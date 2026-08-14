@@ -1,0 +1,816 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{xurl}
+\usepackage{booktabs}
+\geometry{margin=1in}
+
+\title{Construction of SPF Datasets for the ME3AI Project}
+\date{}
+\newcommand{\worktreerootrelative}{../..}
+\newcommand{\forecastrevisionoutputroot}{\worktreerootrelative/data-pipeline/output/forecast_revision}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document specifies the procedure for constructing Survey of Professional
+Forecasters (SPF) datasets used in this project. The SPF is a quarterly survey
+of macroeconomic forecasts conducted by the Federal Reserve Bank of
+Philadelphia; data are provided as Excel workbooks (median and mean levels and
+growth rates, probabilities, dispersion, and microdata). We describe how to
+obtain the official releases, which variables and vintages to use, how to
+validate and normalize the data into the project's cleaned third normal form
+(3NF) structure, and how to link them to the pipeline input and output folders.
+This document serves as the single source of truth for SPF dataset construction
+and reproducibility.
+\end{abstract}
+
+\begin{table}[h]
+\centering
+\caption{Notation and terms used in this document.}
+\label{tab:notation}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol or term & Definition \\
+\midrule
+SPF & Survey of Professional Forecasters \\
+3NF & Third normal form (database normalization) \\
+BEA & Bureau of Economic Analysis \\
+NIPA & National income and product accounts \\
+     & (BEA advance report) \\
+\texttt{var\_path} & URL path segment for a variable (lowercase; \\
+     & e.g., \texttt{ngdp}, \texttt{cpi10}) \\
+VAR & Placeholder for variable code in filenames (e.g., NGDP, CPI10) \\
+\texttt{overwrite} & Policy: \texttt{overwrite} or \texttt{skip-if-exists} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Data source and scope}
+
+The Survey of Professional Forecasters (SPF) is a quarterly survey of
+professional forecasters, formerly run by the American Statistical Association
+and the National Bureau of Economic Research (from 1968:Q4) and taken over by
+the Federal Reserve Bank of Philadelphia in 1990:Q2. The Philadelphia Fed
+publishes documentation and data files; the canonical reference for variable
+definitions, file layout, and timing is the \emph{SPF Documentation}
+(Philadelphia Fed, latest update March 2024), held in this project as
+\texttt{reference/spf-documentation.pdf}.
+
+The survey is timed to the release of the Bureau of Economic Analysis (BEA)
+advance report of the national income and product accounts (NIPA):
+questionnaires are sent after that report; deadlines fall in the second to
+third week of the middle month of each quarter; results are released before
+the BEA second report. For the construction of our datasets, we use the
+survey date (year and quarter) as the primary time index. The first survey
+fully conducted in real time by the Philadelphia Fed is 1990:Q3. Earlier
+vintages (1968:Q4 to 1990:Q2) may be used with the caveats noted in the
+official documentation.
+
+\section{Published files and variables}
+
+The Philadelphia Fed provides SPF data \emph{by variable}: each variable has a
+dedicated data page from which Excel (and other) files can be downloaded. The
+variable index is at \url{https://www.philadelphiafed.org/surveys-and-data/data-files};
+clicking a variable (e.g., NGDP, CPI10, RGDP, UNEMP) leads to a page at
+\[
+\texttt{https://www.philadelphiafed.org/surveys-and-data/}\textit{var\_path},
+\]
+where $\textit{var\_path}$ is the variable identifier in lowercase (e.g.,
+\texttt{ngdp}, \texttt{cpi10}, \texttt{rgdp}). The sole exception is CPI
+inflation, which uses \texttt{cpi-spf}. Variable names and paths are listed on
+the data-files index (e.g., ``10-Year CPI Inflation Rate (CPI10)'' maps to
+\texttt{/cpi10}).
+
+On each variable page, the following file types are typically offered
+(availability may vary by variable):
+
+\begin{itemize}
+  \item \textbf{Documentation}: \\
+    Link to the SPF documentation PDF (same for all variables).
+  \item \textbf{Measures of Cross-Sectional Forecast Dispersion}: \\
+    \texttt{Dispersion\_}\textit{VAR}\texttt{.xlsx} (e.g.,
+    \texttt{Dispersion\_CPI10.xlsx}, \texttt{Dispersion\_NGDP.xlsx}).
+  \item \textbf{Median Responses}: \\
+    \texttt{Median\_}\textit{VAR}\texttt{\_Level.xlsx} (e.g.,
+    \texttt{Median\_NGDP\_Level.xlsx}, \texttt{Median\_CPI10\_Level.xlsx}).
+  \item \textbf{Mean Responses}: \\
+    \texttt{Mean\_}\textit{VAR}\texttt{\_Level.xlsx}.
+  \item \textbf{Annualized Percent Change of Median/Mean Responses}: \\
+    \texttt{Median\_}\textit{VAR}\texttt{\_Growth.xlsx} and
+    \texttt{Mean\_}\textit{VAR}\texttt{\_Growth.xlsx}. For variables that have
+    growth rates (e.g., NGDP, RGDP); not all variables such as CPI10 offer
+    growth files.
+  \item \textbf{Individual Responses}: \\
+    \texttt{Individual\_}\textit{VAR}\texttt{.xlsx}.
+\end{itemize}
+
+Filenames use the variable code as on the website (e.g., NGDP, CPI10). The
+automation must fetch the variable page, extract the download links for the
+desired file types, and save each file to \texttt{data-pipeline/input/} under
+that same filename (no timestamps). Variable names, horizons, and caveats are
+defined in the SPF documentation; we record the exact variable names and
+definitions in a project codebook.
+
+\section{Download automation: inputs and outputs}
+
+We automate retrieval of SPF files from the Philadelphia Fed website so that
+raw files are saved to \texttt{data-pipeline/input/} without manual download.
+Given a variable name (e.g., CPI10, NGDP), the data are hosted on that
+variable's page at \url{https://www.philadelphiafed.org/surveys-and-data/}%
+$\textit{var\_path}$.
+The automation fetches the page, parses the HTML for the desired download
+links (Dispersion, Median Level, Mean Level, Median Growth, Mean Growth,
+Individual), and downloads each file to the input folder under the same
+filename as on the site (e.g., \texttt{Median\_CPI10\_Level.xlsx}). When
+parsing links, the implementation must match \texttt{<a>} tags where
+\texttt{href} may appear after other attributes (e.g.\ \texttt{class}), since
+the Philadelphia Fed markup may use that order.
+
+\paragraph{Inputs.}
+A list of variable names (e.g., CPI10, RGDP, UNEMP, NGDP) as on the
+Philadelphia Fed data-files index. Optional inputs: which file types to
+download (e.g., median level, mean level, dispersion, individual); overwrite
+policy $\texttt{overwrite} \in \{\texttt{overwrite}, \texttt{skip-if-exists}\}$
+(whether to overwrite an existing file or skip); output directory (default
+\texttt{data-pipeline/input/}).
+
+\paragraph{Outputs.}
+Each selected file is saved under \texttt{data-pipeline/input/} with the same
+filename as on the website (no timestamps or version suffixes). Each file is
+downloaded at most once per variable; if multiple variables were to share the
+same filename, the implementation should deduplicate so that the file is
+written once.
+
+Three logical functions suffice: (1) given a variable name, return the variable
+page URL (lowercase path, with exception CPI $\to$ \texttt{cpi-spf}); (2) given
+a variable page URL and requested file types, fetch the page and return a list
+of (filename, download URL) pairs; (3) given a download URL and local path,
+download the file subject to the overwrite policy. The top-level procedure
+loops over the requested variables, obtains the link list for each, and
+downloads each file to \texttt{data-pipeline/input/}.
+
+\section{Pipeline and 3NF}
+
+Our data pipeline (see \texttt{docs/workflow/data\_pipeline.md}) has three
+stages: \textbf{input} (raw data), \textbf{cleaned} (third normal form, 3NF),
+and \textbf{output} (analysis results). SPF data enter as raw files in the
+input folder and are transformed into cleaned tables that satisfy 3NF.
+
+\paragraph{Input.}
+Place the official Excel workbooks in the pipeline input folder. Do not
+modify the original files; preserve them as the source of truth.
+
+\paragraph{Cleaned.}
+The current implementation focuses on \textbf{individual (microdata)} forecasts
+only. Cleaned output is CSV: \texttt{forecast\_individual.csv} in \textbf{wide}
+form (primary key: survey\_year, survey\_quarter, forecaster\_id; one
+column per forecast horizon, all horizons in the same row) and \texttt{forecaster\_survey.csv}
+(primary key: survey\_year, survey\_quarter, forecaster\_id; \texttt{industry}).
+No separate survey table is used; the set of (survey\_year, survey\_quarter) is
+derivable from \texttt{forecast\_individual}. Level/mean/median and probability
+tables may be added in a later stage.
+
+\paragraph{Output.}
+Analyses read from the cleaned folder and write results to the output
+folder, organized by analysis type.
+
+Before treating a constructed SPF dataset as final: verify that raw files match
+the expected Philadelphia Fed release; confirm variable names and column
+layouts align with the SPF documentation; after transformation, check row
+counts and primary keys; record data source, retrieval date, and any
+filtering in the codebook or a README in the cleaned folder.
+
+\section{Prepare dataset for forecast revision regression}
+
+In this section, all constructed objects are indexed by a forecast unit $u$ and
+a survey date $s=(y,q)$. Here the unit index $u$ corresponds to
+\texttt{forecaster\_id}.
+Let $s^{-}$ denote the previous survey date corresponding to $s$: if
+$q \in \{2,3,4\}$ then $s^{-}=(y,q-1)$, while if $q=1$ then
+$s^{-}=(y-1,4)$. With this notation, the three key constructed objects are the
+long-term inflation expectation $x_{u,s}$, inflation news $n_{u,s}$, and the
+reputation measure $\rho_{u,s}$.
+
+\subsection{Construct long-term inflation expectation}
+
+Following Appendix A.1.3 in Aruoba, let $\pi_{a \to b}$ denote annualized
+quarterly inflation between quarters $a$ and $b$, and use the same
+continuous-compounding approximation. The SPF 10-year CPI forecast is a
+\emph{fixed-event} forecast: in each survey quarter it refers to inflation over
+10 years starting from the previous year's Q4. Hence part of the reported
+object is already realized by the survey date and must be removed before using
+it as a forward-looking measurement equation.
+
+In the cleaned wide table \texttt{forecast\_individual.csv}, both the raw
+10-year expectation and the realized short-horizon inflation term are taken from
+the same survey row: column \texttt{CPI10} gives the raw 10-year expectation
+and column \texttt{CPI1} gives the realized inflation term used in the
+adjustment. The adjusted output is written as a separate minimal table
+\texttt{adjusted\_cpi10.csv} with columns
+\texttt{(survey\_year, survey\_quarter, forecaster\_id, adjusted\_cpi10)}. This
+adjusted object is the individual-level long-term inflation expectation
+$x_{u,s}$ used in the forecast revision regression.
+
+With quarterly inflation, the raw 10-year object is the average of 40 quarterly
+inflation rates. For the first-quarter survey, there is no realized quarter
+inside the 10-year window, so
+\begin{equation}
+\text{SPF-10YR-Q1}_t
+\approx \frac{1}{40}
+\sum_{j=0}^{39} \pi_{t-1+j \to t+j}.
+\end{equation}
+Define the long-term inflation expectation by survey date as
+\begin{align}
+x_{u,(y,1)} &\equiv \text{CPI10}_{u,(y,1)}, \\
+x_{u,(y,2)} &\equiv
+ \frac{40\cdot\text{CPI10}_{u,(y,2)} - \text{CPI1}_{u,(y,2)}}{39}, \\
+x_{u,(y,3)} &\equiv
+ \frac{40\cdot\text{CPI10}_{u,(y,3)}
+ - \left(\text{CPI1}_{u,(y,2)} + \text{CPI1}_{u,(y,3)}\right)}{38}, \\
+x_{u,(y,4)} &\equiv
+ \frac{40\cdot\text{CPI10}_{u,(y,4)}
+ - \left(\text{CPI1}_{u,(y,2)} + \text{CPI1}_{u,(y,3)}
+ + \text{CPI1}_{u,(y,4)}\right)}{37}.
+\end{align}
+The corresponding forward-looking measurement equations are
+\begin{align}
+x_{u,(y,1)} &= \frac{1}{40}\sum_{j=0}^{39} \pi_{t-1+j \to t+j}
+ + \varepsilon_{u,(y,1)}, \\
+x_{u,(y,2)} &= \frac{1}{39}\sum_{j=0}^{38} \pi_{t-1+j \to t+j}
+ + \varepsilon_{u,(y,2)}, \\
+x_{u,(y,3)} &= \frac{1}{38}\sum_{j=0}^{37} \pi_{t-1+j \to t+j}
+ + \varepsilon_{u,(y,3)}, \\
+x_{u,(y,4)} &= \frac{1}{37}\sum_{j=0}^{36} \pi_{t-1+j \to t+j}
+ + \varepsilon_{u,(y,4)}.
+\end{align}
+Under this quarterly representation, CPI1 enters the raw 10-year forecast with
+weight $1/40$ once it is realized, but the adjusted object re-averages only over
+the remaining forward-looking quarters. Thus Q2 rescales by $39$, Q3 rescales by
+$38$, and Q4 rescales by $37$. The raw CPI10 measure therefore mechanically
+contains more realized inflation in Q4 than in Q1.
+
+\subsection{Construct inflation news}
+
+For each forecast unit and survey date, inflation news is defined as the
+realized inflation for the current quarter minus the nowcast of that same
+quarter made in the previous survey. In the cleaned wide table
+\texttt{forecast\_individual.csv}, the realized term is \texttt{CPI1} from the
+current survey row, while the nowcast term is \texttt{CPI2} from the previous
+survey row for the same unit. The constructed output is written as
+\texttt{inflation\_news.csv} with columns
+\texttt{(survey\_year, survey\_quarter, forecaster\_id, inflation\_news)}.
+Thus,
+\begin{equation}
+n_{u,s} \equiv \text{CPI1}_{u,s} - \text{CPI2}_{u,s^{-}}.
+\end{equation}
+For individual forecasts, this means matching the current row
+$(\textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$ to
+the lagged survey row for the same \texttt{forecaster\_id}, with the Q1 rollover
+encoded in $s^{-}$. This notation makes the timing explicit: $n_{u,s}$ is always
+dated at the current survey $s$, while the forecast component comes from the
+previous survey $s^{-}$.
+
+\subsection{Construct reputation measure}
+
+A dedicated regression config file determines how the long-term inflation
+expectation $x_{u,s}$ is defined for the forecast revision pipeline. The config
+contains an ordered list of specifications to run, namely raw
+\texttt{CPI10} and adjusted \texttt{CPI10}. If one specification selects raw
+\texttt{CPI10}, then
+\begin{equation}
+x_{u,s} \equiv \text{CPI10}_{u,s}.
+\end{equation}
+If another specification selects adjusted \texttt{CPI10}, then $x_{u,s}$
+equals the adjusted long-term inflation expectation constructed in the previous
+subsection and stored in \texttt{adjusted\_cpi10.csv}. In either case, $u$
+corresponds to \texttt{forecaster\_id}. Each configured definition of $x_{u,s}$
+is propagated through its own versions of \texttt{reputation\_measure.csv} and
+\texttt{regression\_dataset.csv}. Define the reputation measure $\rho$ from
+\begin{equation}
+x_{u,s} = \rho_{u,s}\left((1-q)\pi_{\text{target}} + q z_a\right)
+ + (1-\rho_{u,s})\left((1-q)\pi_{\text{NE}} + q z_{\alpha}\right).
+\end{equation}
+Given values for $q$, $\pi_{\text{target}}$, $\pi_{\text{NE}}$, $z_a$, and
+$z_{\alpha}$, this equation implies
+\begin{equation}
+\rho_{u,s} =
+\frac{x_{u,s} - \left((1-q)\pi_{\text{NE}} + q z_{\alpha}\right)}
+{\left((1-q)\pi_{\text{target}} + q z_a\right)
+ - \left((1-q)\pi_{\text{NE}} + q z_{\alpha}\right)}.
+\end{equation}
+The implementation must load the parameter values from a config file rather
+than hardcoding them in the construction procedure. It must also load the
+configured list of long-term inflation expectation definitions from the
+dedicated regression config file. For each observation where $x_{u,s}$ is
+available, compute $\rho_{u,s}$ using the configured parameter values and the
+selected definition of $x_{u,s}$ dated at the same survey $s$. The constructed
+output for each specification is written as
+\texttt{reputation\_measure.csv} with columns
+\texttt{(survey\_year, survey\_quarter, forecaster\_id, rho)} in its own
+specification-specific output directory.
+
+\subsection{Construct regression dataset}
+
+The regression dataset is indexed at the survey-date level. For each survey
+date $s$, define the individual long-term inflation forecast revision for unit
+$u$ using the same config-selected definition of $x_{u,s}$ by
+\begin{equation}
+r_{u,s} \equiv x_{u,s} - x_{u,s^{-}}.
+\end{equation}
+The regression dependent variable is the matched-sample mean of these
+individual revisions across units observed in both $s$ and $s^{-}$. Let
+$\mathcal{U}_s$ denote the set of units $u$ such that both $x_{u,s}$ and
+$x_{u,s^{-}}$ are observed. Then the dependent variable is
+\begin{equation}
+\bar{r}_s \equiv \frac{1}{|\mathcal{U}_s|}\sum_{u \in \mathcal{U}_s} r_{u,s}.
+\end{equation}
+The same matched sample $\mathcal{U}_s$ is used to construct the survey-level
+regressors. Define
+\begin{align}
+\bar{n}_s &\equiv \frac{1}{|\mathcal{U}_s|}\sum_{u \in \mathcal{U}_s} n_{u,s}, \\
+\bar{\rho}_{s^{-}} &\equiv \frac{1}{|\mathcal{U}_s|}\sum_{u \in \mathcal{U}_s} \rho_{u,s^{-}}, \\
+z_{2,s} &\equiv \bar{n}_s \bar{\rho}_{s^{-}}\left(1-\bar{\rho}_{s^{-}}\right), \\
+z_{3,s} &\equiv \bar{n}_s \bar{\rho}_{s^{-}}\left(1-\bar{\rho}_{s^{-}}\right)^2, \\
+z_{P,s} &\equiv \bar{n}_s \bar{\rho}_{s^{-}}^2\left(1-\bar{\rho}_{s^{-}}\right).
+\end{align}
+Thus the regression-ready dataset at survey date $s$ contains the dependent
+variable $\bar{r}_s$ and the four survey-level regressors
+$\bar{n}_s$, $z_{2,s}$, $z_{3,s}$, and $z_{P,s}$. The reputation term entering the
+nonlinear regressors is the matched-sample mean previous-survey reputation
+$\bar{\rho}_{s^{-}}$, computed using the same set of units $\mathcal{U}_s$.
+The constructed survey-level dataset is written as
+\texttt{regression\_dataset.csv}.
+
+\section{OLS regressions for forecast revision}
+
+The four OLS regressions are estimated at the survey level with a constant:
+\begin{align}
+\bar{r}_s &= \alpha_1 + \beta_1 \bar{n}_s + \varepsilon_{1,s}, \\
+\bar{r}_s &= \alpha_2 + \beta_2 z_{2,s} + \varepsilon_{2,s}, \\
+\bar{r}_s &= \alpha_3 + \beta_3 z_{3,s} + \varepsilon_{3,s}, \\
+\bar{r}_s &= \alpha_P + \beta_P z_{P,s} + \varepsilon_{P,s}.
+\end{align}
+The estimation sample is restricted by the dedicated regression config file,
+which specifies the start survey date and end survey date to use for both
+estimation and fitted-value comparisons for each configured specification.
+
+\subsection{Reported regression statistics}
+
+For each of the four regressions, report a main table containing the slope
+coefficient estimate, slope p value, adjusted $R^2$, RMSE, and sample size.
+Report a second table directly below the main table containing intercept
+inference for each model: intercept estimate, intercept standard error, and
+intercept p value. Both tables should have one row per model and use the same
+regression-ready sample used to estimate that model.
+
+\subsection{Comparison figure}
+
+Construct a figure showing the cumulative change in long-term inflation
+forecast over the same config-selected sample window used in estimation. The
+figure should plot the cumulative sum of the survey-level data series
+$\bar{r}_s$ against the cumulative sums of the fitted counterparts produced by
+the four regression models, using the same bounded survey window in each
+series. Plot the data using a black dashed line.
+Plot the fitted counterpart from Model 1 using a magenta solid line, Model 2
+using a blue solid line, Model 3 using a red solid line, and placebo Model P
+using a green solid line.
+
+\section{Regression results}
+
+The regression implementation writes results tables and a comparison figure to
+\texttt{data-pipeline/output/forecast\_revision/} (worktree-relative). The table is
+\texttt{regression\_results.csv}; it contains one row for each model and the
+reported statistics described above: intercept estimate, intercept standard
+error, intercept p value, slope estimate, slope p value, adjusted $R^2$, RMSE,
+and sample size. The LaTeX output
+\texttt{regression\_results.tex} contains two stacked tables: the main
+forecast revision regression table and an intercept-inference table directly
+under it. The figure is
+\texttt{cumulative\_forecast\_revision\_comparison.png}; it plots the cumulative
+change in long-term inflation forecast over the config-selected sample window
+for the data series and
+for the fitted counterparts from Models 1, 2, 3, and P using the specified line
+styles and colors.
+
+\section{Algorithms: download automation}
+
+\begin{algorithm}[H]
+\caption{\textsc{VariablePageURL}$(\textit{var})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{var}$: variable name as on Philadelphia Fed data-files index (e.g., NGDP, CPI10).
+\State $\textit{path} \gets \text{lowercase}(\textit{var})$.
+\If{$\textit{var} = \texttt{CPI}$}
+    \State $\textit{path} \gets \texttt{cpi-spf}$. \Comment{exception per Philadelphia Fed URL}
+\EndIf
+\State \Return \texttt{https://www.philadelphiafed.org/surveys-and-data/} $\oplus$ $\textit{path}$.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{GetDownloadLinks}$(\textit{page\_url}, \textit{file\_types})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{file\_types}$: subset of
+\Statex \quad $\{\texttt{dispersion}, \texttt{median\_level}, \texttt{mean\_level}, \texttt{median\_growth}, \texttt{mean\_growth}, \texttt{individual}\}$, and optionally \texttt{documentation}.
+\State Fetch HTML at $\textit{page\_url}$.
+\State Parse page for download links: match \texttt{<a>} tags allowing
+\Statex \quad \texttt{href} to appear after other attributes (e.g.\ \texttt{class}); match link text or href to each requested type (e.g., ``Median Responses'' $\to$ \texttt{Median\_VAR\_Level.xlsx}, ``Measures of Cross-Sectional Forecast Dispersion'' $\to$ \texttt{Dispersion\_VAR.xlsx}).
+\State Build list $L$ of $(\textit{filename}, \textit{download\_url})$ for each matched link; extract $\textit{filename}$ from the URL or link (stable name, e.g., \texttt{Median\_NGDP\_Level.xlsx}).
+\State \Return $L$.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{DownloadOneFile}$(\textit{download\_url}, \textit{outpath}, \texttt{overwrite})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\texttt{overwrite} \in \{\texttt{overwrite}, \texttt{skip-if-exists}\}$.
+\If{$\texttt{overwrite} = \texttt{skip-if-exists}$ and file exists at $\textit{outpath}$}
+    \State \Return (skip).
+\EndIf
+\State Download from $\textit{download\_url}$ to $\textit{outpath}$ (overwrite if file exists when $\texttt{overwrite} = \texttt{overwrite}$).
+\State \Return $\textit{outpath}$.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{DownloadByVariableNames}$(\textit{variable\_names}, \textit{file\_types}, \textit{out\_dir}, \texttt{overwrite})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{out\_dir} = \texttt{data-pipeline/input/}$ (fixed by project layout).
+\State \textbf{Require} $\textit{file\_types}$: which file types to download per variable (e.g., median level, mean level, dispersion, individual).
+\State $\textit{written} \gets \emptyset$. \Comment{optional: track filenames already written to avoid duplicate writes}
+\For{each $v$ in $\textit{variable\_names}$}
+    \State $\textit{page\_url} \gets \textsc{VariablePageURL}(v)$.
+    \State $L \gets \textsc{GetDownloadLinks}(\textit{page\_url}, \textit{file\_types})$.
+    \For{each $(\textit{filename}, \textit{url})$ in $L$}
+        \State $\textit{outpath} \gets \textit{out\_dir}$ joined with $\textit{filename}$.
+        \State \textsc{DownloadOneFile}$(\textit{url}, \textit{outpath}, \texttt{overwrite})$.
+        \State Add $\textit{outpath}$ to $\textit{written}$ (if not already present).
+    \EndFor
+\EndFor
+\State \Return $\textit{written}$ (list of paths in \texttt{data-pipeline/input/}).
+\end{algorithmic}
+\end{algorithm}
+
+\section{Algorithm: construct cleaned datasets (individual only)}
+
+The following procedure summarizes the construction of SPF \emph{individual}
+forecast datasets from raw Excel files to cleaned CSV. Raw files
+\texttt{Individual\_VAR.xlsx} are assumed present in \texttt{data-pipeline/input/}
+(e.g., produced by \textsc{DownloadByVariableNames} with \texttt{individual} in
+\texttt{file\_types}). Output is CSV; \texttt{forecast\_individual} is written in
+wide form (one row per survey/forecaster, one column per horizon).
+Helper functions used by the main procedure are specified below.
+
+\begin{algorithm}[H]
+\caption{\textsc{LoadIndividualSheet}$(\textit{path})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{path}$: path to one \texttt{Individual\_VAR.xlsx} file.
+\State Load first sheet: row 1 = header; first four columns YEAR, QUARTER, ID, INDUSTRY; remaining columns = horizon names.
+\State Validate: at least YEAR, QUARTER, ID present; at least one horizon column.
+\State Melt to long form: id\_vars = (YEAR, QUARTER, ID, INDUSTRY), value\_vars = horizon columns; create columns \texttt{horizon}, \texttt{value}.
+\State Rename YEAR $\to$ survey\_year, QUARTER $\to$ survey\_quarter, ID $\to$ forecaster\_id.
+\State \Return long-form table (survey\_year, survey\_quarter, forecaster\_id, industry if present, horizon, value).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{HorizonSortKey}$(\textit{col})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{col}$: horizon column name (e.g., CPI1, CPI10).
+\State \textbf{Ensure} 10-year horizon (name ending with \texttt{10}) is ordered last.
+\State \Return pair $(\textit{col}\,\text{ends with}\,\texttt{10}, \textit{col})$ for sorting (False before True, then by name).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{BuildForecastIndividual}$(\textit{df\_long})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{df\_long}$: concatenated long-form table from \textsc{LoadIndividualSheet}.
+\State Pivot: index = (survey\_year, survey\_quarter, forecaster\_id); columns = horizon; values = value.
+\State If the same horizon appears in more than one raw file, keep the first non-missing value.
+\State Order horizon columns: sort by \textsc{HorizonSortKey} so 10-year column is last.
+\State Final columns: (survey\_year, survey\_quarter, forecaster\_id, horizon\_1, horizon\_2, \ldots, horizon\_10).
+\State \Return wide table (key columns as integers where applicable).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{BuildForecasterSurvey}$(\textit{df\_long})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{df\_long}$: concatenated long-form table (must contain survey\_year, survey\_quarter, forecaster\_id, INDUSTRY or industry).
+\State Select distinct (survey\_year, survey\_quarter, forecaster\_id, industry); sort by (survey\_year, survey\_quarter, forecaster\_id).
+\State \Return forecaster\_survey table; primary key (survey\_year, survey\_quarter, forecaster\_id).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{CleanIndividualTo3NF}$(\textit{input\_dir}, \textit{cleaned\_dir})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{input\_dir}$: path to input folder; $\textit{cleaned\_dir}$: path to cleaned output folder.
+\State Find all \texttt{Individual\_*.xlsx} in $\textit{input\_dir}$.
+\For{each file $\textit{path}$ in that list}
+    \State $\textit{df} \gets \textsc{LoadIndividualSheet}(\textit{path})$.
+    \State Append $\textit{df}$ to collection of long-form tables.
+\EndFor
+\State $\textit{df\_long} \gets$ concatenate all long-form tables.
+\State $\textit{forecast\_individual} \gets \textsc{BuildForecastIndividual}(\textit{df\_long})$.
+\State $\textit{forecaster\_survey} \gets \textsc{BuildForecasterSurvey}(\textit{df\_long})$.
+\State Write $\textit{forecast\_individual}$ to $\textit{cleaned\_dir}$/\texttt{forecast\_individual.csv}, $\textit{forecaster\_survey}$ to $\textit{cleaned\_dir}$/\texttt{forecaster\_survey.csv}.
+\State \Return the two tables (forecast\_individual, forecaster\_survey).
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{GetQuarterSpecificValue}$(\textit{key}, \textit{horizon})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{key}$:
+\Statex \quad $(\textit{forecast\_individual}, \textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$.
+\State \textbf{Require} $\textit{forecast\_individual}$: cleaned wide table.
+\State Find row with key
+\Statex \quad $(\textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$.
+\State \Return value in column $\textit{horizon}$ (e.g., \texttt{CPI1} or \texttt{CPI10}).
+\end{algorithmic}
+\end{algorithm}
+
+\section{Algorithms: prepare dataset for forecast revision regression}
+
+\subsection{Construct long-term inflation expectation}
+
+\begin{algorithm}[H]
+\caption{\textsc{AdjustCPI10Forecasts}$(\textit{forecast\_individual})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{forecast\_individual}$: cleaned wide table
+\Statex \quad containing columns \texttt{CPI1} and \texttt{CPI10}.
+\State Initialize output table for adjusted 10-year CPI forecasts.
+\For{each row key $(\textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$}
+    \State $\textit{key} \gets (\textit{forecast\_individual}, \textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$
+    \State $\textit{cpi10} \gets \textsc{GetQuarterSpecificValue}(\textit{key}, \texttt{CPI10})$
+    \If{$\textit{survey\_quarter} = 1$}
+        \State $\textit{adjusted} \gets \textit{cpi10}$
+    \ElsIf{$\textit{survey\_quarter} = 2$}
+        \State $\textit{key\_q2} \gets (\textit{forecast\_individual}, \textit{survey\_year}, 2, \textit{forecaster\_id})$
+        \State $\textit{cpi1\_q2} \gets \textsc{GetQuarterSpecificValue}(\textit{key\_q2}, \texttt{CPI1})$
+        \State $\textit{adjusted} \gets (40\cdot\textit{cpi10} - \textit{cpi1\_q2})/39$
+    \ElsIf{$\textit{survey\_quarter} = 3$}
+        \State $\textit{key\_q2} \gets (\textit{forecast\_individual}, \textit{survey\_year}, 2, \textit{forecaster\_id})$
+        \State $\textit{key\_q3} \gets (\textit{forecast\_individual}, \textit{survey\_year}, 3, \textit{forecaster\_id})$
+        \State $\textit{cpi1\_q2} \gets \textsc{GetQuarterSpecificValue}(\textit{key\_q2}, \texttt{CPI1})$
+        \State $\textit{cpi1\_q3} \gets \textsc{GetQuarterSpecificValue}(\textit{key\_q3}, \texttt{CPI1})$
+        \State $\textit{adjusted} \gets (40\cdot\textit{cpi10} - (\textit{cpi1\_q2} + \textit{cpi1\_q3}))/38$
+    \Else
+        \State $\textit{key\_q2} \gets (\textit{forecast\_individual}, \textit{survey\_year}, 2, \textit{forecaster\_id})$
+        \State $\textit{key\_q3} \gets (\textit{forecast\_individual}, \textit{survey\_year}, 3, \textit{forecaster\_id})$
+        \State $\textit{key\_q4} \gets (\textit{forecast\_individual}, \textit{survey\_year}, 4, \textit{forecaster\_id})$
+        \State $\textit{cpi1\_q2} \gets \textsc{GetQuarterSpecificValue}(\textit{key\_q2}, \texttt{CPI1})$
+        \State $\textit{cpi1\_q3} \gets \textsc{GetQuarterSpecificValue}(\textit{key\_q3}, \texttt{CPI1})$
+        \State $\textit{cpi1\_q4} \gets \textsc{GetQuarterSpecificValue}(\textit{key\_q4}, \texttt{CPI1})$
+        \State $\textit{adjusted} \gets (40\cdot\textit{cpi10} - (\textit{cpi1\_q2} + \textit{cpi1\_q3} + \textit{cpi1\_q4}))/37$
+    \EndIf
+    \State Write $\textit{adjusted}$ to the output table for that row key.
+\EndFor
+\State \Return table of adjusted 10-year CPI forecasts.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Construct inflation news}
+
+\begin{algorithm}[H]
+\caption{\textsc{ConstructInflationNews}$(\textit{forecast\_individual})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{forecast\_individual}$: cleaned wide table
+\Statex \quad containing columns \texttt{CPI1} and \texttt{CPI2}.
+\State Initialize output table for inflation news.
+\For{each row key $(\textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$}
+    \State $\textit{current\_key} \gets (\textit{forecast\_individual}, \textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id})$
+    \State $\textit{cpi1\_current} \gets \textsc{GetQuarterSpecificValue}(\textit{current\_key}, \texttt{CPI1})$
+    \If{$\textit{survey\_quarter} = 1$}
+        \State $\textit{lagged\_key} \gets (\textit{forecast\_individual}, \textit{survey\_year} - 1, 4, \textit{forecaster\_id})$
+    \Else
+        \State $\textit{lagged\_key} \gets (\textit{forecast\_individual}, \textit{survey\_year}, \textit{survey\_quarter} - 1, \textit{forecaster\_id})$
+    \EndIf
+    \State $\textit{cpi2\_lagged} \gets \textsc{GetQuarterSpecificValue}(\textit{lagged\_key}, \texttt{CPI2})$
+    \State $\textit{inflation\_news} \gets \textit{cpi1\_current} - \textit{cpi2\_lagged}$
+    \State Write $\textit{inflation\_news}$ to the output table for that row key.
+\EndFor
+\State \Return table of inflation news.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{SelectLongTermInflationExpectation}$(\textit{forecast\_individual}, \textit{regression\_config})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{regression\_config}$ contains \texttt{x\_definitions}.
+\For{each \texttt{x\_definition} in \texttt{x\_definitions}}
+\If{\texttt{x\_definition} = \texttt{raw\_cpi10}}
+    \State Set \texttt{x} equal to \texttt{CPI10} from \texttt{forecast\_individual}.
+\ElsIf{\texttt{x\_definition} = \texttt{adjusted\_cpi10}}
+    \State Set \texttt{x} equal to the adjusted long-term inflation expectation.
+\Else
+    \State Raise an error for unsupported \texttt{x\_definition}.
+\EndIf
+\State \Return table indexed by
+\Statex \quad $(\textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id}, \textit{x})$.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Construct reputation measure}
+
+\begin{algorithm}[H]
+\caption{\textsc{ConstructReputationMeasure}$(\textit{x\_table}, \textit{config})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{x\_table}$: table containing config-selected long-term inflation expectation \texttt{x}.
+\State \textbf{Require} $\textit{x\_table}$ has columns
+\Statex \quad $(\textit{survey\_year}, \textit{survey\_quarter}, \textit{forecaster\_id}, \textit{x})$.
+\State \textbf{Require} $\textit{config}$: parameter source containing
+\Statex \quad \texttt{q}, \texttt{pi\_target}, \texttt{pi\_NE}, \texttt{z\_a}, \texttt{z\_alpha}.
+\State Load parameter values from $\textit{config}$.
+\State $\textit{target\_term} \gets (1-\texttt{q})\cdot\texttt{pi\_target} + \texttt{q}\cdot\texttt{z\_a}$.
+\State $\textit{ne\_term} \gets (1-\texttt{q})\cdot\texttt{pi\_NE} + \texttt{q}\cdot\texttt{z\_alpha}$.
+\State $\textit{denominator} \gets \textit{target\_term} - \textit{ne\_term}$.
+\State Initialize output table for reputation measure.
+\For{each row in $\textit{x\_table}$}
+    \State $\textit{x} \gets$ value in column \texttt{x}.
+    \State $\rho \gets (\textit{x} - \textit{ne\_term}) / \textit{denominator}$.
+    \State Write $\rho$ to the output table with the same keys as the input row.
+\EndFor
+\State \Return table containing the input keys and \texttt{rho}.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Construct regression dataset}
+
+\begin{algorithm}[H]
+\caption{\textsc{ConstructRegressionDataset}$(\textit{x\_table}, \textit{inflation\_news}, \textit{reputation\_measure})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{x\_table}$: table containing config-selected long-term inflation expectation \texttt{x}.
+\State \textbf{Require} $\textit{inflation\_news}$: table containing \texttt{inflation\_news}.
+\State \textbf{Require} $\textit{reputation\_measure}$: table containing \texttt{rho}.
+\State \textbf{Require} each table is indexed by
+\Statex \quad $(\textit{survey\_year}, \textit{survey\_quarter}, u)$ with a common unit index $u$.
+\State Initialize output table for the regression dataset.
+\For{each survey date $s=(y,q)$ in sorted survey order}
+    \State Determine previous survey date $s^{-}$.
+    \State Build matched sample $\mathcal{U}_s$ of units $u$ such that
+    \Statex \quad $x_{u,s}$, $x_{u,s^{-}}$, $n_{u,s}$, and $\rho_{u,s^{-}}$ are all observed.
+    \If{$|\mathcal{U}_s| = 0$}
+        \State Continue to next survey date.
+    \EndIf
+    \For{each $u \in \mathcal{U}_s$}
+        \State $r_{u,s} \gets x_{u,s} - x_{u,s^{-}}$.
+    \EndFor
+    \State $\bar{r}_s \gets \frac{1}{|\mathcal{U}_s|}\sum_{u \in \mathcal{U}_s} r_{u,s}$.
+    \State $\bar{n}_s \gets \frac{1}{|\mathcal{U}_s|}\sum_{u \in \mathcal{U}_s} n_{u,s}$.
+    \State $\bar{\rho}_{s^{-}} \gets \frac{1}{|\mathcal{U}_s|}\sum_{u \in \mathcal{U}_s} \rho_{u,s^{-}}$.
+    \State $z_{2,s} \gets \bar{n}_s \bar{\rho}_{s^{-}}\left(1-\bar{\rho}_{s^{-}}\right)$.
+    \State $z_{3,s} \gets \bar{n}_s \bar{\rho}_{s^{-}}\left(1-\bar{\rho}_{s^{-}}\right)^2$.
+    \State $z_{P,s} \gets \bar{n}_s \bar{\rho}_{s^{-}}^2\left(1-\bar{\rho}_{s^{-}}\right)$.
+    \State Write $(s, \bar{r}_s, \bar{n}_s, \bar{\rho}_{s^{-}}, z_{2,s}, z_{3,s}, z_{P,s}, |\mathcal{U}_s|)$
+    \Statex \quad to the regression dataset.
+\EndFor
+\State \Return survey-level regression dataset.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Algorithms: OLS regressions for forecast revision}
+
+\subsection{Reported regression statistics}
+
+\begin{algorithm}[H]
+\caption{\textsc{RunForecastRevisionRegressions}$(\textit{regression\_dataset}, \textit{regression\_config})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} $\textit{regression\_dataset}$: survey-level table containing
+\Statex \quad $(\textit{survey\_year}, \textit{survey\_quarter}, \bar{r}_s, \bar{n}_s, z_{2,s}, z_{3,s}, z_{P,s})$.
+\State \textbf{Require} $\textit{regression\_config}$ contains the sample start and end survey dates.
+\State Keep only survey dates inside the configured sample window for the current specification.
+\State Initialize output table for regression statistics.
+\State Estimate Model 1 by OLS with a constant:
+\Statex \quad $\bar{r}_s = \alpha_1 + \beta_1 \bar{n}_s + \varepsilon_{1,s}$.
+\State Estimate Model 2 by OLS with a constant:
+\Statex \quad $\bar{r}_s = \alpha_2 + \beta_2 z_{2,s} + \varepsilon_{2,s}$.
+\State Estimate Model 3 by OLS with a constant:
+\Statex \quad $\bar{r}_s = \alpha_3 + \beta_3 z_{3,s} + \varepsilon_{3,s}$.
+\State Estimate placebo Model P by OLS with a constant:
+\Statex \quad $\bar{r}_s = \alpha_P + \beta_P z_{P,s} + \varepsilon_{P,s}$.
+\For{each estimated model $m \in \{1,2,3,P\}$}
+    \State Extract intercept estimate, intercept standard error, intercept p value.
+    \State Extract slope estimate, slope p value, adjusted $R^2$, RMSE, and sample size.
+    \State Write one row of statistics for model $m$ to the output table.
+\EndFor
+\State \Return regression-statistics table and fitted values from the four models.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Comparison figure}
+
+\begin{algorithm}[H]
+\caption{\textsc{PlotCumulativeForecastRevisionComparison}$(\textit{regression\_dataset}, \textit{fitted\_values}, \textit{regression\_config})$}
+\begin{algorithmic}[1]
+\State \textbf{Require} fitted values from Models 1, 2, 3, and P for each survey date in
+\Statex \quad $\textit{regression\_dataset}$.
+\State \textbf{Require} $\textit{regression\_config}$ contains the sample start and end survey dates.
+\State Keep survey dates inside the configured sample window; sort by survey date.
+\State Compute cumulative data series as the running sum of $\bar{r}_s$.
+\State Compute cumulative fitted series for each model as the running sum of its fitted values.
+\State Construct figure with five lines:
+\Statex \quad Data = black dashed line.
+\Statex \quad Model 1 fitted counterpart = magenta solid line.
+\Statex \quad Model 2 fitted counterpart = blue solid line.
+\Statex \quad Model 3 fitted counterpart = red solid line.
+\Statex \quad Placebo Model P fitted counterpart = green solid line.
+\State Label horizontal axis with survey date and vertical axis with cumulative change
+\Statex \quad in long-term inflation forecast over the configured sample window.
+\State \Return comparison figure.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Results and comparison}
+
+The forecast revision pipeline is run twice using the two
+\texttt{x\_definitions} listed in
+\texttt{data-pipeline/config/forecast\_revision.json}: raw \texttt{CPI10} and
+adjusted \texttt{CPI10}. This produces two specification-specific regression
+tables, two specification-specific regression figures, and a set of
+survey-level matched-sample comparison figures. The embedded objects below are
+generated by the pipeline and written under
+\texttt{data-pipeline/output/forecast\_revision/}.
+
+\subsection{Regression results: raw CPI10}
+
+\input{\forecastrevisionoutputroot/raw_cpi10/regression_results.tex}
+The intercept inference table is reported directly under the main regression
+table in the same rendered block above.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/raw_cpi10/cumulative_forecast_revision_comparison.png}
+\caption{Cumulative forecast revision comparison using raw CPI10.}
+\end{figure}
+
+\subsection{Regression results: adjusted CPI10}
+
+\input{\forecastrevisionoutputroot/adjusted_cpi10/regression_results.tex}
+The intercept inference table is reported directly under the main regression
+table in the same rendered block above.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/adjusted_cpi10/cumulative_forecast_revision_comparison.png}
+\caption{Cumulative forecast revision comparison using adjusted CPI10.}
+\end{figure}
+
+\subsection{Survey-level matched-sample comparison figures}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/comparison/long_term_forecast_revision_comparison.png}
+\caption{Survey-level matched-sample mean long-term forecast revision: raw versus adjusted CPI10.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/comparison/reputation_measure_comparison.png}
+\caption{Survey-level matched-sample mean previous-survey reputation: raw versus adjusted CPI10.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/comparison/regressor_1_comparison.png}
+\caption{Survey-level matched-sample mean regressor 1: raw versus adjusted CPI10.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/comparison/regressor_2_comparison.png}
+\caption{Survey-level matched-sample mean regressor 2: raw versus adjusted CPI10.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/comparison/regressor_3_comparison.png}
+\caption{Survey-level matched-sample mean regressor 3: raw versus adjusted CPI10.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{\forecastrevisionoutputroot/comparison/regressor_P_comparison.png}
+\caption{Survey-level matched-sample mean placebo regressor: raw versus adjusted CPI10.}
+\end{figure}
+
+\section{Notes}
+
+Before running the pipeline, synchronize dependencies from
+\texttt{data-pipeline/pyproject.toml} using \texttt{uv sync}. Run all pipeline
+and test commands with \texttt{uv run ...} so execution uses the managed
+environment.
+
+Obtaining official Excel files may be implemented by \textsc{DownloadByVariableNames}: given variable names (e.g., CPI10, NGDP), the procedure uses \textsc{VariablePageURL} to form each variable's data page URL (e.g., \url{https://www.philadelphiafed.org/surveys-and-data/cpi10}), \textsc{GetDownloadLinks} to parse the page for Individual (and optionally other) links, and \textsc{DownloadOneFile} to save each file to \texttt{data-pipeline/input/} under the same filename as on the site. The currently implemented cleaned individual-level outputs are \texttt{forecast\_individual}, \texttt{forecaster\_survey}, \texttt{adjusted\_cpi10}, \texttt{inflation\_news}, and specification-specific versions of \texttt{reputation\_measure} and \texttt{regression\_dataset}, all written as CSV. The dedicated regression config file \texttt{data-pipeline/config/forecast\_revision.json} specifies both the sample window for the regression analysis, the ordered list of long-term inflation expectation definitions to compare, and a worktree-relative output root for forecast revision artifacts. Under the forecast revision regression design, the analysis results are written to \texttt{data-pipeline/output/forecast\_revision/}, including specification-specific regression tables and figures plus the survey-level matched-sample comparison figures. Level/mean/median and probability tables remain out of scope unless added explicitly later.
+Codebook tables and figures are generated in \texttt{data-pipeline/report/codebook.qmd}; they are not part of the construction pseudocode.
+
+\end{document}
