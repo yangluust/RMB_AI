@@ -1,0 +1,210 @@
+# Research Pipeline Orchestrator Configuration
+# Owner: Yang Lu
+# Repository: RMB_AI
+#
+# This orchestrator calls the Cursor Cloud Agents API to run a 4-stage
+# research pipeline. Each stage can use a different model.
+#
+# IMPORTANT: Cloud agents execute against the COMMITTED repository snapshot
+# on GitHub. Local uncommitted changes are NOT visible to cloud agents.
+# Commit and push your inputs before running the pipeline.
+
+pipeline:
+  name: "equilibrium-research-pipeline"
+  description: "Four-stage pipeline: derivation -> pseudocode -> implementation -> writing"
+  
+  # Repository configuration
+  repository:
+    url: "https://github.com/yangluust/RMB_AI"
+    # Starting ref (branch or commit SHA). The orchestrator creates a new
+    # cursor/* branch from this ref for each stage.
+    starting_ref: "main"
+
+# Cursor Cloud Agents API configuration
+# Official docs: https://cursor.com/docs/cloud-agent/api/endpoints
+api:
+  base_url: "https://api.cursor.com/v1"
+  # Authentication: set CURSOR_API_KEY environment variable
+  # Generate at: Cursor Dashboard -> API Keys
+  # Do NOT store API keys in this file
+  
+  # Polling configuration for run status
+  polling:
+    interval_seconds: 30
+    max_attempts: 120  # 1 hour maximum wait per stage
+    
+  # Retry configuration for transient failures
+  retries:
+    max_attempts: 3
+    backoff_seconds: [5, 15, 30]
+
+# Stage definitions
+# Each stage runs as a separate cloud agent, with outputs passed via Git
+#
+# Model selection:
+#   - Set model_id to a value from GET /v1/models (e.g., "composer-2", "claude-4.6-sonnet-thinking")
+#   - Set model_id to null or omit to use your configured default
+#   - The orchestrator validates model_id against live /v1/models before launch
+#
+# Model parameters:
+#   - Optional params array with {id, value} entries
+#   - Valid params come from GET /v1/models for the selected model
+stages:
+  # Stage 1: Equilibrium Derivation
+  # Input: Reference papers and economic model specifications
+  # Output: LaTeX derivations committed to outputs/stage1_derivation/
+  - name: "equilibrium_derivation"
+    display_name: "Equilibrium Derivation"
+    description: "Derive theoretical equilibrium conditions from economic models"
+    
+    # Model selection - validated against GET /v1/models at runtime
+    # Set to null to use configured default, or specify a model ID
+    model_id: null  # Uses configured default
+    model_params: []
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Derive the theoretical equilibrium conditions for the FX market model.
+      
+      INPUT SOURCES:
+      - Reference papers in reference/ directory
+      - Data context in data/ directory
+      
+      OUTPUT REQUIREMENTS:
+      - Write LaTeX derivations to outputs/stage1_derivation/derivation.tex
+      - Include step-by-step mathematical reasoning
+      - Document all assumptions
+      - Create outputs/stage1_derivation/summary.md with key results
+      
+      Commit your outputs before finishing.
+    
+    # Validation gate: files that must exist before next stage
+    output_manifest:
+      required_files:
+        - "outputs/stage1_derivation/derivation.tex"
+        - "outputs/stage1_derivation/summary.md"
+      
+  # Stage 2: Equilibrium to Pseudocode
+  # Input: Stage 1 derivations
+  # Output: Algorithmic pseudocode in outputs/stage2_pseudocode/
+  - name: "equilibrium_to_pseudocode"
+    display_name: "Equilibrium to Pseudocode"
+    description: "Translate equilibrium conditions into algorithmic pseudocode"
+    depends_on: "equilibrium_derivation"
+    
+    model_id: null
+    model_params: []
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Translate the equilibrium derivations into algorithmic pseudocode.
+      
+      INPUT:
+      - Read the derivations from outputs/stage1_derivation/
+      
+      OUTPUT REQUIREMENTS:
+      - Write pseudocode to outputs/stage2_pseudocode/algorithm.md
+      - Document numerical stability considerations
+      - Note computational complexity
+      - Create outputs/stage2_pseudocode/summary.md
+      
+      Commit your outputs before finishing.
+    
+    output_manifest:
+      required_files:
+        - "outputs/stage2_pseudocode/algorithm.md"
+        - "outputs/stage2_pseudocode/summary.md"
+
+  # Stage 3: Pseudocode to Python/Plots
+  # Input: Stage 2 pseudocode
+  # Output: Python implementation and visualizations
+  - name: "pseudocode_to_implementation"
+    display_name: "Python Implementation"
+    description: "Implement pseudocode in Python and generate plots"
+    depends_on: "equilibrium_to_pseudocode"
+    
+    model_id: null
+    model_params: []
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Implement the pseudocode in Python and generate visualizations.
+      
+      INPUT:
+      - Read pseudocode from outputs/stage2_pseudocode/
+      - Use data from data/ directory for validation
+      
+      OUTPUT REQUIREMENTS:
+      - Write Python code to outputs/stage3_implementation/
+      - Use numpy, scipy, matplotlib, pandas
+      - Follow PEP 8 style
+      - Generate publication-quality plots as PNG files
+      - Create outputs/stage3_implementation/README.md with usage instructions
+      
+      Commit your outputs before finishing.
+    
+    output_manifest:
+      required_files:
+        - "outputs/stage3_implementation/README.md"
+
+  # Stage 4: Academic Writing
+  # Input: All previous stage outputs
+  # Output: Polished academic prose
+  - name: "academic_writing"
+    display_name: "Academic Writing"
+    description: "Polish research output for academic publication"
+    depends_on: "pseudocode_to_implementation"
+    
+    model_id: null
+    model_params: []
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Polish the research outputs for academic publication.
+      
+      INPUT:
+      - Read derivations from outputs/stage1_derivation/
+      - Read implementation from outputs/stage3_implementation/
+      
+      OUTPUT REQUIREMENTS:
+      - Write polished prose to outputs/stage4_writing/
+      - Target AER/Econometrica style
+      - Ensure clarity and precision
+      - Create outputs/stage4_writing/draft.tex
+      - Create outputs/stage4_writing/summary.md
+      
+      Commit your outputs before finishing.
+    
+    output_manifest:
+      required_files:
+        - "outputs/stage4_writing/draft.tex"
+        - "outputs/stage4_writing/summary.md"
+
+# Artifact collection settings
+# Artifacts are files the agent saves to its artifacts/ directory
+# They can be downloaded via the API after the run completes
+artifacts:
+  collect: true
+  local_output_dir: "collected_artifacts"
+
+# Execution settings
+execution:
+  # dry_run: true means validate config and models without launching agents
+  # This is the default to prevent accidental paid runs
+  dry_run: true
+  
+  # Whether to auto-create PRs for each stage's output
+  auto_create_pr: false
+  
+  # Stop on first stage failure
+  fail_fast: true
+
+# Git ref manifest
+# Records the commit SHAs for each stage's input and output
+# Written to manifest.json after pipeline completion
+manifest:
+  output_file: "pipeline_manifest.json"
