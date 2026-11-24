@@ -507,9 +507,12 @@ class GitHubRepoReader:
       https://docs.github.com/en/rest/git/refs#get-a-reference
       https://docs.github.com/en/rest/git/commits#get-a-commit-object
       https://docs.github.com/en/rest/repos/contents#get-repository-content
+      https://docs.github.com/en/rest/commits/commits#compare-two-commits
     """
     
     API_BASE_URL = "https://api.github.com"
+    # The compare endpoint lists at most this many files in its first page.
+    COMPARE_FILE_LIMIT = 300
     
     def __init__(
         self,
@@ -583,6 +586,41 @@ class GitHubRepoReader:
         if status_code != 200 or not isinstance(body, dict) or not body.get("sha"):
             raise self._error(status_code=status_code, body=body, what=f"commit '{commit}'")
         return body["sha"]
+    
+    def compare(self, base: str, head: str) -> dict:
+        """Return how `head` relates to `base`, and the files that differ.
+
+        Returns:
+            {"status": "ahead" (base is an ancestor of head), "identical",
+            "behind" or "diverged"; "files": the paths changed from the
+            common ancestor to head (both names of a renamed file);
+            "truncated": True if GitHub may not have listed every file}.
+
+        Official docs:
+          https://docs.github.com/en/rest/commits/commits#compare-two-commits
+        """
+        status_code, body = self._get(
+            f"compare/{quote(base, safe='')}...{quote(head, safe='')}"
+        )
+        what = f"comparing {base} with {head}"
+        if status_code != 200 or not isinstance(body, dict):
+            raise self._error(status_code=status_code, body=body, what=what)
+        entries = body.get("files") or []
+        if body.get("status") not in ("ahead", "identical", "behind", "diverged") or not isinstance(entries, list):
+            raise GitHubAPIError(
+                code="github_error",
+                message=f"GitHub sent no usable answer for {what} in {self.full_name}",
+            )
+        files = []
+        for entry in entries:
+            for key in ("filename", "previous_filename"):
+                if isinstance(entry, dict) and entry.get(key) and entry[key] not in files:
+                    files.append(entry[key])
+        return {
+            "status": body["status"],
+            "files": files,
+            "truncated": len(entries) >= self.COMPARE_FILE_LIMIT,
+        }
     
     def file_exists(self, path: str, commit: str) -> bool:
         """True if a file (not a folder) exists at a path in a commit."""

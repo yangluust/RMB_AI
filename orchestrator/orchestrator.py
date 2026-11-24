@@ -10,11 +10,16 @@ Usage:
     python orchestrator.py --check-online         # API key, models, GitHub; launches nothing
     python orchestrator.py --execute              # Start a new project
     python orchestrator.py --resume manifest.json # Continue an existing project
-    python orchestrator.py --resume manifest.json --approve STAGE
-    python orchestrator.py --resume manifest.json --revise STAGE --feedback FILE
+    python orchestrator.py --resume manifest.json --apply-decision decision.json
+    python orchestrator.py --adopt STAGE --adopt-branch B --adopt-commit SHA \
+                           --adopt-input-commit SHA   # Register existing work; launches nothing
 
-Every stage pauses for review: its output is first checked out in the local
-Git checkout, and nothing advances until that exact commit is approved.
+A stage is worked on in rounds, up to a fixed number per stage. Every round
+that ends at a human gate is first checked out in the local Git checkout,
+then announced by a signed notice file (review_bridge.py). Nothing further
+happens until the host has acknowledged the notice and the owner's signed
+decision for that exact commit has been applied. Accepting a stage launches
+nothing; the next stage starts only on a separate decision.
 
 Starting a new project (--execute) always asks for the location of the
 model setup / equilibrium definition document (.qmd, .tex or .md). Nothing
@@ -43,6 +48,8 @@ except ImportError:
     print("Error: PyYAML required. Install with: pip install pyyaml")
     sys.exit(1)
 
+import trial_log
+import verification
 from api_client import (
     APIError,
     AgentRun,
@@ -53,6 +60,18 @@ from api_client import (
     RunStatus,
     parse_github_repo_url,
 )
+from review_bridge import (
+    ACTION_ACCEPT,
+    ACTION_HALT,
+    ACTION_ITERATE,
+    ACTION_RAISE_LIMIT,
+    ACTION_REDO,
+    ACTION_START_STAGE,
+    BridgeError,
+    ReviewBridge,
+    canonical_json,
+)
+from trial_log import TrialJournal, TrialLogError
 
 
 @dataclass
@@ -68,6 +87,27 @@ class StageConfig:
     output_manifest: dict = field(default_factory=dict)
     guardrails: list[str] = field(default_factory=list)
     receives_model_setup_document: bool = False
+    # {max_rounds, autonomous_fix}: how many rounds the stage may take, and
+    # whether a failed round may be followed by another without the owner.
+    iteration: dict = field(default_factory=dict)
+    # {kind, evidence_file, ...}: the evidence file the stage must push,
+    # checked by verification.py. None: no evidence is required.
+    verification: Optional[dict] = None
+    # {enabled, secondary_model_id, secondary_model_params, pass_policy,
+    # on_disagreement, review_dir}: review of each candidate by a second model.
+    cross_model: dict = field(default_factory=dict)
+    
+    @property
+    def max_rounds(self) -> int:
+        return self.iteration["max_rounds"]
+    
+    @property
+    def autonomous_fix(self) -> bool:
+        return self.iteration.get("autonomous_fix", False)
+    
+    @property
+    def cross_model_enabled(self) -> bool:
+        return self.cross_model.get("enabled", False)
 
 
 GUARDRAILS_HEADING = "REPRODUCIBILITY GUARDRAILS (follow all of these):"
@@ -97,8 +137,32 @@ WORKING_DOCUMENT_HEADING = (
     "after every stage):"
 )
 REVISION_HEADING = "REVISION REQUEST FROM THE PROJECT OWNER:"
+FIX_HEADING = "CORRECTION REQUEST (from the orchestrator's checks, not from the project owner):"
+RECONCILE_HEADING = "RECONCILIATION REQUEST (after an independent review by another model):"
 FEEDBACK_BEGIN_LINE = "----- BEGIN FEEDBACK -----"
 FEEDBACK_END_LINE = "----- END FEEDBACK -----"
+# The limits of a round that was not asked for by the owner.
+AUTONOMOUS_RULES = (
+    "Limits of this correction, all checked or reviewed afterwards:\n"
+    "- Correct real errors, and show the evidence for each correction.\n"
+    "- Do not invent an assumption, a value or a functional form.\n"
+    "- Do not change the model or anything the project owner has accepted.\n"
+    "- Do not weaken, remove or skip a check, and do not edit a check's output.\n"
+    "- An item that depends on a choice of the project owner stays open. Do not "
+    "close it; say what decision is needed.\n"
+    "- If you see no way to meet the requirements within these limits, say so in "
+    "the evidence file (\"no_plausible_alternative\": true) instead of forcing a result."
+)
+ROUND_HEADING = "ROUND:"
+EVIDENCE_HEADING = "VERIFICATION EVIDENCE (checked at the commit you push; a failed check ends the round):"
+OUTPUT_PATHS_HEADING = "OUTPUT PATHS:"
+TRIAL_LOG_HEADING = "TRIAL LOG:"
+LOG_ENTRIES_BEGIN_LINE = "----- BEGIN ENTRIES TO APPEND -----"
+LOG_ENTRIES_END_LINE = "----- END ENTRIES TO APPEND -----"
+OWN_ENTRY_BEGIN_LINE = "----- BEGIN YOUR ENTRY -----"
+OWN_ENTRY_END_LINE = "----- END YOUR ENTRY -----"
+TASK_BEGIN_LINE = "----- BEGIN THE TASK -----"
+TASK_END_LINE = "----- END THE TASK -----"
 
 # Directives that pull the text of another file into the document. Only the
 # selected file's own text is sent to the cloud agent, so a document that
@@ -293,19 +357,25 @@ def build_stage_prompt(
     model_setup_document: Optional[ModelSetupDocument] = None,
     working_document_rules: Optional[str] = None,
     revision: Optional[dict] = None,
+    extra_sections: Optional[list[str]] = None,
 ) -> str:
     """Return the prompt text sent to the cloud agent for a stage.
 
     The model setup document (for a stage that receives it), the working
-    document rules, the stage's guardrails and, for a revision, the
-    owner's feedback are appended to the stage prompt, so the agent
-    receives them in the same launch request as the task. The document's
-    local path is left out: the cloud agent cannot open it.
+    document rules, the stage's guardrails, the round's sections and, for
+    a round that revises an earlier output, the feedback are appended to
+    the stage prompt, so the agent receives them in the same launch
+    request as the task. The document's local path is left out: the cloud
+    agent cannot open it.
 
     Args:
         working_document_rules: Text of Orchestrator.working_document_rules().
-        revision: The `revision` record of the stage's attempt, when the
-            attempt revises an output the owner reviewed and did not approve.
+        revision: The `revision` record of the stage's round, when the
+            round revises an output of an earlier round. Its `source` says
+            who asked: "owner" (a decision), "checks" (the orchestrator's
+            checks failed) or "review" (another model's review disagreed).
+        extra_sections: Further sections (round, evidence, output paths,
+            trial log), placed after the guardrails.
 
     Raises:
         ModelSetupDocumentError: if the stage receives the model setup
@@ -340,15 +410,43 @@ def build_stage_prompt(
         )
         sections.append(f"{GUARDRAILS_HEADING}\n{numbered}")
     
+    sections.extend(section.rstrip() for section in extra_sections or [])
+    
     if revision:
-        sections.append(
-            f"{REVISION_HEADING}\n"
+        start = (
             f"The repository snapshot you start from already holds an output of "
-            f"this stage (attempt {revision['replaces_attempt']}). The project "
-            f"owner reviewed it and did not approve it. Do the task above again "
-            f"by revising that output as the feedback below asks. Keep the same "
-            f"file paths and the same working document section. Change nothing "
-            f"the feedback does not call for, and keep every rule above.\n"
+            f"this stage (round {revision['replaces_round']})."
+        )
+        finish = (
+            "Keep the same file paths and the same working document section, and "
+            "keep every rule above."
+        )
+        if revision["source"] == "owner":
+            intro = (
+                f"{REVISION_HEADING}\n{start} The project owner reviewed it and did "
+                f"not accept it (decision {revision['decision_id']}). Do the task "
+                f"above again by revising that output as the feedback below asks. "
+                f"Change nothing the feedback does not call for. {finish}"
+            )
+        elif revision["source"] == "checks":
+            intro = (
+                f"{FIX_HEADING}\n{start} The orchestrator's checks of it found the "
+                f"problems below. Correct them by revising that output. {finish}\n"
+                f"{AUTONOMOUS_RULES}"
+            )
+        else:
+            intro = (
+                f"{RECONCILE_HEADING}\n{start} A reviewer running another model "
+                f"wrote its own assessment without seeing that output, then compared "
+                f"the two; both files are in the snapshot. The differences it found "
+                f"are below. Check each one against the source and the accepted "
+                f"sections. Correct the output where the reviewer is right, and say "
+                f"in your section, with the evidence, where it is not. Do not adopt "
+                f"a claim only because the reviewer made it. {finish}\n"
+                f"{AUTONOMOUS_RULES}"
+            )
+        sections.append(
+            f"{intro}\n"
             f"{FEEDBACK_BEGIN_LINE}\n"
             f"{revision['feedback'].rstrip()}\n"
             f"{FEEDBACK_END_LINE}"
@@ -363,32 +461,80 @@ STAGE_PENDING = "PENDING"
 STAGE_BLOCKED = "BLOCKED"
 STAGE_DRY_RUN = "DRY_RUN"
 STAGE_LAUNCHING = "LAUNCHING"
-STAGE_LAUNCH_REJECTED = "LAUNCH_REJECTED"
 STAGE_RUNNING = "RUNNING"
-STAGE_RUN_FAILED = "RUN_FAILED"
 STAGE_RUN_FINISHED = "RUN_FINISHED"
-STAGE_GATE_FAILED = "GATE_FAILED"
-STAGE_OUTPUT_VERIFIED = "OUTPUT_VERIFIED"
+STAGE_OUTPUT_CHECKED = "OUTPUT_CHECKED"
 STAGE_ARTIFACTS_FAILED = "ARTIFACTS_FAILED"
-# The output passed its checks on GitHub but is not (yet) checked out in the
-# local checkout, so it is not announced as ready for review.
+# The round is closed and its output is on GitHub but not (yet) checked out
+# in the local checkout, so no notice is written for it.
 STAGE_SYNC_PENDING = "LOCAL_SYNC_PENDING"
+# The signed notice is written; the host has not acknowledged posting it.
+STAGE_NOTICE_PENDING = "NOTICE_PENDING"
 STAGE_AWAITING_REVIEW = "AWAITING_REVIEW"
+# Accepted by a signed decision of the owner for the exact output commit.
 STAGE_COMPLETE = "COMPLETE"
 
-# Only a stage in one of these states can lead to a launch request. No agent
-# exists for it yet, or (LAUNCHING) it is not known whether one does.
-LAUNCHABLE_STATUSES = (
-    STAGE_PENDING, STAGE_BLOCKED, STAGE_DRY_RUN, STAGE_LAUNCH_REJECTED, STAGE_LAUNCHING,
+# Only a launch in one of these states can lead to a launch request. No
+# agent exists for it yet, or (LAUNCHING) it is not known whether one does.
+LAUNCHABLE_STATUSES = (STAGE_PENDING, STAGE_BLOCKED, STAGE_DRY_RUN, STAGE_LAUNCHING)
+# A round in one of these states is at its human gate, or past it.
+GATE_STATUSES = (
+    STAGE_SYNC_PENDING, STAGE_NOTICE_PENDING, STAGE_AWAITING_REVIEW, STAGE_COMPLETE,
 )
 
-# An agent ran for a stage in one of these states, and its output is not
-# (or not yet) accepted: the run failed, the output check failed, or the
-# output waits for a review that may reject it. Launching again is a new
-# paid run, so it happens only with --rerun-stage.
-RERUNNABLE_STATUSES = (STAGE_RUN_FAILED, STAGE_GATE_FAILED, STAGE_AWAITING_REVIEW)
+# How a round ended. Only "passed" can be accepted.
+OUTCOME_PASSED = "passed"
+OUTCOME_CHECKS_FAILED = "checks_failed"
+OUTCOME_BLOCKERS_OPEN = "blockers_open"
+OUTCOME_DISAGREEMENT = "disagreement"
+OUTCOME_REVIEW_INVALID = "review_invalid"
+OUTCOME_REVIEW_FAILED = "review_failed"
+OUTCOME_RUN_FAILED = "run_failed"
+OUTCOME_LAUNCH_REJECTED = "launch_rejected"
+# A launch did not take place or did not finish. No new launch follows
+# from these without a decision of the owner.
+INFRASTRUCTURE_OUTCOMES = (OUTCOME_RUN_FAILED, OUTCOME_LAUNCH_REJECTED, OUTCOME_REVIEW_FAILED)
 
-MANIFEST_FORMAT_VERSION = 3
+# Why a round stopped at the human gate.
+STOP_PASSED = "passed"
+STOP_REVIEW_REQUIRED = "review_required"
+STOP_CAP_EXHAUSTED = "cap_exhausted"
+STOP_NO_ALTERNATIVE = "no_plausible_alternative"
+STOP_OWNER_DECISION = "owner_decision_needed"
+STOP_DISAGREEMENT = "disagreement"
+STOP_INFRASTRUCTURE = "infrastructure_failure"
+STOP_ADOPTED = "adopted"
+
+# The launches of a round, in order. Without cross-model review a round
+# has the first one only.
+PHASE_PROPOSE = "propose"
+PHASE_BLIND = "blind_review"
+PHASE_COMPARE = "compare"
+ROLE_PROPOSER = "proposer"
+ROLE_REVIEWER = "reviewer"
+ROLE_BY_PHASE = {
+    PHASE_PROPOSE: ROLE_PROPOSER, PHASE_BLIND: ROLE_REVIEWER, PHASE_COMPARE: ROLE_REVIEWER,
+}
+
+KIND_INITIAL = "initial"
+KIND_REVISE = "revise"        # the owner asked for a revision
+KIND_REDO = "redo"            # the owner asked for a new start from the stage's input
+KIND_FIX = "fix"              # autonomous: the checks failed
+KIND_RECONCILE = "reconcile"  # autonomous: the reviewer disagreed
+KIND_ADOPTED = "adopted"      # existing work registered with --adopt; no launch
+ORIGIN_PIPELINE = "pipeline"
+ORIGIN_ADOPTED = "adopted"
+
+PASS_POLICIES = ("both_agree", "reviewer_accept")
+DISAGREEMENT_POLICIES = ("human_review", "revise_next_round")
+
+CHECKS_NOTE = (
+    "These are checks of form and of cross-references between the files at the "
+    "commit. Evidence files are statements of the model that wrote them. A passed "
+    "check is not a proof that the mathematics, the code or a number is right."
+)
+
+MANIFEST_FORMAT_VERSION = 4
 COMMIT_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 WINDOWS_RESERVED_NAMES = (
     {"CON", "PRN", "AUX", "NUL"}
@@ -795,34 +941,81 @@ class LocalReviewCheckout:
 
 @dataclass
 class StageResult:
-    """The recorded state of one stage of a project."""
+    """The recorded state of one stage of a project: its current round.
+
+    Earlier rounds of the stage are kept, whole, under the manifest's
+    `previous_rounds`.
+    """
     name: str
     status: str = STAGE_PENDING
-    # 1 for the first launch; raised by each explicit --rerun-stage.
-    attempt: int = 1
+    # 0: no round was started. Each round counts once against the stage's
+    # limit, whatever started it and however it ended.
+    round: int = 0
+    kind: Optional[str] = None
+    origin: str = ORIGIN_PIPELINE
+    # What started the round: "execute", "adopt" or the ID of a decision.
+    started_by: Optional[str] = None
+    phase: str = PHASE_PROPOSE
+    
+    # The current launch of the round (one per phase).
+    role: Optional[str] = None
+    model: Optional[dict] = None
     agent_id: Optional[str] = None
     run_id: Optional[str] = None
     agent_url: Optional[str] = None
     run_status: Optional[str] = None
-    # What the stage started from, and the exact commit sent as startingRef.
+    # The exact commit sent as startingRef of the current launch.
+    launch_commit: Optional[str] = None
+    prompt_sha256: Optional[str] = None
+    # IDs of the journal events whose entries the agent was given to append
+    # to the trial log (None: the launch does not write the trial log).
+    log_event_ids: Optional[list] = None
+    pushed_branch: Optional[str] = None
+    duration_ms: Optional[int] = None
+    artifacts: Optional[dict] = None
+    # Records of the launches of this round that are over, in order.
+    launches: list = field(default_factory=list)
+    
+    # What the round started from, and the commit the stage started from in
+    # its first round. The source document, the earlier sections and the
+    # allowed paths are checked against the baseline in every round.
     input_source: Optional[str] = None
     input_commit: Optional[str] = None
-    # The branch the agent pushed, and the commit that passed the output
-    # check. Later stages start from this commit, not from the branch.
+    baseline_commit: Optional[str] = None
+    # The proposer's (or the adopted) commit and the record of its checks.
+    candidate_branch: Optional[str] = None
+    candidate_commit: Optional[str] = None
+    # Adoption only: the commit that holds the stage's content, when the
+    # adopted commit is a later one.
+    content_commit: Optional[str] = None
+    gate: Optional[dict] = None
+    # Cross-model review: the blind assessment and the comparison.
+    cross_review: Optional[dict] = None
+    outcome: Optional[str] = None
+    stop_reason: Optional[str] = None
+    # The branch and commit shown for review. Later stages start from this
+    # commit once it is accepted, not from the branch.
     output_branch: Optional[str] = None
     output_commit: Optional[str] = None
-    gate: Optional[dict] = None
-    artifacts: Optional[dict] = None
-    # The local checkout that shows the output for review: its folder, the
-    # branch and commit checked out, and whether that was verified.
     local_sync: Optional[dict] = None
+    # {"event": the signed notice, "ack": the host's signed ack or None}.
+    notice: Optional[dict] = None
+    notice_seq: int = 0
     review: Optional[dict] = None
-    # Set on an attempt started by --revise: the owner's feedback, the
-    # attempt it replaces, and the branch and commit it starts from.
+    # After acceptance: {"event": the signed notice of the acceptance}.
+    receipt: Optional[dict] = None
+    # Set on a round that revises an earlier round's output.
     revision: Optional[dict] = None
-    duration_ms: Optional[int] = None
     error: Optional[str] = None
+    closed_at: Optional[str] = None
     completed_at: Optional[str] = None
+
+
+LAUNCH_FIELDS = (
+    "phase", "role", "model", "agent_id", "run_id", "agent_url", "run_status",
+    "launch_commit", "prompt_sha256", "log_event_ids", "pushed_branch",
+    "duration_ms", "artifacts",
+)
 
 
 @dataclass
@@ -831,6 +1024,9 @@ class PipelineManifest:
     pipeline_name: str
     repo_url: str
     started_at: str
+    project_id: str = ""
+    # {config_sha256, code (file -> SHA-256), created_by, repins}.
+    provenance: dict = field(default_factory=dict)
     stages: dict[str, StageResult] = field(default_factory=dict)
     completed_at: Optional[str] = None
     # The document selected when this project was started: path, format,
@@ -840,21 +1036,32 @@ class PipelineManifest:
     # project was started. The first stage starts from that commit.
     source_ref: Optional[str] = None
     source_commit: Optional[str] = None
-    # Records of stage attempts replaced by an explicit --rerun-stage.
-    previous_attempts: list[dict] = field(default_factory=list)
+    # Records of the rounds that were followed by another round.
+    previous_rounds: list[dict] = field(default_factory=list)
+    # The owner's decisions that were applied, whole and signed, in order.
+    decisions: list[dict] = field(default_factory=list)
+    # Rounds added to a stage's limit by raise_limit decisions: stage -> number.
+    round_limit_raises: dict = field(default_factory=dict)
+    # Set while the project is halted: {at, reason, by}.
+    halted: Optional[dict] = None
     
     def to_dict(self) -> dict:
         return {
             "format_version": MANIFEST_FORMAT_VERSION,
             "pipeline_name": self.pipeline_name,
             "repo_url": self.repo_url,
+            "project_id": self.project_id,
+            "provenance": self.provenance,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "model_setup_document": self.model_setup_document,
             "source_ref": self.source_ref,
             "source_commit": self.source_commit,
             "stages": {name: asdict(result) for name, result in self.stages.items()},
-            "previous_attempts": self.previous_attempts,
+            "previous_rounds": self.previous_rounds,
+            "decisions": self.decisions,
+            "round_limit_raises": self.round_limit_raises,
+            "halted": self.halted,
         }
     
     @classmethod
@@ -862,23 +1069,32 @@ class PipelineManifest:
         """
         Raises:
             ProjectStateError: if the manifest has another format version
-                or a stage record with unknown fields.
+                or a stage record with unknown fields. A manifest of an
+                earlier version is not converted: its records do not hold
+                what this version checks before it goes on.
         """
         if data.get("format_version") != MANIFEST_FORMAT_VERSION:
             raise ProjectStateError(
                 f"The manifest has format version {data.get('format_version')!r}, "
                 f"but this orchestrator reads version {MANIFEST_FORMAT_VERSION}. "
-                f"It cannot be resumed with this version of the orchestrator."
+                f"It cannot be resumed with this version of the orchestrator, and "
+                f"it is not converted. Work that exists on a branch can be "
+                f"registered in a new project with --adopt."
             )
         manifest = cls(
             pipeline_name=data["pipeline_name"],
             repo_url=data["repo_url"],
             started_at=data["started_at"],
+            project_id=data.get("project_id", ""),
+            provenance=dict(data.get("provenance") or {}),
             completed_at=data.get("completed_at"),
             model_setup_document=data.get("model_setup_document"),
             source_ref=data.get("source_ref"),
             source_commit=data.get("source_commit"),
-            previous_attempts=list(data.get("previous_attempts", [])),
+            previous_rounds=list(data.get("previous_rounds", [])),
+            decisions=list(data.get("decisions", [])),
+            round_limit_raises=dict(data.get("round_limit_raises") or {}),
+            halted=data.get("halted"),
         )
         known_fields = {stage_field.name for stage_field in fields(StageResult)}
         for name, stage_data in data.get("stages", {}).items():
@@ -891,6 +1107,29 @@ class PipelineManifest:
         return manifest
 
 
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# The files of the orchestrator that is running. Their hashes are recorded
+# with a project, and a commit that holds another version of them is not
+# checked out over them.
+ORCHESTRATOR_FILES = (
+    "orchestrator.py", "api_client.py", "review_bridge.py", "trial_log.py", "verification.py",
+)
+
+
+def running_code_sha256() -> dict:
+    """SHA-256 of each file of the orchestrator that is running."""
+    folder = Path(__file__).resolve().parent
+    return {name: file_sha256(path=folder / name) for name in ORCHESTRATOR_FILES}
+
+
+def path_is_under(path: str, entries: list) -> bool:
+    """True if a path is one of the entries or inside one of them (a folder)."""
+    return any(path == entry or path.startswith(entry + "/") for entry in entries)
+
+
 class Orchestrator:
     """
     Pipeline orchestrator that launches cloud agents for each stage.
@@ -898,14 +1137,19 @@ class Orchestrator:
     Key behaviors:
     - Asks for the model setup document whenever a new project is started
     - Validates models against GET /v1/models before launch
-    - Runs the stages in order; each starts from the exact commit that
-      passed the previous stage's output check
-    - Creates each stage's agent at most once, under a recorded agent ID
-    - Checks each stage's output at the pushed commit: required files, the
-      working document's sections, the stage's completion record
-    - Collects artifacts, then checks the output out in the local checkout
-    - Pauses after every stage until that exact commit is approved
-    - Records every step in the manifest, so a project can be resumed
+    - Works on one stage at a time, in rounds, up to a fixed number per
+      stage; a round is counted before any work is done for it
+    - Creates each agent at most once, under a recorded agent ID
+    - Checks each round's output at the pushed commit: required files, the
+      working document's sections, changed paths, the trial log and the
+      stage's evidence file (form and cross-references, not correctness)
+    - Ends every round at a human gate unless the stage allows an
+      autonomous correction round and one is possible; never starts
+      another stage on its own
+    - At the gate: checks the output out in the local checkout, writes a
+      signed notice, and waits for the host's ack and the owner's signed
+      decision for that exact commit
+    - Records every step in the manifest and in the trial journal
     """
     
     def __init__(
@@ -918,6 +1162,7 @@ class Orchestrator:
         sleep: Callable[[float], None] = time.sleep,
         manifest_path: Optional[Path] = None,
         local_review: Optional[LocalReviewCheckout] = None,
+        bridge_secret: Optional[str] = None,
     ):
         self.config = config
         self.dry_run = dry_run
@@ -933,6 +1178,9 @@ class Orchestrator:
         self.manifest_path = manifest_path
         # The local checkout that shows each stage's output for review.
         self.local_review = local_review
+        # The secret shared with the host of the main chat. None: it is
+        # read from the environment variable named in review.delivery.
+        self.bridge_secret = bridge_secret
         
         self.pipeline_config = config.get("pipeline", {})
         self.repo_config = self.pipeline_config.get("repository", {})
@@ -943,9 +1191,15 @@ class Orchestrator:
         # None when the config has no cumulative working document.
         self.working_document_config: Optional[dict] = config.get("working_document")
         self.review_config = config.get("review", {})
+        # None when the config has no trial log in the repository.
+        self.trial_log_config: Optional[dict] = config.get("trial_log")
         
         self.manifest: Optional[PipelineManifest] = None
         self.model_setup_document: Optional[ModelSetupDocument] = None
+        # Branches reported by the run that was just waited for.
+        self._reported_branches: Optional[list[dict]] = None
+        # Content of files at commits, as read from GitHub. A commit never changes.
+        self._file_cache: dict[tuple[str, str], Optional[bytes]] = {}
     
     @property
     def github(self) -> GitHubRepoReader:
@@ -962,6 +1216,44 @@ class Orchestrator:
     def retry_backoff(self) -> list:
         """Seconds to wait before each further try."""
         return self.api_config["retries"]["backoff_seconds"]
+    
+    @property
+    def config_sha256(self) -> str:
+        """SHA-256 of the configuration as it was read, in canonical JSON."""
+        return hashlib.sha256(canonical_json(self.config)).hexdigest()
+    
+    def _project_file(self, suffix: str) -> Path:
+        if self.manifest_path is None:
+            raise RuntimeError("The project has no manifest file. Set manifest_path.")
+        return self.manifest_path.resolve().with_name(self.manifest_path.stem + suffix)
+    
+    @property
+    def bridge(self) -> ReviewBridge:
+        """The outbox and inbox of this project's notices, beside its manifest."""
+        delivery = self.review_config["delivery"]
+        secret = self.bridge_secret
+        if secret is None:
+            secret = os.environ.get(delivery["secret_env"])
+        if self.manifest_path is None:
+            raise RuntimeError("The project has no manifest file. Set manifest_path.")
+        return ReviewBridge(
+            directory=(
+                self.manifest_path.resolve().parent / delivery["directory"]
+                / self.manifest_path.stem
+            ),
+            secret=secret,
+            secret_env=delivery["secret_env"],
+        )
+    
+    @property
+    def journal(self) -> TrialJournal:
+        """The orchestrator's own record of this project's events, beside its manifest."""
+        return TrialJournal(path=self._project_file(suffix=".trial-journal.jsonl"))
+    
+    @property
+    def trial_log_path(self) -> Optional[str]:
+        """Path of the trial log in the repository, or None if there is none."""
+        return self.trial_log_config["path"] if self.trial_log_config else None
     
     def _parse_stages(self, stages_list: list) -> list[StageConfig]:
         """Parse stage configurations from config."""
@@ -980,12 +1272,33 @@ class Orchestrator:
                 receives_model_setup_document=stage_data.get(
                     "receives_model_setup_document", False
                 ),
+                iteration=stage_data.get("iteration", {}),
+                verification=stage_data.get("verification"),
+                cross_model=stage_data.get("cross_model", {}),
             ))
         return stages
     
     def stage_number(self, stage: StageConfig) -> int:
         """The stage's place in the pipeline, counted from 1."""
         return self.stages.index(stage) + 1
+    
+    def stage_named(self, name: Any) -> StageConfig:
+        """
+        Raises:
+            ProjectStateError: if the config defines no stage of this name.
+        """
+        for stage in self.stages:
+            if stage.name == name:
+                return stage
+        raise ProjectStateError(
+            f"The config defines no stage named {name!r}. The stages are: "
+            f"{', '.join(stage.name for stage in self.stages)}."
+        )
+    
+    def round_limit(self, stage: StageConfig) -> int:
+        """The most rounds the stage may take: the configured limit plus the owner's raises."""
+        raised = self.manifest.round_limit_raises.get(stage.name, 0) if self.manifest else 0
+        return stage.max_rounds + raised
     
     def working_document_rules(self, stage: StageConfig) -> Optional[str]:
         """Return the working document rules appended to a stage's prompt.
@@ -1011,7 +1324,7 @@ class Orchestrator:
             rules.append(
                 f"The section(s) of the earlier stage(s) ({', '.join(earlier)}) stay "
                 f"byte-for-byte as they are in the commit you start from. The project "
-                f"owner approved them. If you find an error in one, do not edit it: "
+                f"owner accepted them. If you find an error in one, do not edit it: "
                 f"report it in your own section under the heading \"Issues found in "
                 f"earlier stages\"."
             )
@@ -1074,6 +1387,9 @@ class Orchestrator:
             
             errors.extend(self._model_selection_errors(stage=stage))
             errors.extend(self._stage_setting_errors(stage=stage))
+            errors.extend(self._iteration_setting_errors(stage=stage))
+            errors.extend(self._verification_setting_errors(stage=stage))
+            errors.extend(self._cross_model_setting_errors(stage=stage))
         
         # The document asked for at project start has to reach the stage
         # that starts the pipeline, or asking for it would have no effect.
@@ -1095,36 +1411,149 @@ class Orchestrator:
         stage_data = self.config["stages"][self.stages.index(stage)]
         if "manual_review" in stage_data:
             errors.append(
-                f"{prefix}: manual_review is not a setting. Every stage pauses "
-                f"for review and is advanced only by an approval; remove the line"
+                f"{prefix}: manual_review is not a setting. Every stage stops "
+                f"for review and goes on only by a decision of the owner; remove the line"
             )
         
-        required_files = (
-            stage.output_manifest.get("required_files", [])
-            if isinstance(stage.output_manifest, dict) else None
-        )
-        if not isinstance(required_files, list):
-            return errors + [f"{prefix}: output_manifest.required_files must be a list of paths"]
-        for path in required_files:
-            reason = unsafe_relative_path_reason(path)
-            if reason:
-                errors.append(
-                    f"{prefix}: required file {path!r} is not a safe path relative "
-                    f"to the repository root: {reason}"
-                )
-        
+        if not isinstance(stage.output_manifest, dict):
+            return errors + [f"{prefix}: output_manifest must be a mapping"]
         if "completion_record" in stage.output_manifest:
-            record_path = stage.output_manifest["completion_record"]
-            reason = unsafe_relative_path_reason(record_path)
+            errors.append(
+                f"{prefix}: output_manifest.completion_record is not a setting. The "
+                f"stage's evidence file (verification) takes its place; remove the line"
+            )
+        for key in ("required_files", "allowed_paths"):
+            if key == "allowed_paths" and key not in stage.output_manifest:
+                continue
+            paths = stage.output_manifest.get(key, [])
+            if not isinstance(paths, list):
+                errors.append(f"{prefix}: output_manifest.{key} must be a list of paths")
+                continue
+            for path in paths:
+                reason = unsafe_relative_path_reason(path)
+                if reason:
+                    errors.append(
+                        f"{prefix}: output_manifest.{key} entry {path!r} is not a safe "
+                        f"path relative to the repository root: {reason}"
+                    )
+        return errors
+    
+    def _iteration_setting_errors(self, stage: StageConfig) -> list[str]:
+        """Check a stage's round limit and whether it may correct itself."""
+        prefix = f"Stage '{stage.name}': iteration"
+        iteration = stage.iteration
+        if not isinstance(iteration, dict):
+            return [f"{prefix} must be a mapping with max_rounds"]
+        errors = []
+        unknown = sorted(set(iteration) - {"max_rounds", "autonomous_fix"})
+        if unknown:
+            errors.append(f"{prefix} has unknown setting(s): {unknown}")
+        max_rounds = iteration.get("max_rounds")
+        if not (isinstance(max_rounds, int) and not isinstance(max_rounds, bool) and max_rounds >= 1):
+            errors.append(
+                f"{prefix}.max_rounds must be a whole number, 1 or more: the most "
+                f"rounds the stage may take. There is no default"
+            )
+        if not isinstance(iteration.get("autonomous_fix", False), bool):
+            errors.append(f"{prefix}.autonomous_fix must be true or false")
+        return errors
+    
+    def _verification_setting_errors(self, stage: StageConfig) -> list[str]:
+        """Check a stage's evidence settings."""
+        prefix = f"Stage '{stage.name}': verification"
+        settings = stage.verification
+        if settings is None:
+            return []
+        if not isinstance(settings, dict) or settings.get("kind") not in verification.KINDS:
+            return [f"{prefix}.kind must be one of {', '.join(verification.KINDS)}"]
+        path_keys = {
+            verification.KIND_TEST_MAP: ("implementation_file", "test_file"),
+            verification.KIND_PARAMETER_BATCHES: ("next_batch_spec",),
+        }.get(settings["kind"], ())
+        number_keys = (
+            ("max_configurations",)
+            if settings["kind"] == verification.KIND_PARAMETER_BATCHES else ()
+        )
+        errors = []
+        unknown = sorted(set(settings) - {"kind", "evidence_file", *path_keys, *number_keys})
+        if unknown:
+            errors.append(f"{prefix} has unknown setting(s) for kind {settings['kind']}: {unknown}")
+        for key in ("evidence_file", *path_keys):
+            reason = unsafe_relative_path_reason(settings.get(key))
             if reason:
                 errors.append(
-                    f"{prefix}: output_manifest.completion_record {record_path!r} is "
-                    f"not a safe path relative to the repository root: {reason}"
+                    f"{prefix}.{key} must be a safe path relative to the repository root: {reason}"
                 )
+        for key in number_keys:
+            value = settings.get(key)
+            if not (isinstance(value, int) and not isinstance(value, bool) and value >= 1):
+                errors.append(f"{prefix}.{key} must be a whole number, 1 or more")
+        if settings["kind"] == verification.KIND_PARAMETER_BATCHES and stage.autonomous_fix is True:
+            errors.append(
+                f"Stage '{stage.name}': iteration.autonomous_fix cannot be true for "
+                f"verification kind {verification.KIND_PARAMETER_BATCHES}: every batch "
+                f"needs the owner's approval before it is run"
+            )
+        return errors
+    
+    def _cross_model_setting_errors(self, stage: StageConfig) -> list[str]:
+        """Check a stage's cross-model review settings."""
+        prefix = f"Stage '{stage.name}': cross_model"
+        settings = stage.cross_model
+        if not isinstance(settings, dict):
+            return [f"{prefix} must be a mapping"]
+        errors = []
+        known = {
+            "enabled", "secondary_model_id", "secondary_model_params",
+            "pass_policy", "on_disagreement", "review_dir",
+        }
+        unknown = sorted(set(settings) - known)
+        if unknown:
+            errors.append(f"{prefix} has unknown setting(s): {unknown}")
+        enabled = settings.get("enabled", False)
+        if not isinstance(enabled, bool):
+            return errors + [f"{prefix}.enabled must be true or false"]
+        if not enabled:
+            return errors
+        
+        secondary = settings.get("secondary_model_id")
+        if stage.model_id is None or not (isinstance(secondary, str) and secondary.strip()):
+            errors.append(
+                f"{prefix} is enabled, so the stage's model_id and "
+                f"{prefix}.secondary_model_id must both name a model. No model is "
+                f"chosen for you"
+            )
+        elif secondary == stage.model_id:
+            errors.append(
+                f"{prefix}.secondary_model_id is the stage's own model "
+                f"({stage.model_id}); the reviewer must be a different model"
+            )
+        errors.extend(self._model_errors(
+            prefix=f"{prefix} secondary",
+            model_id=secondary,
+            params=settings.get("secondary_model_params", []),
+        ))
+        if settings.get("pass_policy") not in PASS_POLICIES:
+            errors.append(f"{prefix}.pass_policy must be one of {', '.join(PASS_POLICIES)}")
+        if settings.get("on_disagreement") not in DISAGREEMENT_POLICIES:
+            errors.append(
+                f"{prefix}.on_disagreement must be one of {', '.join(DISAGREEMENT_POLICIES)}"
+            )
+        elif settings["on_disagreement"] == "revise_next_round" and stage.autonomous_fix is not True:
+            errors.append(
+                f"{prefix}.on_disagreement is revise_next_round, which starts a round "
+                f"without the owner; that needs iteration.autonomous_fix: true"
+            )
+        reason = unsafe_relative_path_reason(settings.get("review_dir"))
+        if reason:
+            errors.append(
+                f"{prefix}.review_dir must be a safe folder relative to the repository "
+                f"root: {reason}"
+            )
         return errors
     
     def _pipeline_setting_errors(self) -> list[str]:
-        """Check the repository, retry and artifact settings."""
+        """Check the repository, retry, artifact, review and trial log settings."""
         errors = []
         
         repo_url = self.repo_config.get("url")
@@ -1168,12 +1597,40 @@ class Orchestrator:
                     f"when artifacts.collect is true: {reason}"
                 )
         
+        review = self.review_config if isinstance(self.review_config, dict) else {}
         for key in ("local_checkout", "remote"):
-            value = self.review_config.get(key) if isinstance(self.review_config, dict) else None
+            value = review.get(key)
             if not (isinstance(value, str) and value.strip()):
                 errors.append(
                     f"review.{key} must be set: every stage output is checked out "
                     f"in a local Git checkout before it is announced for review"
+                )
+        delivery = review.get("delivery")
+        if not isinstance(delivery, dict):
+            errors.append(
+                "review.delivery must be set (directory and secret_env): an output is "
+                "announced for review by a signed notice file, and only the host's "
+                "signed ack counts as delivery"
+            )
+        else:
+            reason = unsafe_relative_path_reason(delivery.get("directory"))
+            if reason:
+                errors.append(
+                    f"review.delivery.directory must be a safe relative folder: {reason}"
+                )
+            secret_env = delivery.get("secret_env")
+            if not (isinstance(secret_env, str) and re.fullmatch(r"[A-Z_][A-Z0-9_]*", secret_env)):
+                errors.append(
+                    "review.delivery.secret_env must be the name of an environment "
+                    "variable (capital letters, digits and _). The secret itself is "
+                    "never written in the config"
+                )
+            unknown = sorted(set(delivery) - {"directory", "secret_env"})
+            if unknown:
+                errors.append(
+                    f"review.delivery has unknown setting(s): {', '.join(unknown)}. Only "
+                    f"directory and secret_env are settings; the secret itself is "
+                    f"never written in the config"
                 )
         
         if self.working_document_config is not None:
@@ -1188,28 +1645,42 @@ class Orchestrator:
                         f"working_document.{key} must be a safe path relative to "
                         f"the repository root: {reason}"
                     )
+        
+        if self.trial_log_config is not None:
+            value = (
+                self.trial_log_config.get("path")
+                if isinstance(self.trial_log_config, dict) else None
+            )
+            reason = unsafe_relative_path_reason(value)
+            if reason:
+                errors.append(
+                    f"trial_log.path must be a safe path relative to the repository "
+                    f"root: {reason}"
+                )
         return errors
     
     def _model_selection_errors(self, stage: StageConfig) -> list[str]:
-        """Check that a stage's model settings can be written as the API's `model` field.
+        """Check that a stage's model settings can be written as the API's `model` field."""
+        return self._model_errors(
+            prefix=f"Stage '{stage.name}'", model_id=stage.model_id, params=stage.model_params,
+        )
+    
+    def _model_errors(self, prefix: str, model_id: Any, params: Any) -> list[str]:
+        """Check that a model ID and its parameters can be written as the API's `model` field.
 
         The API takes `model.id` (a string) and `model.params` (a list of
         `{id, value}` items). Whether the API lists these IDs and values is
         checked separately, by validate_models().
         """
-        prefix = f"Stage '{stage.name}'"
         errors = []
         
-        if stage.model_id is not None and not (
-            isinstance(stage.model_id, str) and stage.model_id.strip()
-        ):
+        if model_id is not None and not (isinstance(model_id, str) and model_id.strip()):
             errors.append(f"{prefix}: model_id must be a non-empty string or null")
         
-        params = stage.model_params
         if not isinstance(params, list):
             return errors + [f"{prefix}: model_params must be a list of {{id, value}} items"]
         
-        if params and stage.model_id is None:
+        if params and model_id is None:
             errors.append(
                 f"{prefix}: model_params is set but model_id is null. The API "
                 f"takes parameters only together with model.id, so they would "
@@ -1242,6 +1713,19 @@ class Orchestrator:
         
         return errors
     
+    def model_selections(self) -> list[tuple[str, Optional[str], list]]:
+        """Every (label, model ID, parameters) the config can send in a launch request."""
+        selections = []
+        for stage in self.stages:
+            selections.append((f"Stage '{stage.name}'", stage.model_id, stage.model_params))
+            if stage.cross_model_enabled:
+                selections.append((
+                    f"Stage '{stage.name}' (cross_model secondary)",
+                    stage.cross_model["secondary_model_id"],
+                    stage.cross_model.get("secondary_model_params", []),
+                ))
+        return selections
+    
     def select_model_setup_document(self) -> ModelSetupDocument:
         """Ask the user for the model setup document and read it.
 
@@ -1267,8 +1751,17 @@ class Orchestrator:
         print(f"  Sent to stage(s): {', '.join(receiving)}")
         return document
     
-    def start_new_project(self) -> PipelineManifest:
+    def start_new_project(
+        self, created_by: str = "execute", source_ref: Optional[str] = None,
+    ) -> PipelineManifest:
         """Start a new project: ask for its document, then open its manifest.
+
+        Args:
+            created_by: "execute" (the first stage's first round may be
+                launched) or "adopt" (existing work is registered; nothing
+                is launched for it).
+            source_ref: The ref the project starts from. None means the
+                configured starting ref.
 
         Raises:
             ModelSetupDocumentError: if no usable document is given. No
@@ -1282,155 +1775,38 @@ class Orchestrator:
             pipeline_name=self.pipeline_config.get("name", "unnamed"),
             repo_url=self.repo_config.get("url", ""),
             started_at=started_at,
+            project_id=f"prj-{uuid.uuid4().hex[:12]}",
+            provenance={
+                "created_by": created_by,
+                "created_at": started_at,
+                "config_sha256": self.config_sha256,
+                "code": running_code_sha256(),
+                "repins": [],
+            },
             model_setup_document={**document.to_record(), "selected_at": started_at},
-            source_ref=self.repo_config.get("starting_ref", "main"),
+            source_ref=source_ref or self.repo_config.get("starting_ref", "main"),
         )
         return self.manifest
     
-    def _is_stage_finished(self, manifest: PipelineManifest, stage: StageConfig) -> bool:
-        existing = manifest.stages.get(stage.name)
-        return existing is not None and existing.status == STAGE_COMPLETE
-    
-    def _may_still_launch(self, manifest: PipelineManifest, stage: StageConfig) -> bool:
-        existing = manifest.stages.get(stage.name)
-        return existing is None or existing.status in LAUNCHABLE_STATUSES
-    
-    def _reset_stage_for_rerun(self, manifest: PipelineManifest, stage_name: str) -> None:
-        """Set a stage back to PENDING, keeping the replaced attempt's record.
-
-        Raises:
-            ProjectStateError: unless the stage's run failed, its output
-                check failed, or its output is awaiting review.
-        """
-        result = manifest.stages.get(stage_name)
-        if result is None or result.status not in RERUNNABLE_STATUSES:
-            state = "it has not been run" if result is None else f"its status is {result.status}"
-            raise ProjectStateError(
-                f"Stage '{stage_name}' cannot be rerun: {state}. --rerun-stage "
-                f"applies only to a stage whose run failed, whose output check "
-                f"failed, or whose output is awaiting review "
-                f"({', '.join(RERUNNABLE_STATUSES)})."
-            )
-        manifest.previous_attempts.append(asdict(result))
-        manifest.stages[stage_name] = StageResult(name=stage_name, attempt=result.attempt + 1)
-        print(
-            f"\nStage '{stage_name}': attempt {result.attempt} is kept under "
-            f"previous_attempts. A NEW paid agent will be launched as attempt "
-            f"{result.attempt + 1}."
-        )
-    
-    def _reset_stage_for_revision(
-        self,
-        manifest: PipelineManifest,
-        stage_name: str,
-        feedback: str,
-        base_commit: Optional[str],
-    ) -> None:
-        """Start a new attempt that revises a reviewed output as the feedback asks.
-
-        The new attempt starts from the reviewed output, not from the
-        stage's original input, and carries the feedback in its prompt. The
-        replaced attempt's record is kept.
-
-        Args:
-            feedback: The owner's feedback text.
-            base_commit: The commit to revise. None means the reviewed
-                output commit. Either way it must be the current head of
-                the reviewed attempt's branch.
-
-        Raises:
-            ProjectStateError: unless the stage is awaiting review, the
-                feedback is not empty, the local checkout has no
-                uncommitted changes, and the commit to revise is the
-                current head of the reviewed branch.
-            APIError: if GitHub cannot be read.
-        """
-        result = manifest.stages.get(stage_name)
-        if result is None or result.status != STAGE_AWAITING_REVIEW:
-            state = "it has not been run" if result is None else f"its status is {result.status}"
-            raise ProjectStateError(
-                f"Stage '{stage_name}' cannot be revised: {state}. --revise applies "
-                f"only to a stage whose output is awaiting review."
-            )
-        if not feedback.strip():
-            raise ProjectStateError(
-                f"Stage '{stage_name}' cannot be revised without feedback: the "
-                f"feedback text is empty."
-            )
-        try:
-            self._local_review().check_ready()
-        except LocalSyncError as error:
-            raise ProjectStateError(
-                f"Stage '{stage_name}' is not revised yet: {error}\n  Review edits "
-                f"you want the revision to start from must be committed and pushed "
-                f"to branch '{result.output_branch}', and that commit named with "
-                f"--revise-commit."
-            ) from error
-        head = self._with_retries(
-            action=lambda: self.github.get_branch_commit(branch=result.output_branch),
-            description=f"Reading branch '{result.output_branch}'",
-        )
-        if (base_commit or result.output_commit) != head:
-            raise ProjectStateError(
-                f"The commit to revise must be the current head of branch "
-                f"'{result.output_branch}', which is {head}"
-                + (
-                    "."
-                    if base_commit else
-                    f" (the branch has moved since commit {result.output_commit} was "
-                    f"reviewed). To revise from it: --revise {stage_name} "
-                    f"--revise-commit {head}"
-                )
-            )
-        manifest.previous_attempts.append(asdict(result))
-        manifest.stages[stage_name] = StageResult(
-            name=stage_name,
-            attempt=result.attempt + 1,
-            revision={
-                "requested_at": utc_now(),
-                "replaces_attempt": result.attempt,
-                "base_branch": result.output_branch,
-                "base_commit": base_commit or result.output_commit,
-                "feedback": feedback,
-                "feedback_sha256": hashlib.sha256(feedback.encode("utf-8")).hexdigest(),
-            },
-        )
-        print(
-            f"\nStage '{stage_name}': attempt {result.attempt} is kept under "
-            f"previous_attempts. A NEW paid agent will be launched as attempt "
-            f"{result.attempt + 1} to revise it as the feedback asks."
-        )
-    
-    def resume_project(
-        self,
-        manifest: PipelineManifest,
-        rerun_stage: Optional[str] = None,
-        revise_stage: Optional[str] = None,
-        feedback: Optional[str] = None,
-        revise_commit: Optional[str] = None,
-    ) -> PipelineManifest:
+    def resume_project(self, manifest: PipelineManifest, repin: bool = False) -> PipelineManifest:
         """Continue an existing project from its manifest, without asking.
 
+        The manifest is first checked against what this orchestrator can
+        verify: its signed records and the configuration it was made with.
         The document is the one recorded when the project was started. It
-        is re-read only if a stage that receives it may still be launched,
+        is re-read only if a stage that receives it is not yet accepted,
         and it must then have the recorded content.
 
         Args:
             manifest: The project's manifest.
-            rerun_stage: Name of a stage to launch again from its original
-                input (a new paid run): one that failed, or one awaiting
-                review whose output is rejected.
-            revise_stage: Name of a stage awaiting review to launch again
-                from its reviewed output, with `feedback` (a new paid run).
-            feedback: The owner's feedback text for revise_stage.
-            revise_commit: With revise_stage: the commit to revise, when
-                the reviewed branch has moved on from the reviewed commit.
-
-        The rerun or revision is made in memory; checkpoint() saves it.
+            repin: Accept that the configuration has changed since the
+                project recorded it, and record the new one. Open notices
+                are written again, bound to the new configuration.
 
         Raises:
             ProjectStateError: if the manifest belongs to another repository
-                or pipeline layout, or the stage cannot be rerun or revised.
+                or pipeline layout, fails a check, or was made with another
+                configuration and `repin` is not set.
             ModelSetupDocumentError: if a stage still needs the document
                 and the recorded document is missing or has changed.
         """
@@ -1453,19 +1829,31 @@ class Orchestrator:
         if not manifest.source_ref:
             raise ProjectStateError("The manifest records no source ref (source_ref).")
         
-        if rerun_stage is not None:
-            self._reset_stage_for_rerun(manifest=manifest, stage_name=rerun_stage)
-        if revise_stage is not None:
-            self._reset_stage_for_revision(
-                manifest=manifest,
-                stage_name=revise_stage,
-                feedback=feedback or "",
-                base_commit=revise_commit,
+        problems = self._manifest_problems(manifest=manifest)
+        if problems:
+            raise ProjectStateError(
+                "The manifest is not accepted as the record of a project:\n  - "
+                + "\n  - ".join(problems)
+                + "\n  A manifest is written only by this orchestrator. A status in it "
+                "counts only together with the signed records that led to it."
             )
+        
+        pinned = manifest.provenance["config_sha256"]
+        if pinned != self.config_sha256:
+            if not repin:
+                raise ProjectStateError(
+                    f"The configuration has changed since this project recorded it "
+                    f"(recorded SHA-256 {pinned}, now {self.config_sha256}). Notices "
+                    f"and decisions are bound to the recorded configuration. Restore "
+                    f"it, or resume once with --repin to record the new one; open "
+                    f"notices are then written again and must be answered again."
+                )
+            self.manifest = manifest
+            self._repin(manifest=manifest)
         
         document_still_needed = any(
             stage.receives_model_setup_document
-            and self._may_still_launch(manifest=manifest, stage=stage)
+            and not self._is_stage_finished(manifest=manifest, stage=stage)
             for stage in self.stages
         )
         if document_still_needed:
@@ -1480,9 +1868,150 @@ class Orchestrator:
         self.manifest = manifest
         return self.manifest
     
+    def _is_stage_finished(self, manifest: PipelineManifest, stage: StageConfig) -> bool:
+        existing = manifest.stages.get(stage.name)
+        return existing is not None and existing.status == STAGE_COMPLETE
+    
+    def _manifest_problems(self, manifest: PipelineManifest) -> list[str]:
+        """Check a manifest read from a file against what can be verified.
+
+        A stage counts as accepted only with the owner's signed decision
+        for its output commit, and as announced only with the signed notice
+        and the host's signed ack. A record that claims more than its
+        signed records show is refused, so a manifest written by hand
+        cannot stand in for a review.
+        """
+        problems = []
+        if not manifest.project_id or not manifest.provenance.get("config_sha256"):
+            return ["it has no project ID or no recorded configuration (provenance)"]
+        
+        bridge = self.bridge
+        decisions = {}
+        try:
+            for decision in manifest.decisions:
+                bridge.verify_stored(record=decision, expected_type="decision")
+                bridge.check_decision_form(decision=decision)
+                decisions[decision["decision_id"]] = decision
+        except BridgeError as error:
+            return [f"a recorded decision cannot be verified: {error}"]
+        
+        earlier_accepted = True
+        for number, stage in enumerate(self.stages, start=1):
+            result = manifest.stages.get(stage.name)
+            if result is None or result.round == 0:
+                if result is not None and result.status not in (STAGE_PENDING, STAGE_DRY_RUN):
+                    problems.append(
+                        f"stage '{stage.name}' has status {result.status} but no round"
+                    )
+                earlier_accepted = False
+                continue
+            
+            prefix = f"stage '{stage.name}' (round {result.round}, {result.status})"
+            limit = stage.max_rounds + manifest.round_limit_raises.get(stage.name, 0)
+            if result.round > limit:
+                problems.append(f"{prefix} is past the stage's limit of {limit} round(s)")
+            if not earlier_accepted:
+                problems.append(f"{prefix} has a round although the stage before it is not accepted")
+            first_round = next(
+                (
+                    earlier for earlier in manifest.previous_rounds
+                    if earlier["name"] == stage.name and earlier["round"] == 1
+                ),
+                asdict(result),
+            )
+            if number > 1 and first_round["origin"] != ORIGIN_ADOPTED:
+                start = decisions.get(first_round["started_by"])
+                if not (
+                    start and start["action"] == ACTION_START_STAGE
+                    and start["stage"] == self.stages[number - 2].name
+                ):
+                    problems.append(
+                        f"{prefix} was started without a recorded decision of the "
+                        f"owner to start it"
+                    )
+            if result.origin == ORIGIN_ADOPTED:
+                if result.agent_id or result.run_id or result.artifacts or result.launches:
+                    problems.append(f"{prefix} is adopted work but records an agent or a run")
+            elif (
+                result.status not in (STAGE_PENDING, STAGE_BLOCKED)
+                and not result.agent_id and not result.launches
+            ):
+                problems.append(f"{prefix} records no agent")
+            
+            try:
+                if result.status in (STAGE_AWAITING_REVIEW, STAGE_COMPLETE):
+                    notice = (result.notice or {}).get("event")
+                    ack = (result.notice or {}).get("ack")
+                    bridge.verify_stored(record=notice, expected_type="notice")
+                    bridge.verify_stored(record=ack, expected_type="ack")
+                    if (
+                        ack["event_id"] != notice["event_id"]
+                        or ack["event_payload_sha256"] != notice["payload_sha256"]
+                    ):
+                        raise BridgeError("the recorded ack is not the ack of its notice")
+                if result.status == STAGE_COMPLETE:
+                    decision = decisions.get((result.review or {}).get("decision_id"))
+                    if not (
+                        decision
+                        and decision["action"] == ACTION_ACCEPT
+                        and decision["stage"] == stage.name
+                        and decision["event_id"] == result.notice["event"]["event_id"]
+                        and decision["commit"] == result.output_commit
+                        and result.output_commit
+                        and result.outcome == OUTCOME_PASSED
+                    ):
+                        raise BridgeError(
+                            "no recorded decision of the owner accepts its output "
+                            "commit, or its round did not pass its checks"
+                        )
+            except BridgeError as error:
+                problems.append(f"{prefix}: {error}")
+            earlier_accepted = result.status == STAGE_COMPLETE
+        return problems
+    
+    def _repin(self, manifest: PipelineManifest) -> None:
+        """Record a changed configuration for a project, and open its notices again.
+
+        Raises:
+            ProjectStateError: if a round is under way. The configuration
+                of a round is fixed from its first launch to its gate.
+        """
+        settled = (STAGE_SYNC_PENDING, STAGE_NOTICE_PENDING, STAGE_AWAITING_REVIEW, STAGE_COMPLETE)
+        under_way = [
+            name for name, result in manifest.stages.items()
+            if result.round > 0 and result.status not in settled
+        ]
+        if under_way:
+            raise ProjectStateError(
+                f"--repin is refused while a round is under way ({', '.join(under_way)}: "
+                f"{manifest.stages[under_way[0]].status}). Resume with the recorded "
+                f"configuration until the round is at its gate."
+            )
+        previous = manifest.provenance["config_sha256"]
+        repins = manifest.provenance.setdefault("repins", [])
+        self._record_event(
+            stage=None, round_number=0, kind=f"repin-{len(repins) + 1}",
+            facts={
+                "What happened": "The configuration was changed and recorded with --repin",
+                "Earlier config SHA-256": previous,
+                "New config SHA-256": self.config_sha256,
+                "Effect": "Open notices are written again; earlier decisions for them no longer apply",
+            },
+        )
+        repins.append({"at": utc_now(), "from": previous, "to": self.config_sha256})
+        manifest.provenance["config_sha256"] = self.config_sha256
+        manifest.provenance["code"] = running_code_sha256()
+        for result in manifest.stages.values():
+            if result.status in (STAGE_NOTICE_PENDING, STAGE_AWAITING_REVIEW):
+                self._reopen_notice(result=result)
+            elif result.status == STAGE_COMPLETE:
+                result.receipt = None
+        self.checkpoint()
+        print(f"\nThe new configuration is recorded (SHA-256 {self.config_sha256}).")
+    
     def validate_models(self) -> tuple[bool, list[str]]:
         """
-        Validate all configured models against GET /v1/models.
+        Validate every configured model against GET /v1/models.
         
         Returns:
             Tuple of (all_valid, list_of_errors)
@@ -1500,39 +2029,37 @@ class Orchestrator:
             
             print(f"  Available models: {len(models)}")
             
-            for stage in self.stages:
-                if stage.model_id is None:
-                    print(f"  Stage '{stage.name}': using configured default model")
+            for label, model_id, model_params in self.model_selections():
+                if model_id is None:
+                    print(f"  {label}: using configured default model")
                     continue
                 
-                is_valid, model = self.api.validate_model(stage.model_id)
+                is_valid, model = self.api.validate_model(model_id)
                 if not is_valid:
                     errors.append(
-                        f"Stage '{stage.name}': model '{stage.model_id}' is not "
+                        f"{label}: model '{model_id}' is not "
                         f"listed by GET /v1/models. Listed model IDs and "
                         f"aliases: {sorted(available_ids)}"
                     )
                     continue
                 
-                alias_note = "" if model.id == stage.model_id else f" (alias of '{model.id}')"
-                print(f"  Stage '{stage.name}': model '{stage.model_id}' OK{alias_note}")
+                alias_note = "" if model.id == model_id else f" (alias of '{model.id}')"
+                print(f"  {label}: model '{model_id}' OK{alias_note}")
                 
-                if stage.model_params:
+                if model_params:
                     params_valid, param_errors = self.api.validate_model_params(
-                        stage.model_id,
-                        stage.model_params,
+                        model_id,
+                        model_params,
                     )
                     if not params_valid:
-                        errors.extend(
-                            f"Stage '{stage.name}': {e}" for e in param_errors
-                        )
+                        errors.extend(f"{label}: {e}" for e in param_errors)
                         continue
                     
                     permitted = {
                         definition["id"]: [v["value"] for v in definition.get("values", [])]
                         for definition in model.parameters
                     }
-                    for param in stage.model_params:
+                    for param in model_params:
                         print(
                             f"    {param['id']} = {param['value']} OK "
                             f"(values the API lists: {', '.join(permitted[param['id']])})"
@@ -1566,12 +2093,13 @@ class Orchestrator:
             print("  Configuration OK")
         return config_valid
     
-    def run_online_validation(self) -> bool:
+    def run_online_validation(self, check_models: bool = True) -> bool:
         """
         Run the checks that need the network. Launches nothing.
         
-        Checks the API key, the configured models (GET /v1/models) and that
-        the project's starting point can be read on GitHub.
+        Checks the API key and the configured models (GET /v1/models),
+        unless `check_models` is False (a command that can launch nothing),
+        and that the project's starting point can be read on GitHub.
         
         Returns:
             True if all checks pass
@@ -1579,24 +2107,27 @@ class Orchestrator:
         print("\n=== Online Validation (uses the network, launches nothing) ===\n")
         all_valid = True
         
-        print("Checking API key...")
-        key_valid, key_errors = self.validate_api_key()
-        if not key_valid:
-            all_valid = False
-            for e in key_errors:
-                print(f"  ERROR: {e}")
-        else:
-            print("  API key configured")
-        
-        if key_valid:
-            print("\nValidating models against GET /v1/models...")
-            models_valid, model_errors = self.validate_models()
-            if not models_valid:
+        if check_models:
+            print("Checking API key...")
+            key_valid, key_errors = self.validate_api_key()
+            if not key_valid:
                 all_valid = False
-                for e in model_errors:
+                for e in key_errors:
                     print(f"  ERROR: {e}")
             else:
-                print("  All models validated")
+                print("  API key configured")
+            
+            if key_valid:
+                print("\nValidating models against GET /v1/models...")
+                models_valid, model_errors = self.validate_models()
+                if not models_valid:
+                    all_valid = False
+                    for e in model_errors:
+                        print(f"  ERROR: {e}")
+                else:
+                    print("  All models validated")
+        else:
+            print("The API key and the models are not checked: this command launches no agent.")
         
         print("\nChecking the starting point on GitHub...")
         source_valid, source_errors = self.validate_source()
@@ -1609,33 +2140,35 @@ class Orchestrator:
     
     def validate_source(self) -> tuple[bool, list[str]]:
         """
-        Check that the starting ref can be read on GitHub.
+        Check that the starting point can be read on GitHub.
         
         For an open project the commit found is recorded as the project's
         source commit, so the first stage starts from exactly that commit.
+        The committed copy of the model setup document is checked at that
+        commit every time, also for a project that recorded it earlier.
         
         Returns:
             Tuple of (is_readable, list_of_errors)
         """
-        if self.manifest is not None and self.manifest.source_commit:
-            print(f"  Source commit recorded for this project: {self.manifest.source_commit}")
-            return True, []
-        
         ref = (
             self.manifest.source_ref
             if self.manifest is not None
             else self.repo_config.get("starting_ref", "main")
         )
+        recorded = self.manifest.source_commit if self.manifest is not None else None
         try:
-            commit = self._resolve_ref(ref=ref)
+            commit = recorded or self._resolve_ref(ref=ref)
+            if recorded:
+                print(f"  Source commit recorded for this project: {recorded}")
+            else:
+                print(f"  '{ref}' in {self.github.full_name} is at commit {commit}")
+            errors = self._source_document_errors(ref=ref, commit=commit)
         except GitHubAPIError as error:
             return False, [
                 f"Could not read '{ref}' in {self.github.full_name} on GitHub: {error}. "
                 f"A private repository needs a token in the GITHUB_TOKEN "
                 f"environment variable."
             ]
-        print(f"  '{ref}' in {self.github.full_name} is at commit {commit}")
-        errors = self._source_document_errors(ref=ref, commit=commit)
         if errors:
             return False, errors
         if self.manifest is not None:
@@ -1719,96 +2252,557 @@ class Orchestrator:
             description=f"Reading branch '{ref}'",
         )
     
-    def _resolve_input(self, stage: StageConfig) -> tuple[str, str]:
-        """Return (description, commit SHA) of the snapshot a stage starts from.
+    # ------------------------------------------------------------------
+    # Reading the repository
+    # ------------------------------------------------------------------
+    
+    def _file_bytes(self, path: Any, commit: str) -> Optional[bytes]:
+        """Return a file's content at a commit, or None if no file is there.
 
-        A stage with a dependency starts from the commit that passed the
-        earlier stage's output check. The first stage starts from the
-        project's source commit, which is read once and then kept. An
-        attempt that revises a reviewed output starts from the commit
-        recorded when the revision was requested.
+        A path that is not a safe relative path names no file.
+
+        Raises:
+            APIError: if GitHub cannot be read.
         """
-        result = self.manifest.stages.get(stage.name)
-        if result is not None and result.revision:
+        if unsafe_relative_path_reason(path):
+            return None
+        key = (commit, path)
+        if key not in self._file_cache:
+            self._file_cache[key] = self._with_retries(
+                action=lambda: self.github.get_file_bytes(path=path, commit=commit),
+                description=f"Reading {path}",
+            )
+        return self._file_cache[key]
+    
+    def _compare(self, base: str, head: str) -> dict:
+        """Return how `head` relates to `base` and the files changed between them."""
+        return self._with_retries(
+            action=lambda: self.github.compare(base=base, head=head),
+            description=f"Comparing {base[:12]} with {head[:12]}",
+        )
+    
+    def _branch_head(self, branch: str) -> str:
+        return self._with_retries(
+            action=lambda: self.github.get_branch_commit(branch=branch),
+            description=f"Reading branch '{branch}'",
+        )
+    
+    def _resolve_input(self, stage: StageConfig, result: StageResult) -> tuple[str, str]:
+        """Return (description, commit SHA) of the snapshot a round starts from.
+
+        A round that revises an earlier round's output starts from the
+        commit recorded when it was reserved. Any other round starts from
+        the stage's input: the accepted output commit of the stage before
+        it, or, for the first stage, the project's source commit, which is
+        read once and then kept.
+        """
+        if result.revision:
             return (
-                f"reviewed output of attempt {result.revision['replaces_attempt']} "
+                f"output of round {result.revision['replaces_round']} "
                 f"(branch '{result.revision['base_branch']}')",
                 result.revision["base_commit"],
             )
         
         if stage.depends_on:
             prior = self.manifest.stages[stage.depends_on]
-            return f"output of stage '{stage.depends_on}'", prior.output_commit
+            return f"accepted output of stage '{stage.depends_on}'", prior.output_commit
         
         if not self.manifest.source_commit:
             self.manifest.source_commit = self._resolve_ref(ref=self.manifest.source_ref)
             self.checkpoint()
         return f"'{self.manifest.source_ref}'", self.manifest.source_commit
     
-    def _run_stage(self, stage: StageConfig) -> StageResult:
-        """Move a stage forward from its recorded state as far as it can go.
+    # ------------------------------------------------------------------
+    # Trial journal
+    # ------------------------------------------------------------------
+    
+    def _record_event(
+        self, stage: Optional[StageConfig], round_number: int, kind: str, facts: dict,
+    ) -> Optional[dict]:
+        """Write an event to the trial journal before the step after it is taken.
 
-        The steps are: launch, wait for the run, check the output, collect
-        artifacts, check the output out locally, wait for the review. Each
-        step is recorded in the manifest before the next one starts, so a
-        later run continues from the recorded step and never launches a
-        second agent for the same step. No step leads past the review:
-        only approve_stage() does.
+        The event's ID follows from the project, the stage, the round and
+        the kind, so an event that is already recorded (the step is taken
+        again after an interruption) is not recorded twice. A dry run
+        records nothing.
+
+        Raises:
+            TrialLogError: if the journal cannot be written. Nothing
+                further is done then.
         """
-        result = self.manifest.stages.get(stage.name)
-        if result is None:
-            result = StageResult(name=stage.name)
-            self.manifest.stages[stage.name] = result
+        if self.dry_run:
+            return None
+        number = self.stage_number(stage=stage) if stage is not None else 0
+        identifier = trial_log.event_id(
+            project_id=self.manifest.project_id, stage_number=number,
+            round_number=round_number, kind=kind,
+        )
+        existing = self.journal.find(event_id=identifier)
+        if existing is not None:
+            return existing
+        event = {
+            "event_id": identifier,
+            "project_id": self.manifest.project_id,
+            "at": utc_now(),
+            "stage": stage.name if stage is not None else "project",
+            "stage_number": number,
+            "round": round_number,
+            "kind": kind,
+            "facts": facts,
+        }
+        self.journal.record(event=event)
+        return event
+    
+    def _project_events(self) -> list[dict]:
+        return [
+            event for event in self.journal.events()
+            if event.get("project_id") == self.manifest.project_id
+        ]
+    
+    def _code_sha256(self) -> str:
+        """One SHA-256 over the hashes of the orchestrator's files that are running."""
+        return hashlib.sha256(canonical_json(running_code_sha256())).hexdigest()
+    
+    # ------------------------------------------------------------------
+    # Rounds
+    # ------------------------------------------------------------------
+    
+    def _reserve_round(
+        self,
+        stage: StageConfig,
+        kind: str,
+        started_by: str,
+        reason: str,
+        revision: Optional[dict] = None,
+        origin: str = ORIGIN_PIPELINE,
+        fields_to_set: Optional[dict] = None,
+    ) -> StageResult:
+        """Count a new round of a stage, on disk, before any work is done for it.
+
+        The round's number is one more than the stage's last round,
+        whatever became of that round. The earlier round's record is kept.
+
+        Raises:
+            ProjectStateError: if the stage has used all its rounds.
+        """
+        previous = self.manifest.stages.get(stage.name)
+        last_round = previous.round if previous is not None else 0
+        limit = self.round_limit(stage=stage)
+        if last_round + 1 > limit:
+            raise ProjectStateError(
+                f"Stage '{stage.name}' has used all {limit} round(s) it is allowed. "
+                f"No further round is started. Only a raise_limit decision of the "
+                f"project owner raises the limit."
+            )
+        result = StageResult(**{
+            "name": stage.name,
+            "round": last_round + 1,
+            "kind": kind,
+            "origin": origin,
+            "started_by": started_by,
+            "revision": revision,
+            # Later rounds of a stage are checked against the same input commit.
+            "baseline_commit": previous.baseline_commit if previous is not None else None,
+            **(fields_to_set or {}),
+        })
+        self._record_event(
+            stage=stage, round_number=result.round, kind="reserved",
+            facts={
+                "What happened": f"Round {result.round} of at most {limit} was counted ({kind})",
+                "Started by": started_by,
+                "Why this route": reason,
+                "Starts from": (
+                    f"commit {revision['base_commit']} (output of round "
+                    f"{revision['replaces_round']})" if revision else
+                    f"commit {result.candidate_commit} on branch '{result.candidate_branch}'"
+                    if origin == ORIGIN_ADOPTED else "the stage's input"
+                ),
+                "Config SHA-256": self.manifest.provenance["config_sha256"],
+                "Orchestrator SHA-256": self._code_sha256(),
+            },
+        )
+        if previous is not None and previous.round > 0:
+            self.manifest.previous_rounds.append(asdict(previous))
+        self.manifest.stages[stage.name] = result
+        self.checkpoint()
+        print(
+            f"\nStage '{stage.name}': round {result.round} of at most {limit} is "
+            f"counted ({kind}; {reason})."
+        )
+        return result
+    
+    def _models_for_round(
+        self, stage: StageConfig, round_number: int,
+    ) -> tuple[dict, Optional[dict]]:
+        """Return (the proposer's model, the reviewer's model or None) for a round.
+
+        With cross-model review the two configured models change roles
+        every round: the stage's model proposes in odd rounds and reviews
+        in even ones.
+        """
+        primary = {"id": stage.model_id, "params": list(stage.model_params)}
+        if not stage.cross_model_enabled:
+            return primary, None
+        secondary = {
+            "id": stage.cross_model["secondary_model_id"],
+            "params": list(stage.cross_model.get("secondary_model_params", [])),
+        }
+        return (primary, secondary) if round_number % 2 == 1 else (secondary, primary)
+    
+    def _review_paths(self, stage: StageConfig, round_number: int) -> dict:
+        """Paths of the two files a cross-model reviewer writes in a round."""
+        folder = f"{stage.cross_model['review_dir']}/round_{round_number:02d}"
+        return {
+            "blind": f"{folder}/blind_assessment.md",
+            "comparison": f"{folder}/comparison.json",
+        }
+    
+    def _stage_content_paths(self, stage: StageConfig) -> list[str]:
+        """The paths a stage's own output lives at."""
+        paths = []
+        if self.working_document_config:
+            paths.append(self.working_document_config["path"])
+        paths.extend(stage.output_manifest.get("required_files", []))
+        paths.extend(stage.output_manifest.get("allowed_paths", []))
+        if stage.verification:
+            paths.append(stage.verification["evidence_file"])
+        return list(dict.fromkeys(paths))
+    
+    def _stage_output_paths(self, stage: StageConfig) -> list[str]:
+        """Every path a round of a stage may add or change."""
+        paths = self._stage_content_paths(stage=stage)
+        if stage.cross_model_enabled:
+            paths.append(stage.cross_model["review_dir"])
+        if self.trial_log_path:
+            paths.append(self.trial_log_path)
+        return list(dict.fromkeys(paths))
+    
+    def _reviewed_files(self, stage: StageConfig) -> list[str]:
+        """The files of a candidate that a reviewer's verdict is bound to."""
+        paths = []
+        if self.working_document_config:
+            paths.append(self.working_document_config["path"])
+        paths.extend(stage.output_manifest.get("required_files", []))
+        if stage.verification:
+            paths.append(stage.verification["evidence_file"])
+        return list(dict.fromkeys(paths))
+    
+    def _evidence_phase(self, stage: StageConfig, result: StageResult) -> Optional[str]:
+        """For a stage that runs parameter batches: what this round may do."""
+        if not stage.verification or stage.verification["kind"] != verification.KIND_PARAMETER_BATCHES:
+            return None
+        if result.revision and result.revision.get("approve_batch"):
+            return verification.PHASE_BATCH
+        return verification.PHASE_DOMAIN_PROPOSAL
+    
+    # ------------------------------------------------------------------
+    # Prompts
+    # ------------------------------------------------------------------
+    
+    def _evidence_section(self, stage: StageConfig, result: StageResult) -> Optional[str]:
+        settings = stage.verification
+        if not settings:
+            return None
+        lines = [
+            EVIDENCE_HEADING,
+            f"Write the file {settings['evidence_file']}.",
+            verification.COMMON_INSTRUCTIONS,
+            "Entries for this stage:",
+            verification.EVIDENCE_INSTRUCTIONS[settings["kind"]],
+        ]
+        if settings["kind"] == verification.KIND_TEST_MAP:
+            lines.append(
+                f"The implementation is {settings['implementation_file']}; the tests "
+                f"are in {settings['test_file']}."
+            )
+        phase = self._evidence_phase(stage=stage, result=result)
+        if phase == verification.PHASE_DOMAIN_PROPOSAL:
+            lines.append(
+                f"THIS ROUND IS A DOMAIN PROPOSAL (\"phase\": \"domain_proposal\"). Run "
+                f"no computation. Propose the parameter domain and the first batch in "
+                f"{settings['next_batch_spec']}, with at most "
+                f"{settings['max_configurations']} configurations. Nothing is computed "
+                f"until the project owner has approved that file."
+            )
+        elif phase == verification.PHASE_BATCH:
+            lines.append(
+                f"THIS ROUND RUNS ONE APPROVED BATCH (\"phase\": \"batch\"). The project "
+                f"owner approved the batch in {settings['next_batch_spec']} as it is in "
+                f"the commit you start from. Run exactly that batch: no more "
+                f"configurations than it allows (never more than "
+                f"{settings['max_configurations']}), every one inside its domain. Copy "
+                f"the batch file unchanged into this round's results folder and name "
+                f"the copy as \"batch_spec_file\". List every run, failed runs included. "
+                f"To propose a further batch, write a new {settings['next_batch_spec']}; "
+                f"it is not run until the owner approves it."
+            )
+        decisions = [
+            f"- {decision['decision_id']}: {decision['action']} on stage "
+            f"'{decision['stage']}', round {decision['round']}: "
+            f"\"{' '.join(decision['chat']['quote'].split())[:300]}\""
+            for decision in (self.manifest.decisions if self.manifest else [])
+        ]
+        if decisions:
+            lines.append(
+                "Decisions of the project owner recorded for this project (where an "
+                "item was decided by one of them, cite its ID as \"decision_ref\"):\n"
+                + "\n".join(decisions)
+            )
+        return "\n".join(lines)
+    
+    def _trial_log_section(self, result: StageResult, report: bool = True) -> Optional[str]:
+        """The trial log rules of a launch: the entries to append and the agent's own entry."""
+        path = self.trial_log_path
+        if not path:
+            return None
+        if self.dry_run:
+            entries = "(the orchestrator's entries are read when the stage is launched)"
+            report_id = "<event ID given at launch>"
+        else:
+            entries = "\n".join(self._expected_log_entries(result=result)).rstrip()
+            report_id = self._report_id(result=result)
+        model = result.model or {}
+        return (
+            f"{TRIAL_LOG_HEADING}\n"
+            f"The file {path} is the append-only record of every attempt of this "
+            f"project. Add to its END, in this order, and change nothing that is "
+            f"already in it (if the file does not exist, create it with what is "
+            f"listed here):\n"
+            f"1. The entries between the two lines below, word for word. They are "
+            f"the orchestrator's own record.\n"
+            f"{LOG_ENTRIES_BEGIN_LINE}\n{entries}\n{LOG_ENTRIES_END_LINE}\n"
+            f"2. One entry of your own, with exactly this heading and these lines, "
+            f"each filled in:\n"
+            f"{OWN_ENTRY_BEGIN_LINE}\n"
+            + trial_log.report_template(
+                report_id=report_id,
+                role=result.role or ROLE_BY_PHASE[result.phase],
+                model=model.get("id") or "default",
+            )
+            + f"{OWN_ENTRY_END_LINE}\n"
+            f"Write short statements of what you did and what you found, from the "
+            f"evidence. Do not write out your reasoning. Add no other entry. The "
+            f"file is checked at the commit you push."
+        )
+    
+    def _round_sections(self, stage: StageConfig, result: StageResult) -> list[str]:
+        """The sections appended to a proposer's prompt for a round."""
+        round_number = max(result.round, 1)
+        sections = [
+            f"{ROUND_HEADING}\n"
+            f"This is round {round_number} of at most {self.round_limit(stage=stage)} "
+            f"for stage {self.stage_number(stage=stage)}. A round is one attempt and "
+            f"is counted whatever its result. Do the whole task in this run; do not "
+            f"leave work for a later round."
+        ]
+        evidence = self._evidence_section(stage=stage, result=result)
+        if evidence:
+            sections.append(evidence)
+        if "allowed_paths" in stage.output_manifest:
+            sections.append(
+                f"{OUTPUT_PATHS_HEADING}\n"
+                f"You may add or change only these paths (a folder includes "
+                f"everything in it). Any other changed file fails the output check.\n"
+                + "\n".join(f"- {path}" for path in self._stage_output_paths(stage=stage))
+            )
+        log_section = self._trial_log_section(result=result)
+        if log_section:
+            sections.append(log_section)
+        return sections
+    
+    def _task_text(self, stage: StageConfig, result: StageResult) -> str:
+        """The task as the proposer was given it, without the round's own sections."""
+        evidence = self._evidence_section(stage=stage, result=result)
+        return build_stage_prompt(
+            stage=stage,
+            model_setup_document=self.model_setup_document,
+            working_document_rules=self.working_document_rules(stage=stage),
+            extra_sections=[evidence] if evidence else None,
+        ).rstrip()
+    
+    def _phase_prompt(self, stage: StageConfig, result: StageResult) -> str:
+        """Return the prompt of the round's current launch.
+
+        Raises:
+            ModelSetupDocumentError: if the stage receives the model setup
+                document and none is selected.
+        """
+        if result.phase == PHASE_PROPOSE:
+            return build_stage_prompt(
+                stage=stage,
+                model_setup_document=self.model_setup_document,
+                working_document_rules=self.working_document_rules(stage=stage),
+                revision=result.revision,
+                extra_sections=self._round_sections(stage=stage, result=result),
+            )
         
+        number = self.stage_number(stage=stage)
+        paths = self._review_paths(stage=stage, round_number=max(result.round, 1))
+        task = (
+            f"THE TASK (given to the other agent; do NOT carry it out and do not "
+            f"write its output files):\n{TASK_BEGIN_LINE}\n"
+            f"{self._task_text(stage=stage, result=result)}\n{TASK_END_LINE}"
+        )
+        if result.phase == PHASE_BLIND:
+            return (
+                f"You are an independent reviewer in the RMB_AI research project for "
+                f"Yang Lu.\n\n"
+                f"INDEPENDENT REVIEW, PART 1 OF 2 (blind assessment): stage {number}, "
+                f"round {max(result.round, 1)}.\n"
+                f"Another agent, running a different model, was given the task printed "
+                f"below and has produced a candidate output. You are NOT shown the "
+                f"candidate in this part, and you must not look for it: do not fetch, "
+                f"list or read any other branch of the repository.\n\n"
+                f"WHAT TO DO:\n"
+                f"- From the inputs the task names, work out yourself what a correct "
+                f"output must state, item by item, and which of the task's "
+                f"requirements are hard to meet.\n"
+                f"- Write that assessment to {paths['blind']}. Make it specific enough "
+                f"to be compared item by item with a candidate.\n"
+                f"- Say what you could not determine. Do not fill a gap with an "
+                f"assumption; name it as open.\n\n"
+                f"RULES:\n"
+                f"- Add only the file {paths['blind']}. Change no other file: not the "
+                f"working document, not the trial log, not any output file of the task.\n"
+                f"- Commit and push before finishing.\n\n"
+                f"{task}\n"
+            )
+        
+        blind = result.cross_review["blind"]
+        candidate_files = self._candidate_file_hashes(stage=stage, result=result)
+        log_section = self._trial_log_section(result=result)
+        return (
+            f"You are an independent reviewer in the RMB_AI research project for "
+            f"Yang Lu.\n\n"
+            f"INDEPENDENT REVIEW, PART 2 OF 2 (comparison): stage {number}, round "
+            f"{result.round}.\n"
+            f"The commit you start from holds a blind assessment, {paths['blind']}, "
+            f"written by your model without sight of the candidate (commit "
+            f"{blind['commit']}). The candidate is commit {result.candidate_commit} "
+            f"on branch '{result.candidate_branch}'.\n\n"
+            f"STEPS:\n"
+            f"1. Bring the candidate in without changing it:\n"
+            f"     git fetch origin {result.candidate_branch}\n"
+            f"     git merge --no-edit {result.candidate_commit}\n"
+            f"2. Compare the candidate with the blind assessment item by item, and "
+            f"check it against the requirements of the task printed below.\n"
+            f"3. Write {paths['comparison']}, a JSON object with:\n"
+            f"   - \"candidate_commit\": \"{result.candidate_commit}\"\n"
+            f"   - \"candidate_files\": {json.dumps(candidate_files, sort_keys=True)}\n"
+            f"     (copy it exactly: the SHA-256 of the files your verdict is about)\n"
+            f"   - \"blind_commit\": \"{blind['commit']}\"\n"
+            f"   - \"blind_assessment_sha256\": \"{blind['sha256']}\"\n"
+            f"   - \"verdict\": \"accept\" or \"reject\": whether the candidate meets "
+            f"the task's requirements\n"
+            f"   - \"agreement\": \"agree\" or \"disagree\": whether the blind "
+            f"assessment and the candidate reach the same results\n"
+            f"   - \"differences\": a list of {{\"item\", \"severity\" (\"blocking\" or "
+            f"\"minor\"), \"detail\"}}, empty if there are none\n"
+            f"   - \"plausible_alternative\": false only if the candidate fails and you "
+            f"see no other route that could meet the requirements; otherwise true\n"
+            f"   - \"rationale\": a short statement, from the evidence, of why you "
+            f"reached the verdict. Do not write out your reasoning.\n"
+            f"   Accept only if no difference is blocking. Do not force agreement: "
+            f"where the two differ and you cannot tell which is right, say so and "
+            f"reject.\n\n"
+            f"RULES:\n"
+            f"- Change only {paths['comparison']}"
+            + (f" and {self.trial_log_path}" if log_section else "")
+            + f". Do not change any file of the candidate, and do not change "
+            f"{paths['blind']}.\n"
+            f"- Your verdict holds for exactly the candidate commit named above. Any "
+            f"later change to the candidate is not covered by it.\n"
+            f"- Commit and push before finishing.\n\n"
+            + (f"{log_section}\n\n" if log_section else "")
+            + f"{task}\n"
+        )
+    
+    def _agent_name(self, stage: StageConfig, result: StageResult) -> str:
+        detail = {
+            PHASE_PROPOSE: f"round {result.round}",
+            PHASE_BLIND: f"round {result.round}, blind review",
+            PHASE_COMPARE: f"round {result.round}, comparison",
+        }[result.phase]
+        return f"Pipeline: {stage.display_name} ({detail})"
+    
+    def _report_id(self, result: StageResult) -> str:
+        """ID of the trial log entry the agent of the current launch writes itself."""
+        stage = self.stage_named(name=result.name)
+        return trial_log.event_id(
+            project_id=self.manifest.project_id,
+            stage_number=self.stage_number(stage=stage),
+            round_number=result.round,
+            kind=f"report-{result.phase}",
+        )
+    
+    def _expected_log_entries(self, result: StageResult) -> list[str]:
+        """The orchestrator's entries the current launch was given to append, in order."""
+        wanted = set(result.log_event_ids or [])
+        return [
+            trial_log.render_entry(event=event)
+            for event in self._project_events() if event["event_id"] in wanted
+        ]
+    
+    # ------------------------------------------------------------------
+    # Running a stage
+    # ------------------------------------------------------------------
+    
+    def _run_stage(self, stage: StageConfig) -> StageResult:
+        """Move a stage's current round forward from its recorded state as far as it can go.
+
+        The steps of a launch are: launch, wait for the run, check the
+        output, collect artifacts. A round has one launch, or three with
+        cross-model review. A closed round either leads to one more round
+        of the same stage (only where the stage allows that) or to the
+        human gate: local checkout, signed notice, the host's ack. Each
+        step is recorded before the next one starts, so a later run
+        continues from the recorded step and never launches a second agent
+        for the same step. Nothing here leads past the gate or into
+        another stage: only apply_decision() does.
+        """
+        result = self.manifest.stages[stage.name]
         print(f"\n--- Stage: {stage.display_name} ---")
-        print(f"  Recorded status: {result.status} (attempt {result.attempt})")
+        print(f"  Recorded status: {result.status} (round {result.round}, {result.phase})")
         
-        self._advance_stage(stage=stage, result=result)
+        self._advance_stage(stage=stage)
         
+        result = self.manifest.stages[stage.name]
         if result.status == STAGE_AWAITING_REVIEW:
             self._print_review_notice(stage=stage, result=result)
         elif result.status == STAGE_COMPLETE:
-            print("  Stage complete")
+            print("  Stage accepted")
         elif result.status != STAGE_DRY_RUN:
             print(f"  Stopped with status {result.status}: {result.error}")
         return result
     
-    def _advance_stage(self, stage: StageConfig, result: StageResult) -> None:
+    def _advance_stage(self, stage: StageConfig) -> None:
         """Take each step the stage's recorded status allows, until one stops it."""
-        if result.status in LAUNCHABLE_STATUSES:
-            if not self._launch(stage=stage, result=result):
+        while True:
+            # A closed round may have been followed by a new one.
+            result = self.manifest.stages[stage.name]
+            if result.status in LAUNCHABLE_STATUSES:
+                if result.origin == ORIGIN_ADOPTED:
+                    raise RuntimeError(
+                        f"Stage '{stage.name}': an adopted round is never launched."
+                    )
+                moved = self._launch(stage=stage, result=result)
+            elif result.status == STAGE_RUNNING:
+                moved = self._wait_for_run(stage=stage, result=result)
+            elif result.status == STAGE_RUN_FINISHED:
+                moved = self._check_output(stage=stage, result=result)
+            elif result.status in (STAGE_OUTPUT_CHECKED, STAGE_ARTIFACTS_FAILED):
+                moved = (
+                    self._collect_artifacts(stage=stage, result=result)
+                    and self._finish_launch(stage=stage, result=result)
+                )
+            elif result.status == STAGE_SYNC_PENDING:
+                moved = self._show_output_locally(stage=stage, result=result)
+            elif result.status == STAGE_NOTICE_PENDING:
+                moved = self._deliver_notice(stage=stage, result=result)
+            else:
                 return
-        
-        reported_branches = None
-        if result.status == STAGE_RUNNING:
-            reported_branches = self._wait_for_run(result=result)
-            if reported_branches is None:
+            if not moved:
                 return
-        
-        if result.status in (STAGE_RUN_FINISHED, STAGE_GATE_FAILED):
-            if not self._check_output(
-                stage=stage, result=result, reported_branches=reported_branches,
-            ):
-                return
-        
-        if result.status in (STAGE_OUTPUT_VERIFIED, STAGE_ARTIFACTS_FAILED):
-            if not self._collect_artifacts(stage=stage, result=result):
-                return
-            result.status = STAGE_SYNC_PENDING
-            self.checkpoint()
-        
-        if result.status == STAGE_SYNC_PENDING:
-            if not self._show_output_locally(stage=stage, result=result):
-                return
-            # Only now, with the output verified in the local checkout, is
-            # the stage announced as ready for review.
-            result.status = STAGE_AWAITING_REVIEW
-            result.review = {
-                "requested_at": utc_now(),
-                "approved_at": None,
-                "approved_commit": None,
-            }
-            self.checkpoint()
     
     def _local_review(self) -> LocalReviewCheckout:
         """
@@ -1822,135 +2816,36 @@ class Orchestrator:
             )
         return self.local_review
     
-    def _review_files(self, stage: StageConfig) -> list[str]:
-        """Paths, from the repository root, of the files the reviewer reads for a stage."""
-        paths = []
-        if self.working_document_config:
-            paths.append(self.working_document_config["path"])
-        for path in stage.output_manifest.get("required_files", []):
-            if path not in paths:
-                paths.append(path)
-        return paths
-    
-    def _show_output_locally(self, stage: StageConfig, result: StageResult) -> bool:
-        """Check the verified output commit out in the local checkout.
+    def _check_gate_ready(self) -> None:
+        """Check that an output could be shown locally and announced. Changes nothing but folders.
 
-        On failure nothing is forced: the stage stays LOCAL_SYNC_PENDING
-        with the reason, it is not announced for review, and a resume tries
-        again without launching anything.
+        Raises:
+            LocalSyncError, BridgeError: if it could not. No paid run is
+                started while its output could not reach the owner.
         """
-        try:
-            result.local_sync = self._local_review().show_commit(
-                branch=result.output_branch,
-                commit=result.output_commit,
-                review_files=self._review_files(stage=stage),
-            )
-        except LocalSyncError as error:
-            result.local_sync = {
-                "verified": False,
-                "checked_at": utc_now(),
-                "branch": result.output_branch,
-                "commit": result.output_commit,
-                "problem": str(error),
-            }
+        self._local_review().check_ready()
+        self.bridge.check_ready()
+    
+    def _launch(self, stage: StageConfig, result: StageResult) -> bool:
+        """Launch the agent of the round's current phase. Returns True once the round has moved on."""
+        proposer, reviewer = self._models_for_round(
+            stage=stage, round_number=max(result.round, 1),
+        )
+        model = proposer if result.phase == PHASE_PROPOSE else reviewer
+        print(f"  Role: {ROLE_BY_PHASE[result.phase]} ({result.phase})")
+        print(f"  Model: {model['id'] or '(default)'}")
+        print(f"  Guardrails appended to prompt: {len(stage.guardrails)}")
+        
+        # A stage that receives the model setup document cannot be launched
+        # (or reported as ready by a dry run) when none has been selected.
+        if stage.receives_model_setup_document and self.model_setup_document is None:
+            result.status = STAGE_BLOCKED
             result.error = (
-                f"The output passed its checks on GitHub (commit {result.output_commit} "
-                f"on branch '{result.output_branch}') but is NOT in the local checkout, "
-                f"so it is not ready for review: {error}"
+                f"Stage '{stage.name}' needs the model setup / equilibrium "
+                f"definition document and none has been selected"
             )
             self.checkpoint()
             return False
-        result.error = None
-        return True
-    
-    def _print_review_notice(self, stage: StageConfig, result: StageResult) -> None:
-        """Print the review notice for a stage that is awaiting review.
-
-        It says the output is in the local checkout only if the checkout is
-        at the output commit, with no uncommitted changes, right now.
-        """
-        number = self.stage_number(stage=stage)
-        manifest = self.manifest_path
-        line = "=" * 70
-        print(f"\n  {line}")
-        print(
-            f"  READY FOR REVIEW: stage {number} of {len(self.stages)}, "
-            f"{stage.display_name} (attempt {result.attempt})"
-        )
-        print(f"  {line}")
-        print(f"  Output commit: {result.output_commit}")
-        print(f"  Output branch: {result.output_branch}")
-        print(f"  On GitHub:     {self._commit_url(commit=result.output_commit)}")
-        
-        sync = result.local_sync or {}
-        try:
-            state = self._local_review().state()
-        except LocalSyncError as error:
-            state = None
-            print(f"  Local checkout: could not be read now ({error})")
-        if state is not None:
-            if state["commit"] == result.output_commit and not state["changed_files"]:
-                print(f"  Local checkout: {sync.get('checkout')} is at this commit now.")
-                print("  Files to review there:")
-                for path in sync.get("review_files", []):
-                    print(f"    {path}")
-            elif state["commit"] == result.output_commit:
-                print(
-                    f"  Local checkout: {sync.get('checkout')} is at this commit, with "
-                    f"{len(state['changed_files'])} uncommitted change(s) of your own."
-                )
-            else:
-                print(
-                    f"  Local checkout: {sync.get('checkout')} is NOT at this commit now "
-                    f"(it is at {state['commit']}). To show the output again: "
-                    f"git checkout {result.output_branch}"
-                )
-        
-        completion = (result.gate or {}).get("completion_record")
-        if completion:
-            print(
-                f"  The stage's own run record (reported by the stage, not verified "
-                f"by the orchestrator): {json.dumps(completion)}"
-            )
-        print(
-            "  The checks that passed show the required files and sections are "
-            "there.\n  They do not show the content is right. That is for this review."
-        )
-        print("  Nothing further is launched until this exact commit is approved:")
-        print(f"    approve: --resume {manifest} --approve {stage.name}")
-        print(
-            f"    revise:  --resume {manifest} --revise {stage.name} "
-            f"--feedback <text file>   (a NEW paid agent)"
-        )
-        print(
-            f"    redo:    --resume {manifest} --rerun-stage {stage.name}"
-            f"   (a NEW paid agent, from the stage's original input)"
-        )
-        print(f"  {line}")
-    
-    def _commit_url(self, commit: str) -> str:
-        return f"https://github.com/{self.github.full_name}/tree/{commit}"
-    
-    def _launch(self, stage: StageConfig, result: StageResult) -> bool:
-        """Launch the stage's agent. Returns True once an agent is known to exist."""
-        print(f"  Model: {stage.model_id or '(default)'}")
-        print(f"  Guardrails appended to prompt: {len(stage.guardrails)}")
-        
-        # The prompt is built before anything else, so a stage that receives
-        # the model setup document cannot be launched (or reported as ready
-        # by a dry run) when no document has been selected.
-        try:
-            prompt_text = build_stage_prompt(
-                stage=stage,
-                model_setup_document=self.model_setup_document,
-                working_document_rules=self.working_document_rules(stage=stage),
-                revision=result.revision,
-            )
-        except ModelSetupDocumentError as error:
-            result.status = STAGE_BLOCKED
-            result.error = str(error)
-            return False
-        
         if stage.receives_model_setup_document:
             print(
                 f"  Model setup document in prompt: "
@@ -1962,28 +2857,9 @@ class Orchestrator:
                 f"  Working document rules in prompt: section "
                 f"{self.stage_number(stage=stage)} of {self.working_document_config['path']}"
             )
-        if result.revision:
-            print(
-                f"  Revision feedback in prompt: {len(result.revision['feedback'])} "
-                f"character(s) (SHA-256 {result.revision['feedback_sha256']})"
-            )
-        print(f"  Prompt: {len(prompt_text)} characters")
         
         if self.dry_run:
-            source = (
-                f"the output of stage '{stage.depends_on}'"
-                if stage.depends_on
-                else f"'{self.manifest.source_ref}'"
-            )
-            required = stage.output_manifest.get("required_files", [])
-            print(f"  [DRY RUN] Would launch a cloud agent from {source}")
-            print(f"  [DRY RUN] Would then check {len(required)} required output file(s)")
-            if self.working_document_config:
-                print("  [DRY RUN] Would then check the working document's sections")
-            if "completion_record" in stage.output_manifest:
-                print("  [DRY RUN] Would then check the stage's completion record")
-            print("  [DRY RUN] Would then check the output out in the local checkout")
-            print("  [DRY RUN] Would then pause for review until that commit is approved")
+            self._print_dry_run(stage=stage, result=result, reviewer=reviewer)
             result.status = STAGE_DRY_RUN
             return False
         
@@ -1997,31 +2873,40 @@ class Orchestrator:
         look_before_launching = result.status == STAGE_LAUNCHING
         if not look_before_launching:
             # A paid run is not started while its output could not be
-            # shown for review afterwards.
+            # shown for review and announced afterwards.
             try:
-                self._local_review().check_ready()
-            except LocalSyncError as error:
+                self._check_gate_ready()
+            except (LocalSyncError, BridgeError) as error:
                 result.status = STAGE_BLOCKED
                 result.error = (
-                    f"No agent was launched: the local checkout could not receive "
-                    f"the stage's output for review. {error}"
+                    f"No agent was launched: the stage's output could not be shown "
+                    f"for review or announced. {error}"
                 )
                 self.checkpoint()
                 return False
             try:
-                result.input_source, result.input_commit = self._resolve_input(stage=stage)
+                self._prepare_launch(stage=stage, result=result, model=model)
             except GitHubAPIError as error:
                 result.error = f"Could not read the starting commit on GitHub: {error}"
                 self.checkpoint()
                 return False
-            result.agent_id = f"bc-{uuid.uuid4()}"
+        
+        prompt_text = self._phase_prompt(stage=stage, result=result)
+        if not look_before_launching:
+            result.prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
             result.status = STAGE_LAUNCHING
             result.error = None
             # The agent ID is on disk before the launch request is sent, so
             # an interrupted launch can be picked up under the same ID.
             self.checkpoint()
-        
-        print(f"  Starting from: {result.input_source}, commit {result.input_commit}")
+        if result.revision and result.phase == PHASE_PROPOSE:
+            print(
+                f"  Feedback in prompt ({result.revision['source']}): "
+                f"{len(result.revision['feedback'])} character(s) "
+                f"(SHA-256 {result.revision['feedback_sha256']})"
+            )
+        print(f"  Prompt: {len(prompt_text)} characters (SHA-256 {result.prompt_sha256})")
+        print(f"  Starting from: commit {result.launch_commit}")
         print(f"  Agent ID: {result.agent_id}")
         run = self._create_agent(
             stage=stage,
@@ -2036,6 +2921,8 @@ class Orchestrator:
             )
             run = None
         if run is None:
+            if result.outcome is not None:
+                return self._close_round(stage=stage, result=result)
             self.checkpoint()
             return False
         
@@ -2048,6 +2935,108 @@ class Orchestrator:
         if run.agent_url:
             print(f"  URL: {run.agent_url}")
         return True
+    
+    def _print_dry_run(
+        self, stage: StageConfig, result: StageResult, reviewer: Optional[dict],
+    ) -> None:
+        """Print what a stage's first round would do. Builds its prompts; sends nothing."""
+        draft = StageResult(name=stage.name, round=1, kind=KIND_INITIAL)
+        prompt_text = self._phase_prompt(stage=stage, result=draft)
+        print(f"  Prompt: {len(prompt_text)} characters")
+        source = (
+            f"the accepted output of stage '{stage.depends_on}'"
+            if stage.depends_on
+            else f"'{self.manifest.source_ref}'"
+        )
+        required = stage.output_manifest.get("required_files", [])
+        limit = self.round_limit(stage=stage)
+        print(
+            f"  [DRY RUN] Rounds: at most {limit}; autonomous correction rounds: "
+            f"{'on' if stage.autonomous_fix else 'off'}"
+        )
+        print(f"  [DRY RUN] Would launch a cloud agent from {source}")
+        print(f"  [DRY RUN] Would then check {len(required)} required output file(s)")
+        if self.working_document_config:
+            print("  [DRY RUN] Would then check the working document's sections")
+        if stage.verification:
+            print(
+                f"  [DRY RUN] Would then check the evidence file "
+                f"{stage.verification['evidence_file']} ({stage.verification['kind']}; "
+                f"form and cross-references, not correctness)"
+            )
+        if self.trial_log_path:
+            print(f"  [DRY RUN] Would then check the trial log {self.trial_log_path}")
+        if reviewer is not None:
+            for phase in (PHASE_BLIND, PHASE_COMPARE):
+                draft.phase = phase
+                draft.candidate_branch, draft.candidate_commit = "<candidate branch>", "<candidate commit>"
+                draft.cross_review = {"blind": {"commit": "<blind commit>", "sha256": "<SHA-256>"}}
+                self._phase_prompt(stage=stage, result=draft)
+            print(
+                f"  [DRY RUN] Would then launch the reviewer ({reviewer['id']}) twice: "
+                f"a blind assessment, then a comparison with the candidate "
+                f"(pass policy: {stage.cross_model['pass_policy']})"
+            )
+        else:
+            print("  [DRY RUN] Cross-model review: off")
+        print("  [DRY RUN] Would then check the output out in the local checkout")
+        print(
+            "  [DRY RUN] Would then write a signed notice and wait for the host's "
+            "ack and the owner's decision"
+        )
+    
+    def _prepare_launch(self, stage: StageConfig, result: StageResult, model: dict) -> None:
+        """Fix what the current launch starts from and is given, and record it.
+
+        Raises:
+            GitHubAPIError: if the starting point cannot be read. Nothing
+                is recorded as launched then.
+        """
+        if result.phase == PHASE_PROPOSE:
+            result.input_source, result.input_commit = self._resolve_input(
+                stage=stage, result=result,
+            )
+            result.baseline_commit = result.baseline_commit or result.input_commit
+            result.launch_commit = result.input_commit
+        elif result.phase == PHASE_BLIND:
+            result.launch_commit = result.input_commit
+        else:
+            result.launch_commit = result.cross_review["blind"]["commit"]
+        
+        writes_log = bool(self.trial_log_path) and result.phase != PHASE_BLIND
+        log_before = None
+        if writes_log:
+            # The comparison merges the candidate, so its log continues the candidate's.
+            log_commit = (
+                result.candidate_commit if result.phase == PHASE_COMPARE else result.launch_commit
+            )
+            log_before = self._file_bytes(path=self.trial_log_path, commit=log_commit)
+        
+        result.role = ROLE_BY_PHASE[result.phase]
+        result.model = model
+        if result.agent_id is None:
+            result.agent_id = f"bc-{uuid.uuid4()}"
+            self.checkpoint()
+        self._record_event(
+            stage=stage, round_number=result.round, kind=f"launch-{result.phase}",
+            facts={
+                "What happened": f"The {result.role} was launched ({result.phase})",
+                "Model": model["id"] or "configured default",
+                "Model parameters": [f"{p['id']}={p['value']}" for p in model["params"]],
+                "Agent ID": result.agent_id,
+                "Starts from": f"commit {result.launch_commit}",
+            },
+        )
+        if writes_log:
+            present = (log_before or b"").decode("utf-8", errors="replace")
+            result.log_event_ids = [
+                event["event_id"]
+                for event in trial_log.entries_missing_from(
+                    log_text=present, events=self._project_events(),
+                )
+            ]
+        else:
+            result.log_event_ids = None
     
     def _find_agent(self, agent_id: str) -> Optional[AgentRun]:
         """Return the agent with this ID, or None if the API says there is none."""
@@ -2065,7 +3054,7 @@ class Orchestrator:
         prompt_text: str,
         look_before_launching: bool,
     ) -> Optional[AgentRun]:
-        """Create the stage's agent at most once, under the agent ID recorded for it.
+        """Create the current launch's agent at most once, under the agent ID recorded for it.
 
         A launch request starts a paid agent, so it is never simply sent
         again. When the outcome of a launch request is unknown (no response,
@@ -2075,9 +3064,9 @@ class Orchestrator:
         409 agent_id_conflict instead of creating a second agent.
 
         Returns:
-            The agent's run, or None. On None the result holds either
-            LAUNCH_REJECTED (the API refused; no agent exists) or stays
-            LAUNCHING (outcome unknown; a later resume checks again).
+            The agent's run, or None. On None either the result holds an
+            outcome (the API refused; no agent exists; the round is over)
+            or it stays LAUNCHING (outcome unknown; a resume checks again).
         """
         last_error: Optional[APIError] = None
         for attempt in range(1, self.retry_max_attempts + 1):
@@ -2109,10 +3098,10 @@ class Orchestrator:
                 return self.api.create_agent(
                     prompt_text=prompt_text,
                     repo_url=self.repo_config["url"],
-                    starting_ref=result.input_commit,
-                    model_id=stage.model_id,
-                    model_params=stage.model_params if stage.model_params else None,
-                    name=f"Pipeline: {stage.display_name}",
+                    starting_ref=result.launch_commit,
+                    model_id=result.model["id"],
+                    model_params=result.model["params"] or None,
+                    name=self._agent_name(stage=stage, result=result),
                     auto_create_pr=self.execution_config.get("auto_create_pr", False),
                     agent_id=result.agent_id,
                 )
@@ -2123,8 +3112,12 @@ class Orchestrator:
                 if error.status_code == 409 or error.is_transient:
                     look_before_launching = True
                     continue
-                result.status = STAGE_LAUNCH_REJECTED
-                result.error = f"The API refused the launch request; no agent was created: {error}"
+                self._launch_failed(
+                    stage=stage, result=result,
+                    description=(
+                        f"The API refused the launch request; no agent was created: {error}"
+                    ),
+                )
                 return None
         
         result.error = (
@@ -2134,13 +3127,39 @@ class Orchestrator:
         )
         return None
     
-    def _wait_for_run(self, result: StageResult) -> Optional[list[dict]]:
-        """Poll the stage's run until it ends.
+    def _launch_failed(self, stage: StageConfig, result: StageResult, description: str) -> None:
+        """Record that the current launch did not take place or did not finish.
+
+        The round is over: no launch is repeated without a decision of
+        the owner.
+        """
+        if result.phase == PHASE_PROPOSE:
+            result.outcome = (
+                OUTCOME_LAUNCH_REJECTED if result.run_id is None else OUTCOME_RUN_FAILED
+            )
+            result.gate = self._failure_gate(stage=stage, problem=description)
+        else:
+            result.outcome = OUTCOME_REVIEW_FAILED
+            result.cross_review = {**(result.cross_review or {}), "failure": description}
+        result.error = description
+        self._record_event(
+            stage=stage, round_number=result.round, kind=f"failed-{result.phase}",
+            facts={
+                "What happened": f"The {result.role}'s launch ({result.phase}) failed",
+                "Agent ID": result.agent_id,
+                "Detail": description,
+                "Result": "No output of this launch was checked",
+            },
+        )
+        self._archive_launch(result=result)
+    
+    def _wait_for_run(self, stage: StageConfig, result: StageResult) -> bool:
+        """Poll the current run until it ends.
 
         Returns:
-            The branches the run reported, if it finished successfully.
-            None otherwise: the stage is then RUN_FAILED, or still RUNNING
-            when the status could not be read or the polls ran out.
+            True once the run has ended: the launch is then RUN_FINISHED,
+            or the round is closed because the run failed. False while
+            the run is still going or its status could not be read.
         """
         polling_config = self.api_config.get("polling", {})
         interval = polling_config.get("interval_seconds", 30)
@@ -2163,7 +3182,7 @@ class Orchestrator:
                     f"no new agent."
                 )
                 self.checkpoint()
-                return None
+                return False
             print(f"  [{poll}/{max_polls}] Status: {run.status}")
             if RunStatus.is_terminal(run.status):
                 break
@@ -2176,20 +3195,22 @@ class Orchestrator:
                 f"keeps waiting for the same run and launches no new agent."
             )
             self.checkpoint()
-            return None
+            return False
         
         result.run_status = run.status
         result.duration_ms = run.duration_ms
         if not RunStatus.is_success(run.status):
-            result.status = STAGE_RUN_FAILED
-            result.error = f"The run ended with status {run.status}: {run.result_text}"
-            self.checkpoint()
-            return None
+            self._launch_failed(
+                stage=stage, result=result,
+                description=f"The run ended with status {run.status}: {run.result_text}",
+            )
+            return self._close_round(stage=stage, result=result)
         
         result.status = STAGE_RUN_FINISHED
         result.error = None
+        self._reported_branches = run.branches
         self.checkpoint()
-        return run.branches
+        return True
     
     def _select_output_branch(self, reported_branches: list[dict]) -> str:
         """Pick the one branch the run pushed to this repository.
@@ -2212,6 +3233,25 @@ class Orchestrator:
                 f"which one holds the stage output cannot be told"
             )
         return branches[0]
+    
+    def _pushed_branch_head(self, result: StageResult) -> tuple[str, str]:
+        """Return (the branch the current run pushed, its head commit).
+
+        Raises:
+            OutputGateError: if the run reported no branch, or several.
+            APIError: if the run or the branch cannot be read.
+        """
+        if result.pushed_branch is None:
+            reported = self._reported_branches
+            if reported is None:
+                reported = self._with_retries(
+                    action=lambda: self.api.get_run(
+                        agent_id=result.agent_id, run_id=result.run_id,
+                    ),
+                    description="Reading the run",
+                ).branches
+            result.pushed_branch = self._select_output_branch(reported_branches=reported)
+        return result.pushed_branch, self._branch_head(branch=result.pushed_branch)
     
     def _missing_required_files(self, stage: StageConfig, commit: str) -> list[str]:
         """Return the stage's required output files that are absent at a commit."""
@@ -2249,7 +3289,8 @@ class Orchestrator:
 
         The rules are the ones working_document_rules() puts in the prompt:
         the stage's own section is there and not empty, the sections of
-        earlier stages are byte-for-byte as at the input commit, no marker
+        earlier stages are byte-for-byte as at the stage's input commit
+        (given as `input_commit`, also in a later round of the stage), no marker
         of a later stage is there, and the source document is unchanged.
         """
         path = self.working_document_config["path"]
@@ -2288,7 +3329,7 @@ class Orchestrator:
                     if before != after:
                         problems.append(
                             f"the section of stage {earlier_number} ('{earlier.name}') in "
-                            f"{path} was changed; it must stay as approved"
+                            f"{path} was changed; it must stay as accepted"
                         )
         except WorkingDocumentError as error:
             problems.append(f"in {path}: {error}")
@@ -2310,192 +3351,424 @@ class Orchestrator:
             )
         return problems
     
-    def _completion_record_problems(
-        self, stage: StageConfig, commit: str,
-    ) -> tuple[list[str], Optional[dict]]:
-        """Check the form of the stage's own run record at a commit.
-
-        Returns the problems found and the record as the stage wrote it. A
-        well-formed record shows the stage reported a finished (or blocked)
-        run. It is not evidence that the reported numbers are right.
-        """
-        path = stage.output_manifest["completion_record"]
-        try:
-            text = self._read_text_file(path=path, commit=commit)
-        except WorkingDocumentError as error:
-            return [str(error)], None
-        if text is None:
-            return [f"the completion record {path} is not at commit {commit}"], None
-        try:
-            record = json.loads(text)
-        except json.JSONDecodeError as error:
-            return [f"the completion record {path} is not valid JSON ({error})"], None
-        if not isinstance(record, dict):
-            return [f"the completion record {path} is not a JSON object"], None
-        
-        problems = []
-        status = record.get("status")
-        if status == "completed":
-            if record.get("exit_code") != 0 or isinstance(record.get("exit_code"), bool):
-                problems.append(f'"exit_code" must be 0 (it is {record.get("exit_code")!r})')
-            if not isinstance(record.get("command"), str) or not record["command"].strip():
-                problems.append('"command" must be the command that was run')
-            if not isinstance(record.get("converged"), bool):
-                problems.append('"converged" must be true or false')
-            residual = record.get("max_abs_residual")
-            if isinstance(residual, bool) or not isinstance(residual, (int, float)):
-                problems.append('"max_abs_residual" must be a number')
-            for key in ("parameters_file", "results_file"):
-                named_path = record.get(key)
-                reason = unsafe_relative_path_reason(named_path)
-                if reason:
-                    problems.append(f'"{key}" must be a path from the repository root: {reason}')
-                elif not self._with_retries(
-                    action=lambda: self.github.file_exists(path=named_path, commit=commit),
-                    description=f"Checking {named_path}",
-                ):
-                    problems.append(f'"{key}" names {named_path}, which is not at commit {commit}')
-        elif status == "blocked":
-            reason = record.get("blocked_reason")
-            if not isinstance(reason, str) or not reason.strip():
-                problems.append('"blocked_reason" must say what stopped the stage')
-        else:
-            problems.append(f'"status" must be "completed" or "blocked" (it is {status!r})')
-        return [f"in the completion record {path}: {problem}" for problem in problems], record
+    def _path_problems(self, stage: StageConfig, baseline_commit: str, commit: str) -> list[str]:
+        """Check that only the stage's own paths differ between its input and a commit."""
+        if "allowed_paths" not in stage.output_manifest:
+            return []
+        comparison = self._compare(base=baseline_commit, head=commit)
+        if comparison["status"] != "ahead":
+            return [
+                f"commit {commit} does not build on the stage's input commit "
+                f"{baseline_commit} (GitHub reports '{comparison['status']}')"
+            ]
+        if comparison["truncated"]:
+            return [
+                "too many files differ from the stage's input commit for GitHub to "
+                "list them all, so the changed paths cannot be checked"
+            ]
+        permitted = self._stage_output_paths(stage=stage)
+        outside = [path for path in comparison["files"] if not path_is_under(path, permitted)]
+        if outside:
+            return [
+                "file(s) outside the stage's output paths were added or changed: "
+                + ", ".join(outside[:20]) + (" ..." if len(outside) > 20 else "")
+            ]
+        return []
     
-    def _output_problems(
-        self, stage: StageConfig, input_commit: str, commit: str,
-    ) -> tuple[list[str], list[str], Optional[dict]]:
-        """Check a stage's output at a commit.
+    def _trial_log_problems(
+        self, result: StageResult, before_commit: str, after_commit: str,
+    ) -> list[str]:
+        """Check the trial log at a commit a launch pushed, or at an adopted commit."""
+        path = self.trial_log_path
+        if not path:
+            return []
+        before = self._file_bytes(path=path, commit=before_commit)
+        after = self._file_bytes(path=path, commit=after_commit)
+        if result.origin == ORIGIN_ADOPTED and before is None and after is None:
+            # Adopted work was given no entry to append. The journal beside
+            # the manifest records the adoption; the next launched round
+            # writes the journal's entries into the repository's log.
+            return []
+        problems = trial_log.repository_log_problems(
+            before=before,
+            after=after,
+            path=path,
+            expected_entries=self._expected_log_entries(result=result),
+            report_id=self._report_id(result=result) if result.origin == ORIGIN_PIPELINE else None,
+        )
+        baseline = result.baseline_commit
+        if after is not None and baseline and baseline != before_commit:
+            at_baseline = self._file_bytes(path=path, commit=baseline) or b""
+            if not after.startswith(at_baseline):
+                problems.append(
+                    f"the trial log {path} no longer begins with what it held at the "
+                    f"stage's input commit {baseline}"
+                )
+        return problems
+    
+    def _evidence_result(
+        self, stage: StageConfig, result: StageResult, commit: str,
+    ) -> Optional[verification.EvidenceResult]:
+        """Check the stage's evidence file at a commit. None: the stage requires none."""
+        settings = stage.verification
+        if not settings:
+            return None
+        number = self.stage_number(stage=stage)
+        section = ""
+        earlier_sections = {}
+        if self.working_document_config:
+            content = self._file_bytes(path=self.working_document_config["path"], commit=commit)
+            text = (content or b"").decode("utf-8", errors="replace")
+            for position, earlier in enumerate(self.stages[:number], start=1):
+                try:
+                    extracted = extract_stage_section(text=text, number=position, name=earlier.name)
+                except WorkingDocumentError:
+                    extracted = ""
+                if position == number:
+                    section = extracted
+                else:
+                    earlier_sections[position] = extracted
+        upstream = {}
+        for earlier in self.stages[:number - 1]:
+            if earlier.verification:
+                evidence, _ = verification.load_evidence(
+                    content=self._file_bytes(
+                        path=earlier.verification["evidence_file"], commit=commit,
+                    ),
+                    path=earlier.verification["evidence_file"],
+                )
+                upstream[earlier.verification["kind"]] = evidence
+        return verification.check_evidence(
+            kind=settings["kind"],
+            context=verification.EvidenceContext(
+                stage_name=stage.name,
+                round_number=result.round,
+                settings=settings,
+                read=lambda path: self._file_bytes(path=path, commit=commit),
+                read_input=lambda path: self._file_bytes(path=path, commit=result.input_commit),
+                section=section,
+                earlier_sections=earlier_sections,
+                upstream_evidence=upstream,
+                decision_ids=frozenset(
+                    decision["decision_id"] for decision in self.manifest.decisions
+                ),
+                phase=self._evidence_phase(stage=stage, result=result),
+            ),
+        )
+    
+    def _failure_gate(
+        self, stage: StageConfig, problem: str, branch: Optional[str] = None,
+    ) -> dict:
+        """The check record of a round that produced no commit to check."""
+        return {
+            "checked_at": utc_now(),
+            "branch": branch,
+            "commit": None,
+            "required_files": list(stage.output_manifest.get("required_files", [])),
+            "missing_files": [],
+            "problems": [problem],
+            "blockers": [],
+            "no_plausible_alternative": False,
+            "evidence": None,
+            "acceptable": False,
+            "passed": False,
+            "note": CHECKS_NOTE,
+        }
+    
+    def _candidate_gate(
+        self, stage: StageConfig, result: StageResult, branch: str, commit: str,
+    ) -> dict:
+        """Check a candidate commit and return the record of the checks.
 
-        Returns:
-            (required files missing there, the problems found, the stage's
-            completion record if it has one). No problem means the output
-            has the required form; it does not mean its content is right.
+        Checked at the commit: the required files, the working document's
+        rules and the source document (against the stage's input commit),
+        the changed paths, the trial log and the stage's evidence file.
+        No problem means the output has the required form; it does not
+        mean its content is right.
+
+        Raises:
+            APIError: if GitHub cannot be read.
         """
+        baseline = result.baseline_commit
+        problems = []
         missing = self._missing_required_files(stage=stage, commit=commit)
         if missing:
-            return missing, [f"required output file(s) missing: {', '.join(missing)}"], None
-        problems = []
-        completion_record = None
+            problems.append(f"required output file(s) missing: {', '.join(missing)}")
         if self.working_document_config:
             problems.extend(self._working_document_problems(
-                stage=stage, input_commit=input_commit, commit=commit,
+                stage=stage, input_commit=baseline, commit=commit,
             ))
-        if "completion_record" in stage.output_manifest:
-            record_problems, completion_record = self._completion_record_problems(
-                stage=stage, commit=commit,
-            )
-            problems.extend(record_problems)
-        return missing, problems, completion_record
-    
-    def _gate_record(
-        self,
-        stage: StageConfig,
-        branch: Optional[str],
-        commit: Optional[str],
-        missing: list[str],
-        problems: list[str],
-        completion_record: Optional[dict],
-    ) -> dict:
+        problems.extend(self._path_problems(
+            stage=stage, baseline_commit=baseline, commit=result.content_commit or commit,
+        ))
+        problems.extend(self._trial_log_problems(
+            result=result, before_commit=result.launch_commit or result.input_commit,
+            after_commit=commit,
+        ))
+        evidence = self._evidence_result(stage=stage, result=result, commit=commit)
+        if evidence is not None:
+            problems.extend(evidence.problems)
+        proposal_only = (
+            self._evidence_phase(stage=stage, result=result) == verification.PHASE_DOMAIN_PROPOSAL
+        )
         return {
             "checked_at": utc_now(),
             "branch": branch,
             "commit": commit,
+            "baseline_commit": baseline,
             "required_files": list(stage.output_manifest.get("required_files", [])),
             "missing_files": missing,
             "problems": problems,
+            # Open items only the owner can close. Reported, never closed here.
+            "blockers": evidence.blockers if evidence is not None else [],
+            "no_plausible_alternative": (
+                evidence.no_plausible_alternative if evidence is not None else False
+            ),
             # As the stage wrote it: reported, not verified.
-            "completion_record": completion_record,
+            "evidence": evidence.to_record() if evidence is not None else None,
+            # A domain proposal holds no results, so it cannot end the stage.
+            "acceptable": not proposal_only,
             "passed": not problems,
+            "note": CHECKS_NOTE,
         }
     
-    def _check_output(
-        self,
-        stage: StageConfig,
-        result: StageResult,
-        reported_branches: Optional[list[dict]],
-    ) -> bool:
-        """Check a finished stage's output and fix the commit it hands on.
+    def _check_output(self, stage: StageConfig, result: StageResult) -> bool:
+        """Check what the current launch pushed. Launches nothing.
 
-        Reads the head commit of the branch the agent pushed and checks, at
-        that commit, that the branch has moved on from the input commit,
-        that every required file exists, that the working document keeps
-        its rules and that the stage's completion record is well-formed.
-        Only a commit that passes is recorded as the stage's output commit.
-        Nothing is launched, so this can be repeated freely after a failure.
+        A failed check is a result of the round and is recorded. If GitHub
+        cannot be read, nothing is recorded as checked: the launch stays
+        RUN_FINISHED and a resume checks again.
         """
-        required = list(stage.output_manifest.get("required_files", []))
-        commit = None
-        missing: list[str] = []
-        problems: list[str] = []
-        completion_record = None
+        check = {
+            PHASE_PROPOSE: self._check_candidate,
+            PHASE_BLIND: self._check_blind,
+            PHASE_COMPARE: self._check_comparison,
+        }[result.phase]
         try:
-            if result.output_branch is None:
-                if reported_branches is None:
-                    reported_branches = self._with_retries(
-                        action=lambda: self.api.get_run(
-                            agent_id=result.agent_id, run_id=result.run_id,
-                        ),
-                        description="Reading the run",
-                    ).branches
-                result.output_branch = self._select_output_branch(
-                    reported_branches=reported_branches,
-                )
-            commit = self._with_retries(
-                action=lambda: self.github.get_branch_commit(branch=result.output_branch),
-                description=f"Reading branch '{result.output_branch}'",
+            check(stage=stage, result=result)
+        except APIError as error:
+            result.error = (
+                f"The output could not be checked: {error}. A resume checks again "
+                f"and launches nothing."
             )
-            if commit == result.input_commit:
-                problems = [
-                    f"branch '{result.output_branch}' is still at the input commit: "
-                    f"the stage pushed no new commit"
-                ]
-            else:
-                missing, problems, completion_record = self._output_problems(
-                    stage=stage, input_commit=result.input_commit, commit=commit,
-                )
-        except (OutputGateError, APIError) as error:
-            problems = [f"the output could not be checked: {error}"]
-        
-        result.gate = self._gate_record(
-            stage=stage, branch=result.output_branch, commit=commit,
-            missing=missing, problems=problems, completion_record=completion_record,
-        )
-        if problems:
-            result.status = STAGE_GATE_FAILED
-            where = (
-                f" at commit {commit} on branch '{result.output_branch}'" if commit else ""
-            )
-            result.error = f"The output check failed{where}: " + "; ".join(problems)
             self.checkpoint()
             return False
-        
-        result.output_commit = commit
-        result.status = STAGE_OUTPUT_VERIFIED
+        result.status = STAGE_OUTPUT_CHECKED
         result.error = None
         self.checkpoint()
-        print(f"  Output branch: {result.output_branch}")
-        print(
-            f"  Output commit: {commit} ({len(required)} required file(s) present; "
-            f"form checks passed)"
-        )
         return True
     
+    def _check_candidate(self, stage: StageConfig, result: StageResult) -> None:
+        """Check the proposer's output and record the candidate commit."""
+        try:
+            branch, commit = self._pushed_branch_head(result=result)
+        except OutputGateError as error:
+            result.gate = self._failure_gate(stage=stage, problem=str(error))
+        else:
+            if commit == result.launch_commit:
+                result.gate = self._failure_gate(
+                    stage=stage, branch=branch,
+                    problem=(
+                        f"branch '{branch}' is still at the input commit: the stage "
+                        f"pushed no new commit"
+                    ),
+                )
+            else:
+                result.candidate_branch, result.candidate_commit = branch, commit
+                result.gate = self._candidate_gate(
+                    stage=stage, result=result, branch=branch, commit=commit,
+                )
+        gate = result.gate
+        self._record_event(
+            stage=stage, round_number=result.round, kind="checked-propose",
+            facts={
+                "What happened": "The proposer's output was checked",
+                "Run status": result.run_status,
+                "Prompt SHA-256": result.prompt_sha256,
+                "Candidate": (
+                    f"commit {gate['commit']} on branch '{gate['branch']}'"
+                    if gate["commit"] else "none"
+                ),
+                "Evidence file": (
+                    stage.verification["evidence_file"] if stage.verification else "none required"
+                ),
+                "Result": "checks passed" if gate["passed"] else "checks FAILED",
+                "Problems": gate["problems"],
+                "Open items for the owner": gate["blockers"],
+                "Note": "Checks of form and cross-references, not of correctness",
+            },
+        )
+        print(
+            f"  Candidate: {gate['commit'] or 'none'}"
+            + (f" on branch '{gate['branch']}'" if gate["branch"] else "")
+        )
+        print(
+            f"  Checks: {'passed' if gate['passed'] else 'FAILED'} "
+            f"({len(gate['problems'])} problem(s), {len(gate['blockers'])} open "
+            f"item(s) for the owner)"
+        )
+    
+    def _check_blind(self, stage: StageConfig, result: StageResult) -> None:
+        """Check the reviewer's blind assessment: one new file on top of the round's input."""
+        path = self._review_paths(stage=stage, round_number=result.round)["blind"]
+        record = {"path": path, "branch": None, "commit": None, "sha256": None, "problems": []}
+        try:
+            branch, commit = self._pushed_branch_head(result=result)
+        except OutputGateError as error:
+            record["problems"].append(str(error))
+        else:
+            record["branch"], record["commit"] = branch, commit
+            relation = self._compare(base=result.input_commit, head=commit)
+            content = self._file_bytes(path=path, commit=commit)
+            if relation["status"] != "ahead":
+                record["problems"].append(
+                    f"commit {commit} does not build on the round's input commit "
+                    f"{result.input_commit} (GitHub reports '{relation['status']}')"
+                )
+            elif relation["files"] != [path]:
+                record["problems"].append(
+                    f"the blind assessment must add only {path}; the files changed "
+                    f"are: {', '.join(relation['files']) or 'none'}"
+                )
+            if content is None or not content.strip():
+                record["problems"].append(f"{path} is missing or empty at commit {commit}")
+            else:
+                record["sha256"] = hashlib.sha256(content).hexdigest()
+        record["checked_at"] = utc_now()
+        result.cross_review = {
+            "reviewer_model": result.model,
+            "pass_policy": stage.cross_model["pass_policy"],
+            "blind": record,
+        }
+        self._record_event(
+            stage=stage, round_number=result.round, kind="checked-blind_review",
+            facts={
+                "What happened": "The reviewer's blind assessment was checked",
+                "Run status": result.run_status,
+                "Prompt SHA-256": result.prompt_sha256,
+                "Blind assessment": (
+                    f"{path} at commit {record['commit']}" if record["commit"] else "none"
+                ),
+                "Written without the candidate": (
+                    "the launch was not given the candidate, and the commit adds only "
+                    "this file to the round's input" if not record["problems"] else "not shown"
+                ),
+                "Problems": record["problems"],
+            },
+        )
+    
+    def _candidate_file_hashes(self, stage: StageConfig, result: StageResult) -> dict:
+        """SHA-256 of each reviewed file as it is at the candidate commit."""
+        if self.dry_run:
+            return {path: "<SHA-256>" for path in self._reviewed_files(stage=stage)}
+        hashes = {}
+        for path in self._reviewed_files(stage=stage):
+            content = self._file_bytes(path=path, commit=result.candidate_commit)
+            if content is not None:
+                hashes[path] = hashlib.sha256(content).hexdigest()
+        return hashes
+    
+    def _check_comparison(self, stage: StageConfig, result: StageResult) -> None:
+        """Check the reviewer's comparison: bound to the candidate, which it leaves unchanged."""
+        paths = self._review_paths(stage=stage, round_number=result.round)
+        blind = result.cross_review["blind"]
+        candidate = result.candidate_commit
+        record = {
+            "path": paths["comparison"], "branch": None, "commit": None,
+            "problems": [], "verdict": None, "contains_candidate_unchanged": False,
+        }
+        try:
+            branch, commit = self._pushed_branch_head(result=result)
+        except OutputGateError as error:
+            record["problems"].append(str(error))
+        else:
+            record["branch"], record["commit"] = branch, commit
+            problems = record["problems"]
+            if self._compare(base=blind["commit"], head=commit)["status"] != "ahead":
+                problems.append(
+                    f"commit {commit} does not build on the blind assessment's commit "
+                    f"{blind['commit']}"
+                )
+            from_candidate = self._compare(base=candidate, head=commit)
+            if from_candidate["status"] != "ahead":
+                problems.append(f"commit {commit} does not contain the candidate commit {candidate}")
+            else:
+                permitted = [paths["blind"], paths["comparison"]]
+                if self.trial_log_path:
+                    permitted.append(self.trial_log_path)
+                changed = [path for path in from_candidate["files"] if path not in permitted]
+                if changed or from_candidate["truncated"]:
+                    problems.append(
+                        f"the reviewer changed file(s) other than its own: "
+                        f"{', '.join(changed[:20]) or 'too many to list'}"
+                    )
+                else:
+                    record["contains_candidate_unchanged"] = True
+            blind_now = self._file_bytes(path=paths["blind"], commit=commit)
+            if blind_now is None or hashlib.sha256(blind_now).hexdigest() != blind["sha256"]:
+                problems.append(f"{paths['blind']} was changed or removed after it was committed")
+            comparison, load_problems = verification.load_evidence(
+                content=self._file_bytes(path=paths["comparison"], commit=commit),
+                path=paths["comparison"],
+            )
+            problems.extend(
+                problem.replace("evidence file", "comparison file") for problem in load_problems
+            )
+            if comparison is not None:
+                comparison_problems, record["verdict"] = verification.check_comparison(
+                    comparison=comparison,
+                    candidate_commit=candidate,
+                    candidate_files=self._candidate_file_hashes(stage=stage, result=result),
+                    blind_commit=blind["commit"],
+                    blind_sha256=blind["sha256"],
+                )
+                problems.extend(f"{paths['comparison']}: {p}" for p in comparison_problems)
+            problems.extend(self._trial_log_problems(
+                result=result, before_commit=candidate, after_commit=commit,
+            ))
+        record["checked_at"] = utc_now()
+        result.cross_review["comparison"] = record
+        verdict = record["verdict"] or {}
+        self._record_event(
+            stage=stage, round_number=result.round, kind="checked-compare",
+            facts={
+                "What happened": "The reviewer's comparison with the candidate was checked",
+                "Run status": result.run_status,
+                "Prompt SHA-256": result.prompt_sha256,
+                "Candidate reviewed": f"commit {candidate}",
+                "Comparison": (
+                    f"{paths['comparison']} at commit {record['commit']}"
+                    if record["commit"] else "none"
+                ),
+                "Reviewer's verdict": (
+                    ("accept" if verdict.get("accept") else "reject")
+                    + ", " + ("agrees" if verdict.get("agree") else "does not agree")
+                    + " with its blind assessment" if record["verdict"] else "not usable"
+                ),
+                "Blocking differences": verdict.get("blocking_differences", []),
+                "Reviewer's rationale": verdict.get("rationale", ""),
+                "Problems": record["problems"],
+                "Note": "Two models that agree are not two independent proofs",
+            },
+        )
+    
     def _collect_artifacts(self, stage: StageConfig, result: StageResult) -> bool:
-        """Download the agent's artifacts into the project's artifact folder.
+        """Download the current launch's artifacts into the project's artifact folder.
 
         An artifact whose path is unsafe is not written; it is recorded
         under `rejected`. A failed listing or download stops the stage with
         ARTIFACTS_FAILED; a resume tries the download again and launches
         nothing.
         """
-        if not self.artifacts_config.get("collect", False):
+        if (
+            not self.artifacts_config.get("collect", False)
+            or result.agent_id is None or result.artifacts is not None
+        ):
             return True
         
-        # One folder per attempt: files from a replaced attempt's agent are
-        # never mixed with those of the attempt that is handed on.
-        root = self.artifacts_root / stage.name / f"attempt_{result.attempt}"
+        # One folder per launch: files of one round or one role are never
+        # mixed with those of another.
+        root = self.artifacts_root / stage.name / f"round_{result.round}" / result.phase
         downloaded = []
         rejected = []
         try:
@@ -2543,119 +3816,1043 @@ class Orchestrator:
         print(f"  Artifacts: {len(downloaded)} saved under {root}, {len(rejected)} rejected")
         return True
     
-    def approve_stage(self, stage_name: str, commit: Optional[str] = None) -> None:
-        """Record the manual approval of a stage that is awaiting review.
+    def _archive_launch(self, result: StageResult) -> None:
+        """Keep the record of the current launch among the round's launches, once."""
+        if result.agent_id is None:
+            return
+        if any(launch["agent_id"] == result.agent_id for launch in result.launches):
+            return
+        result.launches.append({name: getattr(result, name) for name in LAUNCH_FIELDS})
+    
+    def _start_phase(self, result: StageResult, phase: str) -> bool:
+        """Go on to the round's next launch. Nothing of the last launch is carried over."""
+        defaults = StageResult(name=result.name)
+        for name in LAUNCH_FIELDS:
+            setattr(result, name, getattr(defaults, name))
+        result.phase = phase
+        result.status = STAGE_PENDING
+        result.error = None
+        self._reported_branches = None
+        self.checkpoint()
+        return True
+    
+    def _finish_launch(self, stage: StageConfig, result: StageResult) -> bool:
+        """After a launch's output is checked: the round's next launch, or its end."""
+        self._archive_launch(result=result)
+        if result.phase == PHASE_PROPOSE:
+            # A reviewer is paid for only when the candidate has the required form.
+            if (
+                stage.cross_model_enabled and result.origin == ORIGIN_PIPELINE
+                and result.gate["passed"]
+            ):
+                return self._start_phase(result=result, phase=PHASE_BLIND)
+        elif result.phase == PHASE_BLIND:
+            if not result.cross_review["blind"]["problems"]:
+                return self._start_phase(result=result, phase=PHASE_COMPARE)
+        return self._close_round(stage=stage, result=result)
+    
+    def _round_outcome(self, stage: StageConfig, result: StageResult) -> str:
+        """How a round ended, from its recorded checks."""
+        gate = result.gate or {}
+        if gate.get("problems"):
+            return OUTCOME_CHECKS_FAILED
+        review = result.cross_review
+        if review is not None:
+            comparison = review.get("comparison")
+            if review["blind"]["problems"] or comparison is None or comparison["problems"]:
+                return OUTCOME_REVIEW_INVALID
+            verdict = comparison["verdict"]
+            accepted = verdict["accept"] and (
+                review["pass_policy"] == "reviewer_accept" or verdict["agree"]
+            )
+            if not accepted:
+                return OUTCOME_DISAGREEMENT
+        if gate.get("blockers"):
+            return OUTCOME_BLOCKERS_OPEN
+        return OUTCOME_PASSED
+    
+    def _sees_no_alternative(self, result: StageResult) -> bool:
+        """True if the proposer or the reviewer stated that it sees no other route."""
+        comparison = (result.cross_review or {}).get("comparison") or {}
+        verdict = comparison.get("verdict") or {}
+        return bool(
+            (result.gate or {}).get("no_plausible_alternative")
+            or verdict.get("plausible_alternative") is False
+        )
+    
+    def _route(self, stage: StageConfig, result: StageResult) -> tuple[Optional[str], Optional[str]]:
+        """Decide what follows a closed round.
 
-        Without `commit`, the commit that passed the output check is
-        approved, and only if the stage's branch still points at it. If the
-        branch has moved (for example, the reviewer pushed a correction),
-        `commit` must name the branch's current head; the output check is
-        then made at that commit and it becomes the stage's output.
+        Returns:
+            (the reason the round stops at the human gate, None), or
+            (None, the kind of the next round) when the stage allows a
+            round without the owner and one is possible. A round is never
+            followed by a round of another stage.
+        """
+        outcome = result.outcome
+        if result.origin == ORIGIN_ADOPTED:
+            return STOP_ADOPTED, None
+        if outcome == OUTCOME_PASSED:
+            return STOP_PASSED, None
+        if outcome in INFRASTRUCTURE_OUTCOMES:
+            return STOP_INFRASTRUCTURE, None
+        if outcome == OUTCOME_BLOCKERS_OPEN:
+            return STOP_OWNER_DECISION, None
+        if self._sees_no_alternative(result=result):
+            return STOP_NO_ALTERNATIVE, None
+        if result.round >= self.round_limit(stage=stage):
+            return STOP_CAP_EXHAUSTED, None
+        if outcome == OUTCOME_REVIEW_INVALID:
+            return STOP_REVIEW_REQUIRED, None
+        if outcome == OUTCOME_DISAGREEMENT:
+            if stage.autonomous_fix and stage.cross_model["on_disagreement"] == "revise_next_round":
+                return None, KIND_RECONCILE
+            return STOP_DISAGREEMENT, None
+        if stage.autonomous_fix:
+            return None, KIND_FIX
+        return STOP_REVIEW_REQUIRED, None
+    
+    def _next_round_revision(
+        self, stage: StageConfig, result: StageResult, kind: str,
+    ) -> dict:
+        """The revision record of a round the orchestrator starts itself."""
+        if kind == KIND_FIX:
+            source = "checks"
+            feedback = (
+                f"The checks of round {result.round} found:\n"
+                + "\n".join(f"- {problem}" for problem in result.gate["problems"])
+            )
+        else:
+            source = "review"
+            paths = self._review_paths(stage=stage, round_number=result.round)
+            verdict = result.cross_review["comparison"]["verdict"]
+            feedback = (
+                f"The reviewer's verdict on round {result.round}: "
+                f"{'accept' if verdict['accept'] else 'reject'}; its blind assessment "
+                f"{'agrees' if verdict['agree'] else 'does not agree'} with the "
+                f"candidate.\nBlocking differences:\n"
+                + ("\n".join(f"- {item}" for item in verdict["blocking_differences"]) or "- none listed")
+                + f"\nThe reviewer's rationale: {verdict['rationale']}\n"
+                f"The blind assessment is {paths['blind']}; the comparison is "
+                f"{paths['comparison']}."
+            )
+        return {
+            "source": source,
+            "decision_id": None,
+            "requested_at": utc_now(),
+            "replaces_round": result.round,
+            "base_branch": result.output_branch,
+            "base_commit": result.output_commit or result.input_commit,
+            "feedback": feedback,
+            "feedback_sha256": hashlib.sha256(feedback.encode("utf-8")).hexdigest(),
+            "approve_batch": False,
+        }
+    
+    def _close_round(self, stage: StageConfig, result: StageResult) -> bool:
+        """End a round: record how it ended and why, then take the route that follows.
 
-        Either way the local checkout must be at the approved commit with
-        no uncommitted changes: what is approved is what is shown there.
+        The record is written to the trial journal before anything else
+        is done: what was tried is in the events before it, and this event
+        holds the result, what becomes of the candidate, and why the next
+        step was chosen.
+        """
+        result.outcome = result.outcome or self._round_outcome(stage=stage, result=result)
+        comparison = (result.cross_review or {}).get("comparison") or {}
+        if comparison.get("contains_candidate_unchanged"):
+            # The reviewer's commit is the candidate plus the review files.
+            result.output_branch, result.output_commit = comparison["branch"], comparison["commit"]
+        else:
+            result.output_branch, result.output_commit = (
+                result.candidate_branch, result.candidate_commit,
+            )
+        stop_reason, next_kind = self._route(stage=stage, result=result)
+        gate = result.gate or {}
+        
+        if next_kind is not None:
+            disposition = f"KEEP: commit {result.output_commit or result.input_commit} is the base of the next round"
+            rationale = (
+                "The reviewer did not agree with the candidate, and the stage is set to "
+                "reconcile in a further round" if next_kind == KIND_RECONCILE else
+                "The checks failed on points a further round can correct, and the "
+                "stage allows a correction round without the owner"
+            )
+            next_route = (
+                f"Round {result.round + 1} ({next_kind}) of the same stage, started by "
+                f"the orchestrator"
+                + ("; the two models change roles" if stage.cross_model_enabled else "")
+            )
+        else:
+            disposition = (
+                "UNRESOLVED: the output waits for the owner's decision"
+                if result.output_commit else "ABANDON: the round produced no candidate"
+            )
+            rationale = STOP_EXPLANATIONS[stop_reason]
+            next_route = "Human gate: local checkout, signed notice, then the owner's decision"
+        self._record_event(
+            stage=stage, round_number=result.round, kind="closed",
+            facts={
+                "What happened": f"Round {result.round} was closed",
+                "Outcome": result.outcome,
+                "Output": (
+                    f"commit {result.output_commit} on branch '{result.output_branch}'"
+                    if result.output_commit else "none"
+                ),
+                "Problems": gate.get("problems", []),
+                "Open items for the owner": gate.get("blockers", []),
+                "Disposition": disposition,
+                "Rationale": rationale,
+                "Next route": next_route,
+            },
+        )
+        result.closed_at = result.closed_at or utc_now()
+        print(f"  Round {result.round} closed: {result.outcome}. {rationale}.")
+        
+        if next_kind is not None:
+            self._reserve_round(
+                stage=stage,
+                kind=next_kind,
+                started_by="orchestrator",
+                reason=f"round {result.round} ended with {result.outcome}; {rationale.lower()}",
+                revision=self._next_round_revision(stage=stage, result=result, kind=next_kind),
+            )
+            return True
+        
+        result.stop_reason = stop_reason
+        result.status = STAGE_SYNC_PENDING if result.output_commit else STAGE_NOTICE_PENDING
+        self.checkpoint()
+        return True
+    
+    # ------------------------------------------------------------------
+    # The human gate
+    # ------------------------------------------------------------------
+    
+    def _review_files(self, stage: StageConfig, result: StageResult) -> list[str]:
+        """Paths of the files the reviewer reads for a round, as far as they are at its output commit."""
+        paths = self._reviewed_files(stage=stage)
+        if result.cross_review:
+            paths.extend(self._review_paths(stage=stage, round_number=result.round).values())
+        if self.trial_log_path:
+            paths.append(self.trial_log_path)
+        return [
+            path for path in dict.fromkeys(paths)
+            if self._file_bytes(path=path, commit=result.output_commit) is not None
+        ]
+    
+    def _show_output_locally(self, stage: StageConfig, result: StageResult) -> bool:
+        """Check the round's output commit out in the local checkout.
+
+        On failure nothing is forced: the stage stays LOCAL_SYNC_PENDING
+        with the reason, no notice is written, and a resume tries again
+        without launching anything.
+        """
+        try:
+            result.local_sync = self._local_review().show_commit(
+                branch=result.output_branch,
+                commit=result.output_commit,
+                review_files=self._review_files(stage=stage, result=result),
+            )
+        except (LocalSyncError, APIError) as error:
+            result.local_sync = {
+                "verified": False,
+                "checked_at": utc_now(),
+                "branch": result.output_branch,
+                "commit": result.output_commit,
+                "problem": str(error),
+            }
+            result.error = (
+                f"The round's output is on GitHub (commit {result.output_commit} on "
+                f"branch '{result.output_branch}') but is NOT in the local checkout, "
+                f"so no notice is written for it: {error}"
+            )
+            self.checkpoint()
+            return False
+        result.error = None
+        result.status = STAGE_NOTICE_PENDING
+        self.checkpoint()
+        return True
+    
+    def _allowed_actions(self, stage: StageConfig, result: StageResult) -> list[str]:
+        """The decisions the owner can take on a round at its gate."""
+        actions = []
+        if result.outcome == OUTCOME_PASSED and (result.gate or {}).get("acceptable"):
+            actions.append(ACTION_ACCEPT)
+        if result.round >= self.round_limit(stage=stage):
+            actions.append(ACTION_RAISE_LIMIT)
+        else:
+            if result.output_commit:
+                actions.append(ACTION_ITERATE)
+            actions.append(ACTION_REDO)
+        actions.append(ACTION_HALT)
+        return actions
+    
+    def _build_notice(self, stage: StageConfig, result: StageResult, kind: str) -> dict:
+        """Return the signed notice of a round at its gate (`review`) or of an acceptance (`accepted`).
 
         Raises:
-            ProjectStateError: if the stage is not awaiting review, the
-                branch moved and no commit was named, the named commit is
-                not the branch head or fails the output check, or the
-                local checkout is not cleanly at the commit.
+            BridgeError: if it cannot be signed.
+            APIError: if the trial log cannot be read on GitHub.
+        """
+        number = self.stage_number(stage=stage)
+        sequence = result.notice_seq + 1
+        if kind == "accepted":
+            actions = [ACTION_START_STAGE] if number < len(self.stages) else []
+        else:
+            actions = self._allowed_actions(stage=stage, result=result)
+        gate = result.gate or {}
+        sync = result.local_sync or {}
+        log_path = self.trial_log_path
+        pending_entries = []
+        if log_path and result.output_commit:
+            present = (
+                self._file_bytes(path=log_path, commit=result.output_commit) or b""
+            ).decode("utf-8", errors="replace")
+            pending_entries = [
+                trial_log.render_entry(event=event)
+                for event in trial_log.entries_missing_from(
+                    log_text=present, events=self._project_events(),
+                )
+            ]
+        notice = {
+            "event_id": trial_log.event_id(
+                project_id=self.manifest.project_id, stage_number=number,
+                round_number=result.round, kind=f"notice-{sequence}",
+            ),
+            "kind": kind,
+            "created_at": utc_now(),
+            "project_id": self.manifest.project_id,
+            "pipeline": self.manifest.pipeline_name,
+            "repository": self.manifest.repo_url,
+            "stage": {
+                "number": number, "of": len(self.stages),
+                "name": stage.name, "display_name": stage.display_name,
+            },
+            "round": result.round,
+            "round_limit": self.round_limit(stage=stage),
+            "round_kind": result.kind,
+            "origin": result.origin,
+            "outcome": result.outcome,
+            "stop_reason": result.stop_reason,
+            "commits": {
+                "input": result.input_commit,
+                "baseline": result.baseline_commit,
+                "candidate": result.candidate_commit,
+                "content": result.content_commit,
+                "output": result.output_commit,
+            },
+            "branch": result.output_branch,
+            "config_sha256": self.manifest.provenance["config_sha256"],
+            "checks": {
+                "passed": gate.get("passed", False),
+                "problems": gate.get("problems", []),
+                "open_items_for_owner": gate.get("blockers", []),
+                "evidence": gate.get("evidence"),
+                "note": CHECKS_NOTE,
+            },
+            "cross_review": result.cross_review,
+            "local": {
+                "checkout": sync.get("checkout"),
+                "at_output_commit": bool(sync.get("verified")),
+                "review_files": sync.get("review_files", []),
+                "trial_log": (
+                    str(Path(sync["checkout"]) / log_path)
+                    if log_path and sync.get("verified") else None
+                ),
+                "trial_journal": str(self.journal.path),
+                "manifest": str(self.manifest_path.resolve()),
+            },
+            "on_github": {
+                "commit": (
+                    self._commit_url(commit=result.output_commit)
+                    if result.output_commit else None
+                ),
+                "trial_log": log_path,
+            },
+            # Journal entries that are not in the repository's trial log at
+            # the output commit; the next launch of the project appends them.
+            "trial_log_entries_not_yet_in_repository": pending_entries,
+            "allowed_decisions": [{"action": action} for action in actions],
+            "message": self._notice_message(stage=stage, result=result, kind=kind, actions=actions),
+        }
+        return self.bridge.sign_notice(notice=notice)
+    
+    def _notice_message(
+        self, stage: StageConfig, result: StageResult, kind: str, actions: list[str],
+    ) -> str:
+        """The text the host posts in the main chat for a notice."""
+        number = self.stage_number(stage=stage)
+        head = (
+            f"Stage {number} of {len(self.stages)} ({stage.display_name}), round "
+            f"{result.round} of at most {self.round_limit(stage=stage)}"
+        )
+        if kind == "accepted":
+            return (
+                f"{head}: ACCEPTED at commit {result.output_commit}. Nothing was "
+                f"launched. "
+                + (
+                    f"Stage {number + 1} starts only on a separate start_stage decision."
+                    if actions else "It was the last stage."
+                )
+            )
+        gate = result.gate or {}
+        where = (
+            f"Output: commit {result.output_commit} on branch '{result.output_branch}'"
+            + (
+                f", checked out in {result.local_sync['checkout']}."
+                if (result.local_sync or {}).get("verified") else "."
+            )
+            if result.output_commit else "The round produced no output commit."
+        )
+        return (
+            f"{head}: {result.outcome}. Stopped because: "
+            f"{STOP_EXPLANATIONS[result.stop_reason]}. {where} "
+            f"{len(gate.get('problems', []))} problem(s), "
+            f"{len(gate.get('blockers', []))} open item(s) for the owner. "
+            f"Possible decisions: {', '.join(actions)}. {CHECKS_NOTE}"
+        )
+    
+    def _reopen_notice(self, result: StageResult) -> None:
+        """Set a round back to NOTICE_PENDING: a new notice is written and must be acknowledged."""
+        result.notice = None
+        result.review = None
+        result.status = STAGE_NOTICE_PENDING
+    
+    def _deliver_notice(self, stage: StageConfig, result: StageResult) -> bool:
+        """Write the round's signed notice and look for the host's ack.
+
+        The round is AWAITING_REVIEW only once a valid ack is in the
+        inbox. Without it the round stays NOTICE_PENDING: what is printed
+        on the console is never counted as delivery.
+        """
+        try:
+            if result.notice is None:
+                event = self._build_notice(stage=stage, result=result, kind="review")
+                result.notice_seq += 1
+                result.notice = {"event": event, "ack": None}
+                self.checkpoint()
+            event = result.notice["event"]
+            path = self.bridge.emit(notice=event)
+            ack = self.bridge.find_ack(notice=event)
+        except (BridgeError, APIError) as error:
+            result.error = f"The notice of this round could not be handed to the host: {error}"
+            self.checkpoint()
+            return False
+        if ack is None:
+            result.error = (
+                f"The notice {path} is written. The host has not acknowledged posting "
+                f"it in the main chat: {self.bridge.ack_path(event_id=event['event_id'])} "
+                f"is not there. Until it is, the output is NOT announced for review."
+            )
+            self.checkpoint()
+            return False
+        self._record_event(
+            stage=stage, round_number=result.round, kind=f"notice-{result.notice_seq}-acknowledged",
+            facts={
+                "What happened": "The host acknowledged posting the notice in the main chat",
+                "Notice": event["event_id"],
+                "Chat message": ack["chat"]["message_ref"],
+                "Stop reason": result.stop_reason,
+                "Possible decisions": [entry["action"] for entry in event["allowed_decisions"]],
+            },
+        )
+        result.notice["ack"] = ack
+        result.status = STAGE_AWAITING_REVIEW
+        result.review = {"requested_at": utc_now()}
+        result.error = None
+        self.checkpoint()
+        return True
+    
+    def _print_review_notice(self, stage: StageConfig, result: StageResult) -> None:
+        """Print where a round at its gate stands. The console is not the delivery."""
+        number = self.stage_number(stage=stage)
+        event = result.notice["event"]
+        gate = result.gate or {}
+        line = "=" * 70
+        print(f"\n  {line}")
+        print(
+            f"  AWAITING THE OWNER'S DECISION: stage {number} of {len(self.stages)}, "
+            f"{stage.display_name} (round {result.round} of at most "
+            f"{self.round_limit(stage=stage)})"
+        )
+        print(f"  {line}")
+        print(f"  Outcome: {result.outcome}; stopped because: {STOP_EXPLANATIONS[result.stop_reason]}")
+        if result.output_commit:
+            print(f"  Output commit: {result.output_commit}")
+            print(f"  Output branch: {result.output_branch}")
+            print(f"  On GitHub:     {self._commit_url(commit=result.output_commit)}")
+            for path in (result.local_sync or {}).get("review_files", []):
+                print(f"    {path}")
+        for problem in gate.get("problems", []):
+            print(f"  Problem: {problem}")
+        for blocker in gate.get("blockers", []):
+            print(f"  Open item for the owner: {blocker}")
+        print(f"  {CHECKS_NOTE}")
+        print(f"  Notice: {self.bridge.notice_path(event_id=event['event_id'])}")
+        print(f"  Posted in the main chat as: {result.notice['ack']['chat']['message_ref']}")
+        print(
+            f"  Possible decisions: "
+            f"{', '.join(entry['action'] for entry in event['allowed_decisions'])}"
+        )
+        print(
+            f"  Nothing further happens until a signed decision for this notice is "
+            f"applied:\n    --resume {self.manifest_path} --apply-decision <decision file>"
+        )
+        print(f"  {line}")
+    
+    def _commit_url(self, commit: str) -> str:
+        return f"https://github.com/{self.github.full_name}/tree/{commit}"
+    
+    # ------------------------------------------------------------------
+    # The owner's decisions
+    # ------------------------------------------------------------------
+    
+    def _issue_receipt(self, stage: StageConfig, result: StageResult) -> None:
+        """Write the signed notice of an acceptance. It carries the token that starts the next stage.
+
+        If it cannot be written now, the stage stays accepted and a resume
+        writes it again; no decision can start the next stage before it is
+        written.
+        """
+        try:
+            if result.receipt is None:
+                event = self._build_notice(stage=stage, result=result, kind="accepted")
+                result.notice_seq += 1
+                result.receipt = {"event": event}
+                self.checkpoint()
+            self.bridge.emit(notice=result.receipt["event"])
+        except (BridgeError, APIError) as error:
+            result.error = f"The notice of the acceptance could not be written: {error}"
+            self.checkpoint()
+            return
+        result.error = None
+    
+    def _record_decision(
+        self, stage: StageConfig, result: StageResult, decision: dict,
+        disposition: str, next_route: str,
+    ) -> None:
+        """Record an owner's decision in the manifest's list and in the trial journal."""
+        self._record_event(
+            stage=stage, round_number=result.round,
+            kind=f"decision-{decision['decision_id']}",
+            facts={
+                "What happened": f"The project owner's decision was applied: {decision['action']}",
+                "Decision": decision["decision_id"],
+                "Answers notice": decision["event_id"],
+                "Bound to": f"round {decision['round']}, commit {decision['commit']}",
+                "Owner's message": (
+                    f"{decision['chat']['message_ref']}: "
+                    f"\"{' '.join(decision['chat']['quote'].split())}\""
+                ),
+                "Parameters": decision["params"] or "none",
+                "Disposition": disposition,
+                "Next route": next_route,
+            },
+        )
+        self.manifest.decisions.append(decision)
+    
+    def apply_decision(self, path: Path) -> None:
+        """Apply a signed decision of the project owner.
+
+        A decision is accepted only if it is signed with the shared
+        secret, carries the token of the open notice and of its action,
+        and names this project, the stage, the round, the exact output
+        commit and the configuration of that notice. A decision that was
+        applied before does nothing; a second decision for a notice that
+        was decided is refused.
+
+        Raises:
+            ProjectStateError: if the decision cannot be trusted, does not
+                answer the open notice, or what it asks for is not allowed.
             APIError: if GitHub cannot be read.
         """
-        result = self.manifest.stages.get(stage_name)
-        if result is None or result.status != STAGE_AWAITING_REVIEW:
-            state = "it has not been run" if result is None else f"its status is {result.status}"
+        try:
+            decision = self.bridge.read_decision(path=path)
+        except BridgeError as error:
+            raise ProjectStateError(str(error)) from error
+        identifier = decision["decision_id"]
+        if any(applied["decision_id"] == identifier for applied in self.manifest.decisions):
+            print(f"\nDecision {identifier} was applied before. Nothing is done again.")
+            return
+        if self.manifest.halted:
             raise ProjectStateError(
-                f"Stage '{stage_name}' is not awaiting review: {state}."
+                f"The project is halted ({self.manifest.halted['reason'] or 'no reason given'}). "
+                f"No decision is applied until it is taken out of the halt with --unhalt."
             )
         
-        head = self._with_retries(
-            action=lambda: self.github.get_branch_commit(branch=result.output_branch),
-            description=f"Reading branch '{result.output_branch}'",
-        )
-        if commit is None:
-            if head != result.output_commit:
-                raise ProjectStateError(
-                    f"Branch '{result.output_branch}' has moved since stage "
-                    f"'{stage_name}' was checked: the checked output is commit "
-                    f"{result.output_commit}, the branch is now at {head}. To hand "
-                    f"on the new commit, approve it by name: "
-                    f"--approve {stage_name} --approve-commit {head}"
-                )
+        stage = self.stage_named(name=decision.get("stage"))
+        result = self.manifest.stages.get(stage.name)
+        action = decision["action"]
+        if action == ACTION_START_STAGE:
+            notice = (result.receipt or {}).get("event") if (
+                result is not None and result.status == STAGE_COMPLETE
+            ) else None
+            needed = "accepted, with the notice of its acceptance written"
         else:
-            if commit != head:
-                raise ProjectStateError(
-                    f"--approve-commit must be the current head of branch "
-                    f"'{result.output_branch}', which is {head}."
-                )
-        
-        target = commit or result.output_commit
-        new_gate = None
-        if target != result.output_commit:
-            stage = next(s for s in self.stages if s.name == stage_name)
-            missing, problems, completion_record = self._output_problems(
-                stage=stage, input_commit=result.input_commit, commit=target,
-            )
-            if problems:
-                raise ProjectStateError(
-                    f"Commit {target} cannot be approved: the output check fails "
-                    f"there: " + "; ".join(problems)
-                )
-            new_gate = self._gate_record(
-                stage=stage, branch=result.output_branch, commit=target,
-                missing=missing, problems=problems, completion_record=completion_record,
+            notice = (result.notice or {}).get("event") if (
+                result is not None and result.status == STAGE_AWAITING_REVIEW
+            ) else None
+            needed = "awaiting review"
+        if notice is None:
+            state = "it has not been started" if result is None else f"its status is {result.status}"
+            raise ProjectStateError(
+                f"Decision {identifier} ({action}) is not applied: stage "
+                f"'{stage.name}' is not {needed}; {state}."
             )
         
+        expected = {
+            "event_id": notice["event_id"],
+            "event_payload_sha256": notice["payload_sha256"],
+            "project_id": self.manifest.project_id,
+            "round": result.round,
+            "commit": result.output_commit,
+            "config_sha256": self.manifest.provenance["config_sha256"],
+        }
+        differing = [
+            f"{key} is {decision.get(key)!r}, the open notice has {value!r}"
+            for key, value in expected.items() if decision.get(key) != value
+        ]
+        if differing:
+            raise ProjectStateError(
+                f"Decision {identifier} ({action}) does not answer the open notice of "
+                f"stage '{stage.name}':\n  - " + "\n  - ".join(differing)
+                + "\n  A decision holds only for the notice, round, commit and "
+                "configuration it was made for."
+            )
+        allowed = [entry["action"] for entry in notice["allowed_decisions"]]
+        if action not in allowed:
+            raise ProjectStateError(
+                f"Decision {identifier}: '{action}' is not among the decisions the "
+                f"notice {notice['event_id']} allows ({', '.join(allowed) or 'none'})."
+            )
+        if any(applied["event_id"] == notice["event_id"] for applied in self.manifest.decisions):
+            raise ProjectStateError(
+                f"Decision {identifier} is refused: the notice {notice['event_id']} "
+                f"was already answered by another decision."
+            )
+        
+        handler = {
+            ACTION_ACCEPT: self._decide_accept,
+            ACTION_START_STAGE: self._decide_start_stage,
+            ACTION_ITERATE: self._decide_iterate,
+            ACTION_REDO: self._decide_redo,
+            ACTION_RAISE_LIMIT: self._decide_raise_limit,
+            ACTION_HALT: self._decide_halt,
+        }[action]
+        handler(stage=stage, result=result, decision=decision)
+    
+    def _require_gate_ready(self, what: str) -> None:
+        try:
+            self._check_gate_ready()
+        except (LocalSyncError, BridgeError) as error:
+            raise ProjectStateError(
+                f"{what} is not started: its output could not be shown for review "
+                f"or announced. {error}"
+            ) from error
+    
+    def _decide_accept(self, stage: StageConfig, result: StageResult, decision: dict) -> None:
+        """Accept a round's output. Launches nothing: the next stage needs its own decision."""
+        gate = result.gate or {}
+        if result.outcome != OUTCOME_PASSED or not gate.get("acceptable"):
+            raise ProjectStateError(
+                f"Stage '{stage.name}' cannot be accepted: round {result.round} ended "
+                f"with {result.outcome}. Only a round that passed every required "
+                f"check can be accepted."
+            )
+        head = self._branch_head(branch=result.output_branch)
+        if head != result.output_commit:
+            raise ProjectStateError(
+                f"Stage '{stage.name}' is not accepted: branch '{result.output_branch}' "
+                f"has moved from the reviewed commit {result.output_commit} to {head}. "
+                f"The checks"
+                + (" and the reviewer's verdict" if result.cross_review else "")
+                + f" hold for the reviewed commit only. To have the new commit checked, "
+                f"decide iterate with base_commit {head}."
+            )
         try:
             state = self._local_review().state()
         except LocalSyncError as error:
             raise ProjectStateError(
-                f"Stage '{stage_name}' is not approved: the local checkout could "
+                f"Stage '{stage.name}' is not accepted: the local checkout could "
                 f"not be read. {error}"
             ) from error
-        if state["changed_files"]:
+        if state["changed_files"] or state["commit"] != result.output_commit:
             raise ProjectStateError(
-                f"Stage '{stage_name}' is not approved: the local checkout has "
-                f"uncommitted changes to tracked files:\n    "
-                + "\n    ".join(state["changed_files"][:20])
-                + f"\n  To hand your edits on: commit them, push them (git push "
-                f"{self._local_review().remote} {result.output_branch}) and approve "
-                f"the pushed commit: --approve {stage_name} --approve-commit <its SHA>."
-                f"\n  To approve without them, restore the files yourself first."
-            )
-        if state["commit"] != target:
-            raise ProjectStateError(
-                f"Stage '{stage_name}' is not approved: the local checkout is at "
-                f"commit {state['commit']}, not at the commit to approve ({target}). "
-                f"Check it out and review it first (git checkout {result.output_branch}"
-                + ("" if target == result.output_commit else ", then git pull --ff-only")
-                + "), then approve again."
+                f"Stage '{stage.name}' is not accepted: the local checkout is at "
+                f"commit {state['commit']} with {len(state['changed_files'])} "
+                f"uncommitted change(s), not cleanly at the reviewed commit "
+                f"{result.output_commit}. What is accepted is what is shown there."
             )
         
-        if new_gate is not None:
-            result.gate = new_gate
-            result.review["replaced_commit"] = result.output_commit
-            result.output_commit = target
-            result.local_sync = {
-                **(result.local_sync or {}),
-                "commit": target,
-                "verified": True,
-                "synced_at": utc_now(),
-            }
-        
-        result.review["approved_at"] = utc_now()
-        result.review["approved_commit"] = result.output_commit
+        self._record_decision(
+            stage=stage, result=result, decision=decision,
+            disposition=f"KEEP: commit {result.output_commit} is accepted by the owner",
+            next_route=(
+                "Nothing is launched. The next stage starts only on a separate "
+                "start_stage decision"
+            ),
+        )
+        result.review = {
+            **(result.review or {}),
+            "decision_id": decision["decision_id"],
+            "accepted_at": utc_now(),
+            "accepted_commit": result.output_commit,
+        }
         result.status = STAGE_COMPLETE
         result.completed_at = utc_now()
         self.checkpoint()
-        print(f"\nStage '{stage_name}' approved at commit {result.output_commit}")
+        self._issue_receipt(stage=stage, result=result)
+        print(
+            f"\nStage '{stage.name}' is accepted at commit {result.output_commit}. "
+            f"Nothing was launched."
+        )
+    
+    def _decide_start_stage(self, stage: StageConfig, result: StageResult, decision: dict) -> None:
+        """Start the first round of the stage after an accepted one."""
+        number = self.stage_number(stage=stage)
+        if number >= len(self.stages):
+            raise ProjectStateError(f"Stage '{stage.name}' is the last stage; no stage follows it.")
+        following = self.stages[number]
+        existing = self.manifest.stages.get(following.name)
+        if existing is not None and existing.round > 0:
+            raise ProjectStateError(f"Stage '{following.name}' was already started.")
+        self._require_gate_ready(what=f"Stage '{following.name}'")
+        self._record_decision(
+            stage=stage, result=result, decision=decision,
+            disposition=f"KEEP: the accepted commit {result.output_commit} is the next stage's input",
+            next_route=f"Round 1 of stage '{following.name}'",
+        )
+        self._reserve_round(
+            stage=following, kind=KIND_INITIAL, started_by=decision["decision_id"],
+            reason=f"the owner decided to start the stage (decision {decision['decision_id']})",
+        )
+    
+    def _decide_iterate(self, stage: StageConfig, result: StageResult, decision: dict) -> None:
+        """Start a round that revises the reviewed output as the owner's feedback asks."""
+        params = decision["params"]
+        feedback = params.get("feedback", "")
+        approve_batch = params.get("approve_batch", False)
+        base_commit = params.get("base_commit")
+        if not isinstance(feedback, str) or not isinstance(approve_batch, bool) or not (
+            base_commit is None
+            or (isinstance(base_commit, str) and COMMIT_SHA_PATTERN.fullmatch(base_commit))
+        ):
+            raise ProjectStateError(
+                "An iterate decision takes feedback (text), approve_batch (true or "
+                "false) and base_commit (a full commit SHA)."
+            )
+        batches = (
+            stage.verification is not None
+            and stage.verification["kind"] == verification.KIND_PARAMETER_BATCHES
+        )
+        if approve_batch and not batches:
+            raise ProjectStateError(
+                f"approve_batch applies only to a stage that runs parameter batches; "
+                f"stage '{stage.name}' does not."
+            )
+        if not approve_batch and not feedback.strip():
+            raise ProjectStateError(
+                "An iterate decision needs feedback: the text that says what to revise."
+            )
+        self._require_gate_ready(what=f"A further round of stage '{stage.name}'")
+        head = self._branch_head(branch=result.output_branch)
+        if (base_commit or result.output_commit) != head:
+            raise ProjectStateError(
+                f"The commit to revise must be the current head of branch "
+                f"'{result.output_branch}', which is {head}"
+                + (
+                    "." if base_commit else
+                    f" (the branch has moved since commit {result.output_commit} was "
+                    f"reviewed; name the new head as base_commit to revise from it)."
+                )
+            )
+        if approve_batch:
+            spec_path = stage.verification["next_batch_spec"]
+            spec = self._file_bytes(path=spec_path, commit=head)
+            spec_problems = (
+                [f"{spec_path} is not at commit {head}"] if spec is None else
+                verification.batch_file_problems(
+                    content=spec, path=spec_path,
+                    limit=stage.verification["max_configurations"],
+                )
+            )
+            if spec_problems:
+                raise ProjectStateError(
+                    "The batch cannot be approved: " + "; ".join(spec_problems)
+                )
+            approval = (
+                f"The project owner approved the batch in {spec_path} as it is at "
+                f"commit {head} (SHA-256 {hashlib.sha256(spec).hexdigest()}). Run "
+                f"exactly that batch."
+            )
+            feedback = f"{approval}\n{feedback}".rstrip()
+        
+        self._record_decision(
+            stage=stage, result=result, decision=decision,
+            disposition=f"KEEP: commit {head} is the base of the next round",
+            next_route=(
+                f"Round {result.round + 1} of the same stage: "
+                + ("run the approved batch" if approve_batch else "revise as the owner's feedback asks")
+            ),
+        )
+        self._reserve_round(
+            stage=stage, kind=KIND_REVISE, started_by=decision["decision_id"],
+            reason=f"the owner asked for it (decision {decision['decision_id']})",
+            revision={
+                "source": "owner",
+                "decision_id": decision["decision_id"],
+                "requested_at": utc_now(),
+                "replaces_round": result.round,
+                "base_branch": result.output_branch,
+                "base_commit": head,
+                "feedback": feedback,
+                "feedback_sha256": hashlib.sha256(feedback.encode("utf-8")).hexdigest(),
+                "approve_batch": approve_batch,
+            },
+        )
+    
+    def _decide_redo(self, stage: StageConfig, result: StageResult, decision: dict) -> None:
+        """Start a round from the stage's input again; the reviewed output is not used."""
+        self._require_gate_ready(what=f"A further round of stage '{stage.name}'")
+        self._record_decision(
+            stage=stage, result=result, decision=decision,
+            disposition="ABANDON: the owner asked for a new start from the stage's input",
+            next_route=f"Round {result.round + 1} of the same stage, from the stage's input",
+        )
+        self._reserve_round(
+            stage=stage, kind=KIND_REDO, started_by=decision["decision_id"],
+            reason=f"the owner asked for a new start (decision {decision['decision_id']})",
+        )
+    
+    def _decide_raise_limit(self, stage: StageConfig, result: StageResult, decision: dict) -> None:
+        """Raise the stage's round limit. Starts nothing: the round's notice is written again."""
+        by = decision["params"].get("by")
+        if not (isinstance(by, int) and not isinstance(by, bool) and by >= 1):
+            raise ProjectStateError("A raise_limit decision needs by: a whole number, 1 or more.")
+        raises = self.manifest.round_limit_raises
+        self._record_decision(
+            stage=stage, result=result, decision=decision,
+            disposition="UNRESOLVED: the output still waits for the owner's decision",
+            next_route=(
+                f"The stage's limit is raised by {by} to "
+                f"{self.round_limit(stage=stage) + by} round(s). The round's notice is "
+                f"written again with the decisions that are now possible"
+            ),
+        )
+        raises[stage.name] = raises.get(stage.name, 0) + by
+        self._reopen_notice(result=result)
+        self.checkpoint()
+        print(
+            f"\nThe round limit of stage '{stage.name}' is now "
+            f"{self.round_limit(stage=stage)}. Nothing was launched."
+        )
+    
+    def _decide_halt(self, stage: StageConfig, result: StageResult, decision: dict) -> None:
+        self._record_decision(
+            stage=stage, result=result, decision=decision,
+            disposition="UNRESOLVED: the project is halted",
+            next_route="Nothing, until the project is taken out of the halt with --unhalt",
+        )
+        self._set_halt(reason=str(decision["params"].get("reason", "")), by=decision["decision_id"])
+    
+    def _set_halt(self, reason: str, by: str) -> None:
+        self.manifest.halted = {"at": utc_now(), "reason": reason, "by": by}
+        self.checkpoint()
+        print("\nThe project is halted. Nothing is launched and no decision is applied.")
+    
+    def halt(self, reason: str) -> None:
+        """Halt the project from the command line. Nothing is launched while it is halted."""
+        if self.manifest.halted:
+            raise ProjectStateError("The project is already halted.")
+        number = 1 + sum(event["kind"].startswith("halt-") for event in self._project_events())
+        self._record_event(
+            stage=None, round_number=0, kind=f"halt-{number}",
+            facts={"What happened": "The project was halted with --halt", "Reason": reason},
+        )
+        self._set_halt(reason=reason, by="command line")
+    
+    def unhalt(self) -> None:
+        """Take the project out of a halt. A notice that the halt answered is written again."""
+        if not self.manifest.halted:
+            raise ProjectStateError("The project is not halted.")
+        number = 1 + sum(event["kind"].startswith("unhalt-") for event in self._project_events())
+        self._record_event(
+            stage=None, round_number=0, kind=f"unhalt-{number}",
+            facts={
+                "What happened": "The project was taken out of its halt with --unhalt",
+                "The halt": self.manifest.halted,
+            },
+        )
+        answered = {decision["event_id"] for decision in self.manifest.decisions}
+        for result in self.manifest.stages.values():
+            if (
+                result.status == STAGE_AWAITING_REVIEW
+                and result.notice["event"]["event_id"] in answered
+            ):
+                self._reopen_notice(result=result)
+        self.manifest.halted = None
+        self.checkpoint()
+        print("\nThe project is no longer halted.")
+    
+    # ------------------------------------------------------------------
+    # Adoption of existing work
+    # ------------------------------------------------------------------
+    
+    def adopt_stage(
+        self,
+        stage_name: str,
+        branch: str,
+        commit: str,
+        input_commit: str,
+        content_commit: Optional[str] = None,
+    ) -> None:
+        """Register work that already exists on a branch as a round of a stage. Launches nothing.
+
+        The adopted commit is checked like a candidate an agent pushed,
+        against the given input commit. The round counts against the
+        stage's limit, its origin is recorded as adopted, and no agent,
+        run or artifact is recorded for it. Evidence that is not there is
+        a failed check. The round then goes to the human gate like any
+        other; adoption never accepts anything and is never followed by
+        an automatic round.
+
+        Args:
+            branch: The branch that holds the work.
+            commit: Its current head: the commit that is adopted.
+            input_commit: The commit the stage's work started from.
+            content_commit: The commit that holds the stage's content,
+                when the adopted commit is a later one (for example after
+                the orchestrator itself was changed on the branch). The
+                stage's own files must be the same in both.
+
+        Raises:
+            ProjectStateError: if any of that does not hold. Nothing is
+                recorded then.
+            APIError: if GitHub cannot be read.
+        """
+        stage = self.stage_named(name=stage_name)
+        number = self.stage_number(stage=stage)
+        for label, value in (
+            ("--adopt-commit", commit), ("--adopt-input-commit", input_commit),
+            ("--adopt-content-commit", content_commit),
+        ):
+            if value is not None and not COMMIT_SHA_PATTERN.fullmatch(value):
+                raise ProjectStateError(f"{label} must be a full 40-character commit SHA.")
+        existing = self.manifest.stages.get(stage.name)
+        if existing is not None and existing.round > 0:
+            raise ProjectStateError(
+                f"Stage '{stage.name}' already has a round in this project; work is "
+                f"adopted only for a stage that was not started."
+            )
+        if number == 1:
+            expected_input = self.manifest.source_commit
+            origin_of_input = "the project's source commit"
+        else:
+            prior = self.manifest.stages.get(self.stages[number - 2].name)
+            if prior is None or prior.status != STAGE_COMPLETE:
+                raise ProjectStateError(
+                    f"Stage '{stage.name}' cannot be adopted: the stage before it is "
+                    f"not accepted."
+                )
+            expected_input = prior.output_commit
+            origin_of_input = f"the accepted output of stage '{prior.name}'"
+        if input_commit != expected_input:
+            raise ProjectStateError(
+                f"The input commit given ({input_commit}) is not {origin_of_input} "
+                f"({expected_input})."
+            )
+        head = self._branch_head(branch=branch)
+        if head != commit:
+            raise ProjectStateError(
+                f"The commit to adopt must be the current head of branch '{branch}', "
+                f"which is {head}, not {commit}."
+            )
+        content = content_commit or commit
+        for label, base, later, accepted in (
+            ("the adopted commit", input_commit, commit, ("ahead",)),
+            ("the content commit", input_commit, content, ("ahead",)),
+            ("the adopted commit", content, commit, ("ahead", "identical")),
+        ):
+            relation = self._compare(base=base, head=later)
+            if relation["status"] not in accepted:
+                raise ProjectStateError(
+                    f"Nothing is adopted: {label} {later} does not build on {base} "
+                    f"(GitHub reports '{relation['status']}')."
+                )
+        if content != commit:
+            if relation["truncated"]:
+                raise ProjectStateError(
+                    "Nothing is adopted: too many files differ between the content "
+                    "commit and the adopted commit for GitHub to list them all."
+                )
+            changed = [
+                path for path in relation["files"]
+                if path_is_under(path, self._stage_content_paths(stage=stage))
+            ]
+            if changed:
+                raise ProjectStateError(
+                    f"Nothing is adopted: the stage's own files differ between the "
+                    f"content commit {content} and the adopted commit {commit}: "
+                    f"{', '.join(changed)}."
+                )
+        
+        self._require_gate_ready(what=f"The adoption for stage '{stage.name}'")
+        
+        draft = StageResult(
+            name=stage.name, round=1, kind=KIND_ADOPTED, origin=ORIGIN_ADOPTED,
+            input_commit=input_commit, baseline_commit=input_commit, content_commit=content,
+        )
+        gate = self._candidate_gate(stage=stage, result=draft, branch=branch, commit=commit)
+        result = self._reserve_round(
+            stage=stage, kind=KIND_ADOPTED, started_by="adopt", origin=ORIGIN_ADOPTED,
+            reason="existing work on a branch was registered with --adopt; no agent was launched",
+            fields_to_set={
+                "status": STAGE_OUTPUT_CHECKED,
+                "input_source": f"adopted work; input commit given: {origin_of_input}",
+                "input_commit": input_commit,
+                "baseline_commit": input_commit,
+                "candidate_branch": branch,
+                "candidate_commit": commit,
+                "content_commit": content,
+                "gate": gate,
+            },
+        )
+        self._record_event(
+            stage=stage, round_number=result.round, kind="adopted",
+            facts={
+                "What happened": "Existing work was adopted and checked; no agent was launched",
+                "Origin": "adopted (no agent, run or artifact belongs to this round)",
+                "Adopted": f"commit {commit}, the head of branch '{branch}'",
+                "Stage content from": f"commit {content}",
+                "Input": f"commit {input_commit}",
+                "Result": "checks passed" if gate["passed"] else "checks FAILED",
+                "Problems": gate["problems"],
+                "Open items for the owner": gate["blockers"],
+                "Note": (
+                    "Adoption accepts nothing. Checks of form and cross-references, "
+                    "not of correctness"
+                ),
+            },
+        )
+        self.checkpoint()
+        print(
+            f"  Adopted commit {commit} for stage '{stage.name}': checks "
+            f"{'passed' if gate['passed'] else 'FAILED'} ({len(gate['problems'])} "
+            f"problem(s), {len(gate['blockers'])} open item(s)). Nothing was launched "
+            f"and nothing is accepted."
+        )
+    
+    # ------------------------------------------------------------------
+    # The pipeline
+    # ------------------------------------------------------------------
     
     def run_pipeline(self) -> PipelineManifest:
         """
-        Run the stages of the open project, in order, until one cannot go on.
+        Move the open project forward as far as it can go without the owner.
         
         A project is opened by start_new_project() (which asks for the
-        model setup document) or by resume_project().
+        model setup document) or by resume_project(). At most one stage is
+        worked on: the first one that is not accepted, and only if a round
+        was started for it. A round of a later stage is started only by
+        apply_decision().
         
         Returns:
             PipelineManifest with all stage results
@@ -2670,30 +4867,45 @@ class Orchestrator:
             )
         
         print(f"\n=== Pipeline: {self.manifest.pipeline_name} ===")
-        print(f"Project started: {self.manifest.started_at}")
+        print(f"Project: {self.manifest.project_id}, started {self.manifest.started_at}")
         print(f"Repository: {self.manifest.repo_url}")
         print(f"Stages: {len(self.stages)}")
         print(f"Dry run: {self.dry_run}")
         
-        done_statuses = (STAGE_COMPLETE, STAGE_DRY_RUN)
+        if self.manifest.halted:
+            print(
+                f"\nThe project is halted ({self.manifest.halted['reason'] or 'no reason given'}). "
+                f"Nothing is done."
+            )
+            return self.manifest
+        
         for stage in self.stages:
-            existing = self.manifest.stages.get(stage.name)
-            if existing and existing.status == STAGE_COMPLETE:
-                print(f"\n--- Stage: {stage.display_name} [already complete] ---")
+            result = self.manifest.stages.get(stage.name)
+            if self.dry_run:
+                self.manifest.stages[stage.name] = StageResult(name=stage.name)
+                self._run_stage(stage)
                 continue
-            
-            if stage.depends_on:
-                dependency = self.manifest.stages.get(stage.depends_on)
-                if not dependency or dependency.status not in done_statuses:
-                    print(
-                        f"\n--- Stage: {stage.display_name} "
-                        f"[not started: waits for '{stage.depends_on}'] ---"
-                    )
-                    break
-            
-            result = self._run_stage(stage)
-            if result.status not in done_statuses:
+            if result is not None and result.status == STAGE_COMPLETE:
+                print(f"\n--- Stage: {stage.display_name} [accepted] ---")
+                self._issue_receipt(stage=stage, result=result)
+                continue
+            if (
+                result is None and stage is self.stages[0]
+                and self.manifest.provenance.get("created_by") == "execute"
+            ):
+                self._reserve_round(
+                    stage=stage, kind=KIND_INITIAL, started_by="execute",
+                    reason="the project was started with --execute",
+                )
+                result = self.manifest.stages[stage.name]
+            if result is None or result.round == 0:
+                print(
+                    f"\n--- Stage: {stage.display_name} [not started: starts only on "
+                    f"a start_stage decision of the owner] ---"
+                )
                 break
+            self._run_stage(stage)
+            break
         
         if all(
             stage.name in self.manifest.stages
@@ -2703,7 +4915,7 @@ class Orchestrator:
             self.manifest.completed_at = self.manifest.completed_at or utc_now()
             final = self.manifest.stages[self.stages[-1].name]
             print(
-                f"\nEvery stage is approved. The approved final output is commit "
+                f"\nEvery stage is accepted. The accepted final output is commit "
                 f"{final.output_commit} on branch '{final.output_branch}'. Nothing "
                 f"was merged into any other branch."
             )
@@ -2741,11 +4953,23 @@ class Orchestrator:
         with open(temporary_path, "w", encoding="utf-8") as f:
             json.dump(self.manifest.to_dict(), f, indent=2)
         os.replace(temporary_path, path)
+    
+
+STOP_EXPLANATIONS = {
+    STOP_PASSED: "the round passed every required check and waits for the owner's review",
+    STOP_REVIEW_REQUIRED: "the round did not pass, and a further round needs the owner's decision",
+    STOP_CAP_EXHAUSTED: "the stage has used all the rounds it is allowed",
+    STOP_NO_ALTERNATIVE: "the round did not pass and no other route was seen",
+    STOP_OWNER_DECISION: "items are open that only the project owner can decide",
+    STOP_DISAGREEMENT: "the reviewer did not agree with the candidate",
+    STOP_INFRASTRUCTURE: "a launch failed; no launch is repeated without the owner",
+    STOP_ADOPTED: "existing work was adopted; adoption accepts nothing",
+}
 
 
 def load_config(config_path: Path) -> dict:
     """Load configuration from YAML file."""
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -2757,21 +4981,22 @@ def load_manifest(manifest_path: Path) -> PipelineManifest:
 
 NEXT_STEP_BY_STATUS = {
     STAGE_AWAITING_REVIEW: (
-        "Review the output in the local checkout, then approve it: "
-        "--resume {manifest} --approve {stage}\n"
-        "            (approving a stage also launches the next one). To have it "
-        "revised by a NEW paid\n            agent: --resume {manifest} --revise {stage} "
-        "--feedback <text file>. To discard it and\n            launch a NEW paid agent "
-        "from the stage's original input: --resume {manifest} --rerun-stage {stage}"
+        "The notice is posted. Nothing happens until the owner's signed decision is "
+        "applied:\n            --resume {manifest} --apply-decision <decision file>"
+    ),
+    STAGE_NOTICE_PENDING: (
+        "The signed notice is in the outbox; the host has not acknowledged posting it "
+        "in the main chat.\n            --resume {manifest} looks for the ack again. "
+        "Nothing is launched, and the output is not announced."
     ),
     STAGE_SYNC_PENDING: (
-        "The output is on GitHub but not in the local checkout, so it is not ready "
-        "for review.\n            Fix the cause given above; --resume {manifest} then "
+        "The output is on GitHub but not in the local checkout, so no notice is "
+        "written.\n            Fix the cause given above; --resume {manifest} then "
         "tries the local checkout again.\n            No new agent is launched."
     ),
     STAGE_BLOCKED: (
         "No agent was launched. Fix the cause given above; --resume {manifest} then "
-        "launches this stage."
+        "launches this round."
     ),
     STAGE_LAUNCHING: (
         "It is not known whether the agent was created. --resume {manifest} first "
@@ -2780,21 +5005,22 @@ NEXT_STEP_BY_STATUS = {
     STAGE_RUNNING: (
         "--resume {manifest} keeps waiting for the same run. No new agent is launched."
     ),
-    STAGE_LAUNCH_REJECTED: (
-        "No agent was created. Fix the cause; --resume {manifest} then launches this stage."
-    ),
-    STAGE_RUN_FAILED: (
-        "--resume {manifest} launches nothing for this stage. To launch a NEW paid "
-        "agent for it: --resume {manifest} --rerun-stage {stage}"
-    ),
-    STAGE_GATE_FAILED: (
-        "--resume {manifest} checks the output again and launches nothing. To launch "
-        "a NEW paid agent instead: --resume {manifest} --rerun-stage {stage}"
+    STAGE_RUN_FINISHED: (
+        "--resume {manifest} checks the output again. No new agent is launched."
     ),
     STAGE_ARTIFACTS_FAILED: (
         "--resume {manifest} tries the download again. No new agent is launched."
     ),
+    STAGE_COMPLETE: (
+        "Accepted. The next stage starts only on the owner's start_stage decision:\n"
+        "            --resume {manifest} --apply-decision <decision file>"
+    ),
 }
+
+EXIT_COMPLETE = 0
+EXIT_FAILED = 1
+EXIT_WAITING_FOR_OWNER = 2
+EXIT_NOTICE_PENDING = 3
 
 
 def build_local_review(config: dict, config_path: Path) -> LocalReviewCheckout:
@@ -2807,9 +5033,7 @@ def build_local_review(config: dict, config_path: Path) -> LocalReviewCheckout:
     """
     checkout = (config_path.resolve().parent / config["review"]["local_checkout"]).resolve()
     code_folder = Path(__file__).resolve().parent
-    own_files = [
-        code_folder / "orchestrator.py", code_folder / "api_client.py", config_path.resolve(),
-    ]
+    own_files = [code_folder / name for name in ORCHESTRATOR_FILES] + [config_path.resolve()]
     return LocalReviewCheckout(
         path=checkout,
         repo_url=config["pipeline"]["repository"]["url"],
@@ -2819,23 +5043,6 @@ def build_local_review(config: dict, config_path: Path) -> LocalReviewCheckout:
             for path in own_files if path.is_relative_to(checkout)
         ],
     )
-
-
-def read_feedback_file(path: Path) -> str:
-    """Return the text of a feedback file.
-
-    Raises:
-        ProjectStateError: if the file cannot be read as non-empty UTF-8 text.
-    """
-    try:
-        text = path.read_bytes().decode("utf-8-sig")
-    except (OSError, UnicodeDecodeError) as error:
-        raise ProjectStateError(
-            f"The feedback file {path} could not be read as UTF-8 text: {error}"
-        ) from error
-    if not text.strip():
-        raise ProjectStateError(f"The feedback file {path} is empty.")
-    return text
 
 
 def main(
@@ -2848,8 +5055,9 @@ def main(
 ) -> int:
     """Run the command line interface and return the process exit code.
 
-    Exit codes: 0 when every stage is approved (or a check passed), 2 when
-    the pipeline is paused for review, 1 otherwise.
+    Exit codes: 0 when every stage is accepted (or a check passed), 2 when
+    the project waits for a decision of the owner, 3 when a notice waits
+    for the host's ack, 1 otherwise.
 
     Args:
         argv: Command line arguments (default: those of the process).
@@ -2869,23 +5077,28 @@ Examples:
   python orchestrator.py --check-online         # API key, models, GitHub; launches nothing
   python orchestrator.py --execute              # Start a new project
   python orchestrator.py --resume manifest.json # Continue an existing project
-  python orchestrator.py --resume manifest.json --approve STAGE
-  python orchestrator.py --resume manifest.json --revise STAGE --feedback notes.txt
-  python orchestrator.py --resume manifest.json --rerun-stage STAGE
+  python orchestrator.py --resume manifest.json --apply-decision decision.json
+  python orchestrator.py --adopt STAGE --adopt-branch BRANCH --adopt-commit SHA \\
+                         --adopt-input-commit SHA [--adopt-content-commit SHA]
 
-Review:
-  Every stage, the last one included, stops for review. Its output is first
-  checked out in the local Git checkout (review.local_checkout in the
-  config), at exactly the commit that passed the output check. Nothing
-  advances until that commit is approved with --approve.
+Rounds and the human gate:
+  A stage is worked on in rounds, up to iteration.max_rounds. A round ends at
+  the human gate: its output is checked out in the local Git checkout, a
+  signed notice is written to the outbox, and the host of the main chat
+  acknowledges posting it. Only then is the output awaiting review. Nothing
+  further happens until the owner's signed decision for that notice is
+  applied with --apply-decision: accept, iterate, redo, raise_limit, halt, and
+  after an acceptance start_stage. Accepting launches nothing.
 
 Model setup / equilibrium definition document:
-  --execute and --dry-run always ask for the location of this document
-  (.qmd, .tex or .md). --resume uses the document recorded in the manifest.
+  --execute, --adopt (new project) and --dry-run always ask for the location
+  of this document (.qmd, .tex or .md). --resume uses the recorded one.
 
 Environment:
   CURSOR_API_KEY    API key from Cursor Dashboard -> API Keys
   GITHUB_TOKEN      Only for a private repository: token that can read it
+  The variable named in review.delivery.secret_env: the secret shared with
+  the host of the main chat, used to sign notices and verify acks and decisions
 
 Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
         """,
@@ -2898,7 +5111,7 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
         help="Path to config.yaml (default: ./config.yaml)",
     )
     
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
         action="store_true",
@@ -2916,14 +5129,14 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
         "--execute",
         action="store_true",
         help="Start a new project: ask for the model setup document, then "
-             "run the pipeline (launches paid cloud agents)",
+             "run the first round of the first stage (launches paid cloud agents)",
     )
     mode.add_argument(
         "--resume",
         type=Path,
         metavar="MANIFEST",
         help="Continue the project recorded in a manifest JSON file. Never "
-             "launches a second agent for a stage that already has one",
+             "launches a second agent for a launch that already has one",
     )
     
     parser.add_argument(
@@ -2933,74 +5146,75 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
              "Not allowed with --resume",
     )
     parser.add_argument(
-        "--approve",
-        metavar="STAGE",
-        help="With --resume: approve the reviewed output of a stage that is "
-             "paused for review, then go on to the next stage",
-    )
-    parser.add_argument(
-        "--approve-commit",
-        metavar="SHA",
-        help="With --approve: approve this commit, which must be the current "
-             "head of the stage's branch (needed when the branch has moved)",
-    )
-    parser.add_argument(
-        "--revise",
-        metavar="STAGE",
-        help="With --resume and --feedback: launch a NEW paid agent that "
-             "revises the reviewed output of a stage as the feedback asks. "
-             "The revised output comes back for review",
-    )
-    parser.add_argument(
-        "--feedback",
+        "--apply-decision",
         type=Path,
         metavar="FILE",
-        help="With --revise: a UTF-8 text file with the feedback for the stage",
+        help="With --resume: apply a signed decision file of the project owner "
+             "(accept, start_stage, iterate, redo, raise_limit or halt)",
     )
     parser.add_argument(
-        "--revise-commit",
-        metavar="SHA",
-        help="With --revise: revise this commit, which must be the current "
-             "head of the stage's branch (needed when the branch has moved)",
-    )
-    parser.add_argument(
-        "--rerun-stage",
+        "--adopt",
         metavar="STAGE",
-        help="With --resume: launch a NEW paid agent, from the stage's "
-             "original input, for a stage whose run failed, whose output check "
-             "failed, or whose output is awaiting review and is rejected",
+        help="Register work that already exists on a branch as a round of STAGE. "
+             "Launches nothing and accepts nothing. Alone it starts a new project "
+             "(first stage); with --resume it applies to the next stage",
+    )
+    parser.add_argument("--adopt-branch", metavar="BRANCH", help="With --adopt: the branch that holds the work")
+    parser.add_argument("--adopt-commit", metavar="SHA", help="With --adopt: the commit to adopt, the branch's current head")
+    parser.add_argument("--adopt-input-commit", metavar="SHA", help="With --adopt: the commit the work started from")
+    parser.add_argument(
+        "--adopt-content-commit",
+        metavar="SHA",
+        help="With --adopt: the commit that holds the stage's content, when the "
+             "adopted commit is a later one with the same stage files",
+    )
+    parser.add_argument(
+        "--halt",
+        metavar="REASON",
+        help="With --resume: halt the project. Nothing is launched and no decision "
+             "is applied until --unhalt",
+    )
+    parser.add_argument("--unhalt", action="store_true", help="With --resume: end a halt")
+    parser.add_argument(
+        "--repin",
+        action="store_true",
+        help="With --resume: record a changed configuration for the project. Open "
+             "notices are written again and must be answered again",
     )
     
     args = parser.parse_args(argv)
     
     usage_error = None
+    modes = [args.dry_run, args.check_online, args.execute, bool(args.resume)]
+    adopt_details = [
+        flag for flag, value in (
+            ("--adopt-branch", args.adopt_branch),
+            ("--adopt-commit", args.adopt_commit),
+            ("--adopt-input-commit", args.adopt_input_commit),
+            ("--adopt-content-commit", args.adopt_content_commit),
+        ) if value
+    ]
     resume_only = [
         flag for flag, value in (
-            ("--approve", args.approve),
-            ("--approve-commit", args.approve_commit),
-            ("--revise", args.revise),
-            ("--feedback", args.feedback),
-            ("--revise-commit", args.revise_commit),
-            ("--rerun-stage", args.rerun_stage),
+            ("--apply-decision", args.apply_decision),
+            ("--halt", args.halt is not None),
+            ("--unhalt", args.unhalt),
+            ("--repin", args.repin),
         ) if value
     ]
-    actions = [
-        flag for flag, value in (
-            ("--approve", args.approve),
-            ("--revise", args.revise),
-            ("--rerun-stage", args.rerun_stage),
-        ) if value
-    ]
-    if resume_only and not args.resume:
+    actions = resume_only[:3] + (["--adopt"] if args.adopt else [])
+    if not any(modes) and not args.adopt:
+        usage_error = "one of --dry-run, --check-online, --execute, --resume or --adopt is required"
+    elif args.adopt and (args.dry_run or args.check_online or args.execute):
+        usage_error = "--adopt can be combined only with --resume"
+    elif adopt_details and not args.adopt:
+        usage_error = f"{', '.join(adopt_details)} can be used only with --adopt"
+    elif args.adopt and not (args.adopt_branch and args.adopt_commit and args.adopt_input_commit):
+        usage_error = "--adopt needs --adopt-branch, --adopt-commit and --adopt-input-commit"
+    elif resume_only and not args.resume:
         usage_error = f"{', '.join(resume_only)} can be used only with --resume"
-    elif args.approve_commit and not args.approve:
-        usage_error = "--approve-commit can be used only with --approve"
-    elif len(actions) > 1:
+    elif len([action for action in actions if action != "--repin"]) > 1:
         usage_error = f"{' and '.join(actions)} cannot be used together"
-    elif (args.feedback or args.revise_commit) and not args.revise:
-        usage_error = "--feedback and --revise-commit can be used only with --revise"
-    elif args.revise and not args.feedback:
-        usage_error = "--revise needs --feedback FILE: the text that says what to revise"
     elif args.resume and args.output:
         usage_error = (
             "--output cannot be used with --resume: a resumed project keeps "
@@ -3008,11 +5222,11 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
         )
     if usage_error:
         print(f"Error: {usage_error}")
-        return 1
+        return EXIT_FAILED
     
     if not args.config.exists():
         print(f"Error: Config file not found: {args.config}")
-        return 1
+        return EXIT_FAILED
     
     print(f"Loading config: {args.config}")
     config = load_config(args.config)
@@ -3028,13 +5242,18 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
     
     if not orchestrator.run_config_validation():
         print("\nValidation FAILED. No agent was launched.")
-        return 1
+        return EXIT_FAILED
     
-    # A dry run runs no Git command, so it gets no local checkout.
+    manifest_path = args.resume or args.output or Path(
+        config.get("manifest", {}).get("output_file", "pipeline_manifest.json")
+    )
+    # A dry run runs no Git command and writes no file, so it gets no
+    # local checkout and no manifest file.
     if not args.dry_run:
         orchestrator.local_review = local_review or build_local_review(
             config=config, config_path=args.config,
         )
+        orchestrator.manifest_path = manifest_path
     
     if args.check_online:
         online_valid = orchestrator.run_online_validation()
@@ -3046,30 +5265,33 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
             print(f"  ERROR: {error}")
         else:
             print(f"  {orchestrator.local_review.path} can receive stage outputs")
+        print("\nChecking the secret for signing review notices (writes nothing)...")
+        try:
+            orchestrator.bridge.check_secret()
+        except BridgeError as error:
+            online_valid = False
+            print(f"  ERROR: {error}")
+        else:
+            print(
+                "  The secret is set. Whether a host reads the outbox and posts in "
+                "the main chat is NOT checked: that host is outside this program."
+            )
         if not online_valid:
             print("\nOnline validation FAILED. No agent was launched.")
-            return 1
+            return EXIT_FAILED
         print("\nOnline validation PASSED. No agent was launched.")
-        return 0
+        return EXIT_COMPLETE
     
-    manifest_path = args.resume or args.output or Path(
-        config.get("manifest", {}).get("output_file", "pipeline_manifest.json")
-    )
-    
+    new_project = bool(args.execute or (args.adopt and not args.resume))
     try:
         if args.resume:
             if not args.resume.exists():
                 print(f"Error: Manifest file not found: {args.resume}")
-                return 1
-            orchestrator.manifest_path = manifest_path
+                return EXIT_FAILED
             orchestrator.resume_project(
-                manifest=load_manifest(args.resume),
-                rerun_stage=args.rerun_stage,
-                revise_stage=args.revise,
-                feedback=read_feedback_file(path=args.feedback) if args.revise else None,
-                revise_commit=args.revise_commit,
+                manifest=load_manifest(args.resume), repin=args.repin,
             )
-        elif args.execute:
+        elif new_project:
             if manifest_path.exists():
                 print(
                     f"\nERROR: A project manifest already exists at {manifest_path}. "
@@ -3078,15 +5300,17 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
                     f"--output <other file> to start a new project beside it."
                 )
                 print("No agent was launched.")
-                return 1
-            orchestrator.manifest_path = manifest_path
-            orchestrator.start_new_project()
+                return EXIT_FAILED
+            orchestrator.start_new_project(
+                created_by="adopt" if args.adopt else "execute",
+                source_ref=args.adopt_input_commit if args.adopt else None,
+            )
         else:
             orchestrator.start_new_project()
-    except (ModelSetupDocumentError, ProjectStateError, APIError) as error:
+    except (ModelSetupDocumentError, ProjectStateError, APIError, TrialLogError) as error:
         print(f"\nERROR: {error}")
         print("No agent was launched.")
-        return 1
+        return EXIT_FAILED
     
     if args.dry_run:
         manifest = orchestrator.run_pipeline()
@@ -3100,53 +5324,86 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
             "was launched, no Git command was run and nothing was saved.\nNo stage "
             "was carried out: nothing was derived, written, computed or checked "
             "out. The dry run shows only that the config is valid, the document "
-            "can be read, and each stage's prompt can be built.\nNot checked: the "
-            "API key, the models, GitHub access and the local checkout (use "
-            "--check-online). --execute starts a project and asks for the "
-            "document again."
+            "can be read, and each stage's prompts can be built.\nNot checked: the "
+            "API key, the models, GitHub access, the local checkout and the "
+            "review notices (use --check-online). --execute starts a project and "
+            "asks for the document again."
         )
-        return 0 if ready else 1
+        return EXIT_COMPLETE if ready else EXIT_FAILED
     
-    if not orchestrator.run_online_validation():
+    # A command that can launch nothing needs no API key and no model check.
+    launches_nothing = bool(args.adopt or args.halt is not None)
+    if not orchestrator.run_online_validation(check_models=not launches_nothing):
         print("\nValidation FAILED. No agent was launched.")
-        return 1
+        return EXIT_FAILED
     
     print("\nValidation PASSED")
     
-    # The project's record (the selected document, the source commit, and any
-    # --rerun-stage reset) is on disk before any agent is launched.
-    orchestrator.checkpoint()
-    
-    if args.approve:
-        try:
-            orchestrator.approve_stage(stage_name=args.approve, commit=args.approve_commit)
-        except (ProjectStateError, APIError) as error:
-            print(f"\nERROR: {error}")
-            print("No agent was launched.")
-            return 1
-    
-    manifest = orchestrator.run_pipeline()
+    try:
+        if args.adopt:
+            # Nothing is saved for a new project unless the adoption is recorded.
+            orchestrator.adopt_stage(
+                stage_name=args.adopt,
+                branch=args.adopt_branch,
+                commit=args.adopt_commit,
+                input_commit=args.adopt_input_commit,
+                content_commit=args.adopt_content_commit,
+            )
+        else:
+            # The project's record (the selected document and the source
+            # commit) is on disk before any agent is launched.
+            orchestrator.checkpoint()
+        if args.apply_decision:
+            orchestrator.apply_decision(path=args.apply_decision)
+        if args.halt is not None:
+            orchestrator.halt(reason=args.halt)
+        if args.unhalt:
+            orchestrator.unhalt()
+        manifest = orchestrator.run_pipeline()
+    except (ProjectStateError, APIError, BridgeError, TrialLogError) as error:
+        print(f"\nERROR: {error}")
+        print("Nothing further was done.")
+        return EXIT_FAILED
     print(f"\nManifest saved to: {manifest_path}")
     
     print("\n=== Pipeline Summary ===")
-    statuses = []
-    for stage in orchestrator.stages:
+    not_started = "NOT STARTED"
+    statuses = [
+        manifest.stages[stage.name].status
+        if stage.name in manifest.stages and manifest.stages[stage.name].round > 0
+        else not_started
+        for stage in orchestrator.stages
+    ]
+    for position, (stage, status) in enumerate(zip(orchestrator.stages, statuses)):
         result = manifest.stages.get(stage.name)
-        status = result.status if result else "NOT STARTED"
-        statuses.append(status)
-        print(f"  {stage.name}: {status}")
-        if result and result.error:
+        started = status != not_started
+        print(
+            f"  {stage.name}: {status}"
+            + (
+                f" (round {result.round} of at most {orchestrator.round_limit(stage=stage)}"
+                + (f", {result.outcome}" if result.outcome else "") + ")"
+                if started else ""
+            )
+        )
+        if started and result.error:
             print(f"      {result.error}")
-        if status in NEXT_STEP_BY_STATUS:
-            print("      Next: " + NEXT_STEP_BY_STATUS[status].format(
-                manifest=manifest_path, stage=stage.name,
-            ))
+        # For an accepted stage the next step is named only where the project stands.
+        waits_here = status != STAGE_COMPLETE or statuses[position + 1:position + 2] == [not_started]
+        if status in NEXT_STEP_BY_STATUS and waits_here:
+            print("      Next: " + NEXT_STEP_BY_STATUS[status].format(manifest=manifest_path))
+    if manifest.halted:
+        print(f"  The project is halted: {manifest.halted['reason'] or 'no reason given'}")
     
     if all(status == STAGE_COMPLETE for status in statuses):
-        return 0
-    if STAGE_AWAITING_REVIEW in statuses:
-        return 2
-    return 1
+        return EXIT_COMPLETE
+    if STAGE_NOTICE_PENDING in statuses:
+        return EXIT_NOTICE_PENDING
+    waits_for_start = STAGE_COMPLETE in statuses and all(
+        status in (STAGE_COMPLETE, not_started) for status in statuses
+    )
+    if manifest.halted or STAGE_AWAITING_REVIEW in statuses or waits_for_start:
+        return EXIT_WAITING_FOR_OWNER
+    return EXIT_FAILED
 
 
 if __name__ == "__main__":

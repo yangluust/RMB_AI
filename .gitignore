@@ -47,3 +47,7 @@ Thumbs.db
 # Orchestrator downloads and in-progress manifest writes
 collected_artifacts/
 *.json.tmp
+
+# Orchestrator review notices, acks and decisions, and the local trial journal
+review_bridge/
+*.trial-journal.jsonl

@@ -3,10 +3,13 @@
 # Repository: RMB_AI
 #
 # This orchestrator calls the Cursor Cloud Agents API to run a 4-stage
-# research pipeline. Each stage can use a different model. After EVERY
-# stage the pipeline stops, brings the stage's output into the local
-# checkout, and waits for the owner's review. Nothing advances without an
-# explicit approval; the last stage also waits for one.
+# research pipeline. Each stage can use a different model. A stage is
+# worked on in rounds, up to a fixed number (iteration.max_rounds). A round
+# ends at the human gate: its output is brought into the local checkout, a
+# signed notice is written for the host of the main chat, and nothing
+# further happens until the owner's signed decision for that exact commit
+# is applied. Accepting a stage launches nothing: the next stage starts
+# only on a separate decision. The last stage waits for a decision too.
 #
 # IMPORTANT: Cloud agents execute against the COMMITTED repository snapshot
 # on GitHub. Local uncommitted changes are NOT visible to cloud agents.
@@ -47,6 +50,18 @@ working_document:
   # project is started must be this same file (same SHA-256).
   source_document: "docs/intervention-incomplete-information-source.md"
 
+# The trial log
+# One Markdown file, append-only, that records every round: what was tried,
+# with which model, from which commit, the evidence and result, whether the
+# candidate is kept, abandoned or unresolved, and why the next step was
+# chosen. The orchestrator keeps its own record in a local journal beside
+# the manifest (written before each next step; it does not depend on any
+# model). Each launched agent appends the orchestrator's entries, word for
+# word, and one entry of its own; the output check verifies that the file
+# only grew (see "Trial Log" in docs/pipeline-design.md).
+trial_log:
+  path: "docs/pipeline-trial-log.md"
+
 # Local review
 # After a stage's output has passed its checks on GitHub, the orchestrator
 # checks out the stage's branch, at exactly the checked commit, in this
@@ -61,6 +76,18 @@ review:
   local_checkout: ".."
   # Name of the Git remote, in that checkout, that points at the repository.
   remote: "origin"
+  # How an output is announced. The orchestrator posts nothing itself and
+  # holds no chat or mail credentials. It writes a signed notice file to
+  #   <folder of the manifest>/<directory>/<manifest name>/outbox/
+  # The host of the main chat (outside this repository) posts it and writes
+  # a signed ack to .../inbox/. Without a valid ack the round stays
+  # NOTICE_PENDING. The owner's decisions come back as signed files too.
+  # secret_env names the environment variable that holds the secret both
+  # sides sign with (16 characters or more). The secret is never written
+  # here. See "Review Bridge" in docs/pipeline-design.md.
+  delivery:
+    directory: "review_bridge"
+    secret_env: "RMB_REVIEW_BRIDGE_SECRET"
 
 # Cursor Cloud Agents API configuration
 # Official docs: https://cursor.com/docs/cloud-agent/api/endpoints
@@ -100,8 +127,44 @@ api:
 #   - If a model ID, parameter or value is not listed there, validation fails
 #     and nothing is launched. Nothing is substituted or dropped.
 #
-# Review: every stage pauses for review after its output check. There is no
-# setting that switches this off.
+# Review: every round ends at the human gate unless the stage allows a
+# correction round without the owner (iteration.autonomous_fix) and one is
+# possible. No setting lets a stage be accepted, or another stage be
+# started, without the owner's decision.
+#
+# Per stage:
+#   iteration.max_rounds      Hard limit of rounds. A round is counted before
+#                             any work is done for it, whatever started it
+#                             and however it ends. Only the owner's
+#                             raise_limit decision raises it.
+#   iteration.autonomous_fix  false (default): every round goes to the owner.
+#                             true: a round whose checks failed is followed
+#                             by a correction round of the same stage, until
+#                             a round passes, the limit is reached, or no
+#                             other route is seen. Launch failures and open
+#                             items that need the owner's choice always stop.
+#   verification              The evidence file the stage must push, and its
+#                             kind. Its form and cross-references are
+#                             checked; that is not a proof of correctness.
+#   cross_model               Review of each candidate by a second model.
+#                             Off by default. To switch it on, set
+#                             enabled: true and name as secondary_model_id a
+#                             model that GET /v1/models lists and that is not
+#                             the stage's own model (with its parameters in
+#                             secondary_model_params). No model is named
+#                             here: none has been chosen by the owner.
+#                             The two models change roles every round. The
+#                             reviewer first writes a blind assessment in a
+#                             launch that is not given the candidate, then
+#                             compares it with the exact candidate commit.
+#                             pass_policy: reviewer_accept, or both_agree
+#                             (the reviewer accepts AND its blind assessment
+#                             agrees). on_disagreement: human_review, or
+#                             revise_next_round (needs autonomous_fix: true).
+#                             One round counts once, with one or three launches.
+#   output_manifest.allowed_paths
+#                             Folders and files, besides the required files,
+#                             that the stage may add or change.
 stages:
   # Stage 1: Equilibrium conditions
   # Input: The model setup / equilibrium definition document (.qmd, .tex
@@ -174,25 +237,53 @@ stages:
         is not enough to write the conditions, stop and report what is
         missing instead of filling the gap yourself.
       
-      NOT IN THIS STAGE: no pseudocode, no program code, no parameter
-      values, no numerical results.
+      NOT IN THIS STAGE: no pseudocode, no solver, no parameter values, no
+      numerical results. The only program allowed is the script that checks
+      the algebra symbolically (see "VERIFICATION EVIDENCE" below); it goes
+      in outputs/stage1_audit/ and uses no parameter value.
       
       OUTPUT:
       - Write your work as this stage's section of the working document
         (see "WORKING DOCUMENT" below). Create the document if it does not
         exist. If it already has a section for this stage, replace that
         section with your own derivation.
-      - Write mathematics in Markdown with $$...$$ for displayed formulas.
+      - Write mathematics in Markdown with $$...$$ for displayed formulas,
+        and give every displayed condition a label with \tag{...}.
+      - Write the audit of your derivation to outputs/stage1_audit/ (see
+        "VERIFICATION EVIDENCE" below). The audit reports; it does not
+        replace the derivation.
       
       Commit and push your work before finishing.
     
-    # Output check: after the run finishes, each of these files must exist
-    # at the head commit of the branch the agent pushed, and the working
-    # document must keep its rules there. Otherwise the stage stops with
-    # GATE_FAILED and no later stage is launched.
+    iteration:
+      max_rounds: 4
+      autonomous_fix: false
+    
+    # Audit of the derivation: every labelled equation with its source and
+    # whether it is exact or first-order, unknowns against residuals, every
+    # open item, exact-versus-first-order consistency, symbolic checks.
+    verification:
+      kind: "equilibrium_audit"
+      evidence_file: "outputs/stage1_audit/audit.json"
+    
+    cross_model:
+      enabled: false
+      secondary_model_id: null
+      secondary_model_params: []
+      pass_policy: "both_agree"
+      on_disagreement: "human_review"
+      review_dir: "outputs/stage1_review"
+    
+    # Output check: after a run finishes, each of the required files must
+    # exist at the head commit of the branch the agent pushed, the working
+    # document must keep its rules there, no file outside the stage's paths
+    # may have changed, and the trial log and the evidence file must pass
+    # their checks. A round that fails is recorded and cannot be accepted.
     output_manifest:
       required_files:
         - "docs/equilibrium-working-document.md"
+      allowed_paths:
+        - "outputs/stage1_audit"
       
   # Stage 2: Equilibrium conditions to pseudocode
   # Input: Section 1 of the working document
@@ -252,13 +343,37 @@ stages:
       
       OUTPUT:
       - Write your work as this stage's section of the working document
-        (see "WORKING DOCUMENT" below).
+        (see "WORKING DOCUMENT" below). Give every pseudocode step an ID
+        (for example P1, P2) and use it wherever you refer to the step.
+      - Write the trace between the Stage 1 conditions and your steps to
+        outputs/stage2_trace/ (see "VERIFICATION EVIDENCE" below).
       
       Commit and push your work before finishing.
+    
+    iteration:
+      max_rounds: 3
+      autonomous_fix: false
+    
+    # Trace in both directions: every Stage 1 condition, unknown, timing
+    # step, expectation and boundary condition leads to a pseudocode step,
+    # and every step comes from one.
+    verification:
+      kind: "traceability"
+      evidence_file: "outputs/stage2_trace/trace.json"
+    
+    cross_model:
+      enabled: false
+      secondary_model_id: null
+      secondary_model_params: []
+      pass_policy: "both_agree"
+      on_disagreement: "human_review"
+      review_dir: "outputs/stage2_review"
     
     output_manifest:
       required_files:
         - "docs/equilibrium-working-document.md"
+      allowed_paths:
+        - "outputs/stage2_trace"
 
   # Stage 3: Pseudocode to Python code
   # Input: Sections 1 and 2 of the working document
@@ -301,7 +416,11 @@ stages:
         command line, and exits with a non-zero code when it does not
         reach a solution that passes the Stage 2 checks. It reports the
         residuals, the convergence status and the admissibility checks it
-        computed. It holds no built-in parameter values.
+        computed. It holds no built-in parameter values and no built-in
+        tolerance. The configuration file is a JSON object: its entry
+        "parameters" holds every numeric parameter by the symbol's name;
+        functional-form choices, initial conditions, distributions and
+        solver settings (tolerances included) are other top-level entries.
       - outputs/stage3_implementation/test_solve_equilibrium.py: tests of
         the code. Values used only in tests must be named as test values;
         they are not a calibration.
@@ -316,7 +435,9 @@ stages:
         tests, and the test output as it was printed.
       
       Run the tests before finishing and report their real outcome. Do not
-      edit a test output.
+      edit a test output. Save the printed test output and write the map
+      from pseudocode steps to functions and tests (see "VERIFICATION
+      EVIDENCE" below), both in outputs/stage3_implementation/.
       
       DO NOT FILL GAPS: if the pseudocode cannot be implemented without a
       choice it leaves open, make the choice a named entry of the
@@ -345,6 +466,27 @@ stages:
       - "Raw inputs left unchanged."
       - "Secrets and large generated files kept outside Git."
     
+    iteration:
+      max_rounds: 4
+      autonomous_fix: false
+    
+    # Every pseudocode step mapped to a function and to tests that exist,
+    # residual and admissibility checks with named tolerances, and the
+    # reported test run with its printed output.
+    verification:
+      kind: "test_map"
+      evidence_file: "outputs/stage3_implementation/test_map.json"
+      implementation_file: "outputs/stage3_implementation/solve_equilibrium.py"
+      test_file: "outputs/stage3_implementation/test_solve_equilibrium.py"
+    
+    cross_model:
+      enabled: false
+      secondary_model_id: null
+      secondary_model_params: []
+      pass_policy: "both_agree"
+      on_disagreement: "human_review"
+      review_dir: "outputs/stage3_review"
+    
     output_manifest:
       required_files:
         - "docs/equilibrium-working-document.md"
@@ -352,14 +494,16 @@ stages:
         - "outputs/stage3_implementation/test_solve_equilibrium.py"
         - "outputs/stage3_implementation/requirements.txt"
         - "outputs/stage3_implementation/README.md"
+      allowed_paths:
+        - "outputs/stage3_implementation"
 
-  # Stage 4: Parameter configuration, computation and results
+  # Stage 4: Parameter domain, computation in approved batches, results
   # Input: Sections 1-3 of the working document and the Stage 3 code
-  # Output: parameter and result files in outputs/stage4_results/, and
+  # Output: the batch files and results in outputs/stage4_results/, and
   #         Section 4 of the working document
   - name: "parameterization_and_results"
     display_name: "Parameters, Computation and Results"
-    description: "Determine a parameter configuration, run the computation and report the results"
+    description: "Propose a parameter domain, run approved batches of configurations and report the results"
     depends_on: "pseudocode_to_implementation"
     
     # Requested by Yang Lu: GPT-5.6 Sol, high reasoning. Sent in the launch request as
@@ -374,86 +518,113 @@ stages:
     prompt: |
       You are working on the RMB_AI research project for Yang Lu.
       
-      TASK: Determine a parameter configuration, run the Stage 3 code with
-      it, and report the results.
+      TASK: Explore the model's parameter space with the Stage 3 code, in
+      batches the project owner approves, and report the results.
+      
+      This stage works in rounds. "VERIFICATION EVIDENCE" below says which
+      kind of round this one is:
+      - A DOMAIN PROPOSAL round computes nothing. It proposes the parameter
+        domain and the first batch of configurations.
+      - A BATCH round runs exactly one batch that the project owner has
+        approved, and may propose the next one.
       
       INPUT:
       - The working document docs/equilibrium-working-document.md: the
         equilibrium conditions (Stage 1), the pseudocode (Stage 2) and the
-        Python code (Stage 3), each reviewed and approved by the project
+        Python code (Stage 3), each reviewed and accepted by the project
         owner.
       - The code in outputs/stage3_implementation/.
       - The original document docs/intervention-incomplete-information-source.md,
         for what it says about parameters and functional forms.
       
-      PARAMETER CONFIGURATION:
-      - Take every value and functional form that the source document
-        states from the source document, and cite where it states it.
+      PARAMETER DOMAIN (a domain proposal round, and any later proposal):
+      - Take every value, range and functional form that the source
+        document states from the source document, and cite where it
+        states it ("origin": "source").
       - For an item the source document does not supply (Stage 1 lists
         them under "Missing closures and ambiguities"), you may propose an
-        ILLUSTRATIVE choice. Label each one as illustrative, give the
-        reason for it, and say plainly that the source document does not
+        ILLUSTRATIVE value or range ("origin": "illustrative"). Give the
+        reason for it and say plainly that the source document does not
         supply it. Never present an illustrative choice as the source's
         calibration.
       - If an open item is a structural ambiguity of the model, and not a
         value or functional form that can be chosen for illustration, do
-        not invent the missing structure. Stop, and report it (see
-        "BLOCKED" below).
-      - Write the configuration to outputs/stage4_results/parameters.json.
+        not invent the missing structure. Report it in your section and in
+        the evidence file ("no_plausible_alternative": true if nothing can
+        be computed without it).
+      - Write the proposed batch to outputs/stage4_results/next_batch_spec.json:
+        the domain, the number of configurations (at most 25), the random
+        seeds and the solver tolerances.
       
-      COMPUTATION AND RESULTS:
-      - Run outputs/stage3_implementation/solve_equilibrium.py with that
-        configuration. Write its results to
-        outputs/stage4_results/results.json.
+      COMPUTATION (a batch round only):
+      - Run outputs/stage3_implementation/solve_equilibrium.py once per
+        configuration of the approved batch. Every configuration lies
+        inside the approved domain. Do not run more configurations than
+        the batch allows, and count every run, failed runs included.
+      - Write each configuration's parameter file and results file to
+        outputs/stage4_results/batch_<round number>/.
       - Do not change the Stage 3 code. If it cannot run, or is wrong,
-        stop and report it (see "BLOCKED" below).
-      - Report only numbers the code produced in that run. Do not edit,
-        round away or make up a result. Report the residuals, the
-        convergence status and the admissibility checks as the code
-        computed them. A run that did not converge is reported as not
-        converged.
-      
-      RUN RECORD: write outputs/stage4_results/run_record.json, a JSON
-      object with these entries:
-      - "status": "completed" if the code ran to the end and wrote the
-        results, otherwise "blocked".
-      - When "completed": "command" (the exact command that was run),
-        "exit_code" (its exit code, which must be 0), "parameters_file"
-        and "results_file" (paths from the repository root), "converged"
-        (true or false, as the code reported) and "max_abs_residual" (a
-        number, as the code reported).
-      - When "blocked": "blocked_reason" (what stopped the stage).
-      
-      BLOCKED: when you stop without results, write the run record with
-      "status": "blocked", and explain in your section of the working
-      document what is missing or wrong and what decision is needed from
-      the project owner.
+        report it; do not work around it.
+      - Report only numbers the code produced in these runs. Do not edit,
+        round away or make up a result.
+      - Classify every run: admissible; inadmissible (the solver converged
+        and an admissibility condition of Stage 1 fails: name it);
+        numerical_failure (no convergence, or an error); outside_domain.
+        A numerical failure says nothing about whether an equilibrium
+        exists. Do not report it as a boundary of the model.
+      - A boundary of the admissible region may be claimed only between a
+        configuration classified admissible and one classified
+        inadmissible, repeated from another starting value or with a
+        tighter tolerance. Such a boundary is numerical evidence. It is
+        not a proof that no equilibrium exists beyond it; say so.
       
       OUTPUT:
       - This stage's section of the working document (see "WORKING
-        DOCUMENT" below): the parameter configuration as a table (symbol,
-        value or form, from the source or illustrative, reason), the exact
-        command that was run, and the results with the residuals, the
-        convergence status and the admissibility checks.
+        DOCUMENT" below). Domain proposal: the proposed domain as a table
+        (symbol, value or range, from the source or illustrative, reason)
+        and the proposed batch. Batch round: the same table for the
+        approved batch, the exact commands that were run, and for every
+        run its classification, residuals, convergence status and
+        admissibility checks, keeping the results of earlier batches.
+      - The evidence file (see "VERIFICATION EVIDENCE" below).
       
       Commit and push your work before finishing.
+    
+    iteration:
+      max_rounds: 6
+      # Must stay false for this stage: every batch needs the owner's approval.
+      autonomous_fix: false
+    
+    # Round 1 is a domain proposal and computes nothing. Each later round
+    # runs one batch the owner approved (an iterate decision with
+    # approve_batch: true), with at most max_configurations runs, every one
+    # inside the approved domain and every one counted. A domain proposal
+    # cannot be accepted as the stage's result.
+    verification:
+      kind: "parameter_batches"
+      evidence_file: "outputs/stage4_results/batch_record.json"
+      next_batch_spec: "outputs/stage4_results/next_batch_spec.json"
+      max_configurations: 25
+    
+    cross_model:
+      enabled: false
+      secondary_model_id: null
+      secondary_model_params: []
+      pass_policy: "both_agree"
+      on_disagreement: "human_review"
+      review_dir: "outputs/stage4_review"
     
     output_manifest:
       required_files:
         - "docs/equilibrium-working-document.md"
-        - "outputs/stage4_results/run_record.json"
-      # The stage's own record of its run, checked for form at the pushed
-      # commit: a "completed" record must name a parameters file and a
-      # results file that exist there, with exit code 0. This shows the
-      # stage reported a finished run. It does not show the numbers are
-      # right; that is judged at the review.
-      completion_record: "outputs/stage4_results/run_record.json"
+      allowed_paths:
+        - "outputs/stage4_results"
 
 # Artifact collection settings
 # Artifacts are files the agent saves to its artifacts/ directory. After a
-# stage's output check passes, the orchestrator lists them and downloads
+# launch's output is checked, the orchestrator lists them and downloads
 # each one to
-#   <folder of the manifest>/<local_output_dir>/<manifest name>/<stage>/
+#   <folder of the manifest>/<local_output_dir>/<manifest name>/<stage>/round_<n>/<phase>/
 # A path that is unsafe to write (absolute, with "..", a backslash, a colon
 # or a Windows device name) is not saved; it is recorded in the manifest.
 artifacts:
@@ -468,9 +639,11 @@ execution:
   auto_create_pr: false
 
 # Project manifest
-# Records, for each stage: the agent and run IDs, the exact input commit,
-# the output branch and commit, the output check, collected artifacts, the
-# local review checkout and the review state. Written after every step, so
-# a project can be resumed.
+# Records the project ID, the configuration and orchestrator version it
+# was made with, and for each stage its current round: the launches with
+# their agent and run IDs, the exact input commit, the candidate and output
+# commits, the checks, the signed notice and ack, and the owner's signed
+# decisions. Earlier rounds are kept. Written after every step, so a
+# project can be resumed. Beside it: <name>.trial-journal.jsonl.
 manifest:
   output_file: "pipeline_manifest.json"
