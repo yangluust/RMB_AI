@@ -30,14 +30,14 @@ The original design specified Grok-only models with specific xAI reasoning tiers
 
 ## Project Input: Model Setup and Equilibrium Definition Document
 
-Each project starts from one document written by Yang Lu: a Quarto Markdown (`.qmd`) or LaTeX (`.tex`) file that states the economic model setup and the equilibrium definition. Stage 1 derives the equilibrium from what that document states. This design document states no equilibrium definition, and the orchestrator never supplies one.
+Each project starts from one document written by Yang Lu: a Quarto Markdown (`.qmd`), LaTeX (`.tex`) or Markdown (`.md`) file that states the economic model setup and the equilibrium definition. Stage 1 derives the equilibrium from what that document states. This design document states no equilibrium definition, and the orchestrator never supplies one.
 
 ### The Orchestrator Asks for the Document
 
 Starting a new project with `--execute` always asks this question first:
 
 ```
-Location of the model setup / equilibrium definition document for this project (.qmd or .tex):
+Location of the model setup / equilibrium definition document for this project (.qmd, .tex or .md):
 ```
 
 - The question comes before any request is sent to Cursor. No stage is launched until a usable document has been given.
@@ -53,12 +53,24 @@ The answer is the path of the file on the local machine, for example `D:\Researc
 | The answer is blank | no location was given |
 | The path does not exist | the document does not exist |
 | The path is a folder | the location is not a file |
-| The extension is not `.qmd` or `.tex` | the document must be a `.qmd` or `.tex` file |
+| The extension is not `.qmd`, `.tex` or `.md` | the document must be a `.qmd`, `.tex` or `.md` file |
 | The file is empty or holds only whitespace | the document is empty |
 | The file is not UTF-8 text | the document is not UTF-8 text |
-| The file pulls in other files (`\input`, `\include`, `\subfile`, `\import`, `\subimport`, or Quarto `{{< include ... >}}`) | the document pulls in other files |
+| The file pulls in other files (see the table below) | the document pulls in other files |
 
 There is one attempt per run. After an error, run the command again.
+
+The format is taken from the file extension, without regard to case:
+
+| Extension | Format named in the Stage 1 prompt | Recorded in the manifest as | Refused when a line contains |
+|-----------|------------------------------------|-----------------------------|------------------------------|
+| `.qmd` | Quarto Markdown (.qmd) | `qmd` | Quarto `{{< include ... >}}` |
+| `.tex` | LaTeX (.tex) | `tex` | `\input`, `\include`, `\subfile`, `\import` or `\subimport`, outside a `%` comment |
+| `.md` | Markdown (.md) | `md` | Quarto `{{< include ... >}}`, or a MyST `{include}` or `{literalinclude}` directive at the start of a fence |
+
+No other extension is accepted; `.markdown` and `.Rmd` are refused. The same checks apply to all three formats: the file must exist, be UTF-8 text, be non-empty and be self-contained.
+
+Markdown has no include syntax of its own. The check on a `.md` file covers the two forms in the table. The include forms of other Markdown tools (for example MkDocs snippets or Obsidian embeds) are not detected: such a file passes the check and reaches the agent without the included text.
 
 ### How the Document Reaches the Stage 1 Agent
 
@@ -72,7 +84,7 @@ Limits of this handoff:
 - **The text goes to Cursor.** It is part of the agent's prompt and is visible in that agent's conversation. Do not put secrets in the document.
 - **Not recorded in Git by the orchestrator.** The repository holds the document only if Yang commits it himself. The project manifest records which file was used (see below).
 - **Size.** The API documentation states no size limit for `prompt.text`, and the orchestrator sets none. A very large document may be rejected by the API; this has not been tested.
-- **Content is not judged.** The orchestrator checks that the file is a readable, non-empty, self-contained `.qmd` or `.tex` file. It cannot tell whether the file states an equilibrium definition, or a correct one. The Stage 1 prompt tells the agent to stop and report what is missing if the document does not state enough, instead of filling the gap itself.
+- **Content is not judged.** The orchestrator checks that the file is a readable, non-empty, self-contained `.qmd`, `.tex` or `.md` file. It cannot tell whether the file states an equilibrium definition, or a correct one. The Stage 1 prompt tells the agent to stop and report what is missing if the document does not state enough, instead of filling the gap itself.
 - **Stand-in tests only.** This has been checked against a stand-in for the API. No Stage 1 agent has been launched.
 
 ### What the Project Records
@@ -104,7 +116,7 @@ Yang decides what the document contains and how it is laid out. The list below i
 | Attribute | Value |
 |-----------|-------|
 | **Purpose** | Derive theoretical equilibrium conditions from economic model specification |
-| **Input** | QMD (`.qmd`) or LaTeX (`.tex`) file stating the economic model setup and the equilibrium definition |
+| **Input** | QMD (`.qmd`), LaTeX (`.tex`) or Markdown (`.md`) file stating the economic model setup and the equilibrium definition |
 | **Input Location** | Asked for at the start of every new project; the file's text is sent in the Stage 1 launch request (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)) |
 | **Output** | LaTeX derivations in `outputs/stage1_derivation/` |
 | **Equilibrium Definition** | Stated in the input document; this design document and the orchestrator supply none |
@@ -450,7 +462,7 @@ python orchestrator/orchestrator.py --execute
 Offline (`--dry-run` stops here):
 
 1. **Configuration**: `config.yaml` is checked. The repository URL must be a github.com URL. Each stage needs a prompt, well-formed model settings and guardrails, a true/false `manual_review`, and `required_files` that are safe relative paths. `api.retries` must be set and well-formed. The first stage must receive the model setup document.
-2. **Model setup document**: A usable `.qmd` or `.tex` document must be given (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)).
+2. **Model setup document**: A usable `.qmd`, `.tex` or `.md` document must be given (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)).
 
 Online (`--check-online`, `--execute`, `--resume`):
 
@@ -613,7 +625,8 @@ Tested against the stand-in:
 | Review pauses the pipeline; approval fixes the commit handed on; a moved branch needs `--approve-commit` | `test_manual_review_pauses_the_pipeline_until_the_output_is_approved` |
 | An output rejected at review is replaced only with `--rerun-stage` | `test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun` |
 | Artifacts are saved only to safe paths inside the project folder; a non-https download URL is refused | `test_artifacts_are_downloaded_only_to_safe_paths_inside_the_project_folder` |
-| `--dry-run` sends no request, needs no API key and saves nothing | `test_cli_dry_run_is_offline_and_saves_nothing` |
+| A `.qmd`, `.tex` or `.md` document is accepted and its text reaches Stage 1; another extension, an empty or non-UTF-8 file, or a file that pulls in other files is refused | `test_valid_qmd_tex_and_md_documents_reach_stage1_in_the_launch_request`, `test_unusable_locations_are_rejected_before_any_launch`, `test_document_that_pulls_in_other_files_is_rejected` |
+| `--dry-run` sends no request, needs no API key and saves nothing, with a `.tex`, `.qmd` or `.md` document | `test_cli_dry_run_is_offline_and_saves_nothing` |
 | `--check-online` reads the model listing and the starting ref and launches nothing | `test_cli_check_online_validates_over_the_network_and_launches_nothing` |
 | The committed configuration runs through all four stages with three approvals | `test_cli_execute_asks_records_the_document_and_resume_does_not_ask` |
 
@@ -774,12 +787,13 @@ This would require:
 | 2026-11-24 | Cloud Agent | The orchestrator now asks for the model setup / equilibrium definition document (`.qmd` or `.tex`) at every new project and sends its text to Stage 1. The fill-in template and its gate are removed; an optional outline remains. |
 | 2026-11-24 | Cloud Agent | Set each stage's model and reasoning parameter in `orchestrator/config.yaml` and recorded the mapping, with what is and is not verified, under Model Selection. |
 | 2026-11-24 | Cloud Agent | Implemented the output check, launch safety, bounded retries, artifact download, manual review and commit-based handoff. Rewrote Architecture, Source Snapshot, Validation and Review Gates, and Failure Handling to describe what is implemented. `--dry-run` is now offline; `--check-online` is new. Added What Has and Has Not Been Tested. |
+| 2026-11-24 | Cloud Agent | The model setup document may also be a Markdown (`.md`) file. A `.md` file is checked for the Quarto include shortcode and the MyST include directives. The checks on `.qmd` and `.tex` files are unchanged. |
 
 ---
 
 ## Next Steps
 
-1. **Yang Lu: have the model setup / equilibrium definition document ready** as one self-contained `.qmd` or `.tex` file; the orchestrator asks for its location
+1. **Yang Lu: have the model setup / equilibrium definition document ready** as one self-contained `.qmd`, `.tex` or `.md` file; the orchestrator asks for its location
 2. **Commit and push repository inputs** the stages need (`reference/`, `data/`)
 3. **Run `--dry-run`** to check the configuration and the document offline
 4. **Run `--check-online` with an API key** to check the configured models against the public `GET /v1/models` listing, and repository access

@@ -7,7 +7,7 @@ Local Windows orchestrator for running a multi-stage research pipeline on Cursor
 This orchestrator:
 - Calls the **Cursor Public Cloud Agents API** to run each pipeline stage, one cloud agent per stage
 - Sets a **model per stage** and checks it against `GET /v1/models` before any launch
-- **Asks for the model setup / equilibrium definition document** (`.qmd` or `.tex`) at every new project, before anything is launched
+- **Asks for the model setup / equilibrium definition document** (`.qmd`, `.tex` or `.md`) at every new project, before anything is launched
 - Starts each stage from an **exact commit**: the project's source commit, then the commit that passed the previous stage's output check
 - **Checks each stage's output** (required files at the pushed commit), **downloads artifacts**, and can **pause for review** before the next stage
 - Records every step in a **manifest file**, so a project can be resumed without launching any agent twice
@@ -40,7 +40,7 @@ python orchestrator/orchestrator.py --resume pipeline_manifest.json --approve eq
 Steps 3 and 5 each ask:
 
 ```
-Location of the model setup / equilibrium definition document for this project (.qmd or .tex):
+Location of the model setup / equilibrium definition document for this project (.qmd, .tex or .md):
 ```
 
 Type the path of your file, for example `D:\Research\my_model\setup.qmd`.
@@ -92,7 +92,8 @@ Stage 3 (`pseudocode_to_implementation`) carries the twelve reproducibility guar
 
 Every new project starts by asking for the location of the model setup / equilibrium definition document. This is mandatory: there is no setting, flag or environment variable that supplies the location, and an earlier project's document is never reused.
 
-- The file must exist, be a `.qmd` or `.tex` file, hold non-empty UTF-8 text, and be self-contained (no `\input`, `\include` or Quarto `{{< include >}}` of other files).
+- The file must exist, be a `.qmd` (Quarto Markdown), `.tex` (LaTeX) or `.md` (Markdown) file, hold non-empty UTF-8 text, and be self-contained (no `\input`, `\include` or Quarto `{{< include >}}` of other files). The extension is matched without regard to case; `.markdown` and `.Rmd` are not accepted.
+- A `.md` file is checked for the Quarto `{{< include >}}` shortcode and for the MyST `{include}` and `{literalinclude}` directives. Markdown has no include syntax of its own, and the include forms of other Markdown tools are not detected.
 - If the answer is blank or unusable, or no answer can be read (for example under a scheduler), the run stops with an error and nothing is launched.
 - The file is only read. It is not changed, moved, copied or committed.
 - The first stage must set `receives_model_setup_document: true`. At launch the orchestrator appends the document's full text to that stage's prompt. The cloud agent cannot open a path on your machine, so the text is sent and the path is not.
