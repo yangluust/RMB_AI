@@ -13,7 +13,7 @@ This document describes the design for a four-stage research pipeline that runs 
 
 ### Design Goals
 
-1. **Model Flexibility**: Each stage can use a different model from Cursor's available models
+1. **Model Flexibility**: Each stage uses a specified model (validated against available models at runtime)
 2. **Sequential Chaining**: Stages run in order, with validation gates between them
 3. **Repository-Based Handoff**: Outputs committed to Git branches, inputs read from prior commits
 4. **Resumable**: Failed pipelines can resume from the last successful stage
@@ -21,7 +21,17 @@ This document describes the design for a four-stage research pipeline that runs 
 
 ### Historical Note
 
-The original design specified Grok-only models with specific reasoning tiers (xhigh, low, high). **This constraint has been abandoned** in favor of wider model selection from whatever models are available through the Cursor API. The reasoning preferences below are desired characteristics, not API control parameters.
+The original design specified Grok-only models with specific xAI reasoning tiers. This was superseded to allow wider model selection. The current design specifies requested model names and reasoning levels per stage, which must be mapped to actual API model IDs at runtime.
+
+---
+
+## Equilibrium Definition
+
+> **⚠️ PENDING: Yang Lu to provide equilibrium definition**
+>
+> The equilibrium definition that Stage 1 should use for derivation has not yet been supplied. Yang Lu will specify the precise mathematical or economic definition of equilibrium that the agent should derive toward.
+>
+> This section will be updated once the definition is provided.
 
 ---
 
@@ -31,11 +41,15 @@ The original design specified Grok-only models with specific reasoning tiers (xh
 
 | Attribute | Value |
 |-----------|-------|
-| **Purpose** | Derive theoretical equilibrium conditions from economic models |
-| **Input** | Reference papers (`reference/`), data context (`data/`) |
+| **Purpose** | Derive theoretical equilibrium conditions from economic model specification |
+| **Input** | QMD (`.qmd`) or LaTeX (`.tex`) file specifying the economic model setup |
+| **Input Location** | To be committed to repository (e.g., `inputs/model_setup.qmd` or `inputs/model_setup.tex`) |
 | **Output** | LaTeX derivations in `outputs/stage1_derivation/` |
-| **Desired Reasoning** | **Highest** — mathematical proofs require maximum reasoning depth |
-| **Model Choice** | Configurable; no specific model chosen yet |
+| **Equilibrium Definition** | ⚠️ **Pending** — Yang Lu to specify |
+| **Requested Model** | **Claude Fable 5.2** |
+| **Requested Reasoning** | **Second-highest** |
+
+**Stage 1 Task:** The agent reads the QMD or LaTeX file containing the economic model setup, understands the model structure, and derives the equilibrium conditions according to the equilibrium definition (once provided by Yang Lu).
 
 ### Stage 2: Equilibrium to Pseudocode
 
@@ -44,8 +58,8 @@ The original design specified Grok-only models with specific reasoning tiers (xh
 | **Purpose** | Translate equilibrium conditions into algorithmic pseudocode |
 | **Input** | Stage 1 outputs (`outputs/stage1_derivation/`) |
 | **Output** | Pseudocode in `outputs/stage2_pseudocode/` |
-| **Desired Reasoning** | **Highest** — accurate mathematical-to-algorithmic translation |
-| **Model Choice** | Configurable; no specific model chosen yet |
+| **Requested Model** | **Claude Fable 5.2** |
+| **Requested Reasoning** | **Second-highest** |
 
 ### Stage 3: Python Implementation and Plots
 
@@ -54,8 +68,21 @@ The original design specified Grok-only models with specific reasoning tiers (xh
 | **Purpose** | Implement pseudocode in Python, generate visualizations |
 | **Input** | Stage 2 outputs (`outputs/stage2_pseudocode/`), data (`data/`) |
 | **Output** | Python code and plots in `outputs/stage3_implementation/` |
-| **Desired Reasoning** | **Lower** — implementation from clear pseudocode is more mechanical |
-| **Model Choice** | Configurable; no specific model chosen yet |
+| **Requested Model** | **Grok** (version unspecified) |
+| **Requested Reasoning** | Lower (implicit from task nature) |
+
+#### Reproducibility Guardrails (Stage 3)
+
+> **⚠️ PLACEHOLDER: Yang Lu to specify reproducibility guardrails**
+>
+> This section is reserved for reproducibility requirements that Yang Lu will define later. These may include:
+> - Random seed handling
+> - Version pinning for dependencies
+> - Deterministic algorithm requirements
+> - Output validation criteria
+> - Numerical precision requirements
+>
+> **Content pending — do not invent specifications.**
 
 ### Stage 4: Academic Writing
 
@@ -64,18 +91,35 @@ The original design specified Grok-only models with specific reasoning tiers (xh
 | **Purpose** | Polish research output for academic publication |
 | **Input** | Stages 1 and 3 outputs |
 | **Output** | Polished prose in `outputs/stage4_writing/` |
-| **Desired Reasoning** | **Mid-to-High** — nuanced academic writing, not maximum depth |
-| **Model Choice** | Configurable; no specific model chosen yet |
+| **Requested Model** | **GPT-5.6** |
+| **Requested Reasoning** | **High** |
 
 ---
 
 ## Model Selection
 
-### Desired Reasoning Preferences vs. Supported API Parameters
+### Requested Models vs. Verified API Model IDs
 
-**Important:** The reasoning preferences above (highest, lower, mid-to-high) are *desired characteristics* for model selection, **not** specific API control parameters. The actual available parameters depend on the model chosen.
+**Critical Distinction:** The model names and reasoning levels in this document are **owner-requested specifications**, not verified API model identifiers. The actual `model.id` values that the Cursor API accepts must be discovered at runtime via `GET /v1/models`.
 
-#### What the Cursor API Actually Supports
+#### Summary of Requested Specifications
+
+| Stage | Requested Model Name | Requested Reasoning Level | API Model ID | API Params |
+|-------|---------------------|--------------------------|--------------|------------|
+| 1. Equilibrium Derivation | Claude Fable 5.2 | Second-highest | **Unresolved** | **Unresolved** |
+| 2. Equilibrium → Pseudocode | Claude Fable 5.2 | Second-highest | **Unresolved** | **Unresolved** |
+| 3. Python Implementation | Grok (version unspecified) | Lower | **Unresolved** | **Unresolved** |
+| 4. Academic Writing | GPT-5.6 | High | **Unresolved** | **Unresolved** |
+
+#### What "Unresolved" Means
+
+- **API Model ID**: The exact string to pass as `model.id` (e.g., `"claude-fable-5.2-high"` or similar) has not been verified against `GET /v1/models`. The orchestrator must query available models and find the matching ID.
+
+- **API Params**: The mapping from "second-highest reasoning" to actual API parameters (if any) is unknown. Not all models expose reasoning-level parameters. The API may not support ordinal reasoning tiers like "second-highest."
+
+- **No invented mappings**: This document does not fabricate model IDs or parameter values. Runtime resolution is required.
+
+### What the Cursor API Actually Supports
 
 According to [Cursor Cloud Agents API documentation](https://cursor.com/docs/cloud-agent/api/endpoints):
 
@@ -94,7 +138,7 @@ POST /v1/agents
 - **`model.id`**: Must be a value returned by `GET /v1/models`
 - **`model.params`**: Optional array of `{id, value}` pairs; valid params come from `GET /v1/models` for the selected model
 
-#### How to Discover Available Models and Parameters
+### How to Discover Available Models and Parameters
 
 ```bash
 curl https://api.cursor.com/v1/models -u YOUR_API_KEY:
@@ -105,38 +149,16 @@ Response includes:
 - `parameters`: Per-model parameter definitions with allowed values
 - `variants`: Pre-configured `id`+`params` combinations
 
-**Example response structure:**
-```json
-{
-  "items": [
-    {
-      "id": "composer-2",
-      "displayName": "Composer 2",
-      "parameters": [
-        {
-          "id": "fast",
-          "values": [{"value": "false"}, {"value": "true"}]
-        }
-      ]
-    },
-    {
-      "id": "claude-4.6-sonnet-thinking",
-      "displayName": "Claude 4.6 Sonnet (Thinking)"
-    }
-  ]
-}
-```
+**Before first execution:** Run the above command to discover actual model IDs and map them to the requested model names.
 
-#### Mapping Preferences to Model Choices
+### Runtime Model Resolution
 
-| Stage | Desired Reasoning | Suggested Approach |
-|-------|-------------------|-------------------|
-| Equilibrium Derivation | Highest | Choose a "thinking" model variant if available |
-| Equilibrium to Pseudocode | Highest | Choose a "thinking" model variant if available |
-| Python Implementation | Lower | Choose a faster variant (e.g., `fast: true`) or standard model |
-| Academic Writing | Mid-to-High | Choose standard model without fast mode |
-
-**No specific models are chosen yet.** The orchestrator validates selected models against `GET /v1/models` at runtime and refuses to launch if the model is unavailable.
+The orchestrator should:
+1. Query `GET /v1/models` to get available models
+2. Search for models matching the requested names (e.g., containing "fable", "grok", "gpt-5.6")
+3. If multiple matches exist, prefer variants with reasoning-related parameters matching the requested level
+4. If no match found, fail with a clear error listing available alternatives
+5. Log the resolved `model.id` and `params` for each stage
 
 ---
 
@@ -168,6 +190,7 @@ Response includes:
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │   Agent 1   │  │   Agent 2   │  │   Agent 3   │  ...         │
 │  │  (Stage 1)  │  │  (Stage 2)  │  │  (Stage 3)  │              │
+│  │ Claude Fable│  │ Claude Fable│  │    Grok     │              │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘              │
 │         │                │                │                      │
 │         ▼                ▼                ▼                      │
@@ -187,13 +210,13 @@ Response includes:
 
 2. Orchestrator validates:
    - Config file syntax
-   - Model IDs against GET /v1/models
+   - Model IDs against GET /v1/models (resolve requested names to actual IDs)
    - API key present in CURSOR_API_KEY env var
 
 3. For each stage (sequential):
    a. Check dependencies (prior stage completed)
    b. Validate input manifest (required files exist in repo)
-   c. Launch cloud agent via POST /v1/agents
+   c. Launch cloud agent via POST /v1/agents with resolved model ID
    d. Poll GET /v1/agents/{id}/runs/{runId} until terminal status
    e. If FINISHED:
       - Fetch pushed branch info from response
@@ -222,6 +245,27 @@ This means:
 - Local uncommitted changes are **NOT visible** to cloud agents
 - You must `git commit` and `git push` before the agent can see your changes
 - Each agent starts from the `starting_ref` (branch or commit) you specify
+
+### Input File Requirements for Stage 1
+
+Stage 1 requires a QMD or LaTeX file specifying the economic model setup. This file must be:
+1. Committed to the repository before pipeline execution
+2. Located at a known path (configure in `config.yaml`)
+3. Contain the full model specification that the agent will use for derivation
+
+**Example workflow:**
+```bash
+# Create your model specification
+# (file: inputs/model_setup.qmd or inputs/model_setup.tex)
+
+# Commit the input file
+git add inputs/model_setup.qmd
+git commit -m "Add economic model specification for equilibrium derivation"
+git push origin main
+
+# Now run the pipeline
+python orchestrator/orchestrator.py --dry-run
+```
 
 ### Branch Creation
 
@@ -263,8 +307,8 @@ Before running the pipeline:
 cd D:\RMB_AI
 git status  # Check for uncommitted changes
 
-# 2. Commit any input changes
-git add reference/ data/
+# 2. Commit any input changes (including model specification)
+git add inputs/ reference/ data/
 git commit -m "Add input data for pipeline run"
 
 # 3. Push to GitHub
@@ -285,8 +329,8 @@ python orchestrator.py --config config.yaml --execute
 
 Before launching each stage:
 
-1. **Model Validation**: Check `model_id` exists in `GET /v1/models` response
-2. **Parameter Validation**: Check `model_params` are valid for the model
+1. **Model Validation**: Check resolved `model.id` exists in `GET /v1/models` response
+2. **Parameter Validation**: Check `model.params` are valid for the model
 3. **Dependency Check**: Prior stage completed successfully
 4. **Input Manifest**: Required input files exist in the starting ref
 
@@ -314,7 +358,7 @@ The orchestrator can pause for manual review:
 | Scenario | Handling |
 |----------|----------|
 | API authentication failure | Stop immediately, report error |
-| Model not available | Stop before launch, suggest alternatives |
+| Requested model not found in API | Stop before launch, list available models |
 | Run status ERROR | Log details, optionally continue to next stage |
 | Run status CANCELLED | User cancelled; stop pipeline |
 | Run status EXPIRED | Timeout; retry with same config |
@@ -412,17 +456,19 @@ This would require:
 
 ### Open Questions
 
-1. **Model Selection**: Which specific models should be used for each stage? The orchestrator supports any model from `GET /v1/models`, but no final choices have been made.
+1. **Equilibrium Definition**: ⚠️ Yang Lu to provide the mathematical/economic equilibrium definition for Stage 1 derivation.
 
-2. **Reasoning Parameters**: Some models may have parameters that control reasoning depth (e.g., Composer's `fast` parameter). Need to review available models and their parameters to map reasoning preferences.
+2. **Model ID Resolution**: The requested model names (Claude Fable 5.2, Grok, GPT-5.6) must be mapped to actual `model.id` values from `GET /v1/models`. This mapping is unresolved until runtime validation.
 
-3. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
+3. **Reasoning Level Parameters**: The API may not support ordinal reasoning levels like "second-highest." Need to discover what parameters each model actually exposes and how to map requested levels.
 
-4. **Parallelization**: Stages 1-3 are strictly sequential, but could Stage 4 (writing) run in parallel with Stage 3 (implementation)? Current design is fully sequential.
+4. **Grok Version**: Stage 3 requests "Grok" without a specific version. Need to determine which Grok version is available and appropriate.
 
-5. **Error Recovery**: If Stage 2 fails, should we allow manual fixes and resume, or require re-running from Stage 1?
+5. **Reproducibility Guardrails**: ⚠️ Yang Lu to specify Stage 3 reproducibility requirements.
 
-6. **Output Review**: Should there be mandatory human review between stages, or is automated manifest validation sufficient?
+6. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
+
+7. **Error Recovery**: If Stage 2 fails, should we allow manual fixes and resume, or require re-running from Stage 1?
 
 ---
 
@@ -442,13 +488,15 @@ This would require:
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-11-24 | Cloud Agent | Initial draft |
+| 2026-11-24 | Cloud Agent | Updated with specific model requests: Claude Fable 5.2 (Stages 1-2), Grok (Stage 3), GPT-5.6 (Stage 4). Added Stage 1 input format (QMD/LaTeX). Added pending sections for equilibrium definition and reproducibility guardrails. |
 
 ---
 
 ## Next Steps
 
-1. **Review this document** and provide feedback on the design
-2. **Choose models** for each stage based on `GET /v1/models` output
-3. **Test dry-run** to validate configuration
-4. **Commit input data** to the repository
-5. **Execute first pipeline run** with close monitoring
+1. **Yang Lu: Provide equilibrium definition** for Stage 1 derivation task
+2. **Yang Lu: Specify reproducibility guardrails** for Stage 3 Python implementation
+3. **Resolve model IDs** by querying `GET /v1/models` and mapping requested names
+4. **Commit input files** (economic model specification in QMD or LaTeX)
+5. **Test dry-run** to validate configuration and model availability
+6. **Execute first pipeline run** with close monitoring
