@@ -2291,6 +2291,44 @@ def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
     print("✓ test_manual_review_pauses_the_pipeline_until_the_output_is_approved passed")
 
 
+def test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun():
+    """--rerun-stage on a stage awaiting review launches a new agent from the same input."""
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest_path = Path(tmp) / "manifest.json"
+        backend = make_launch_mock()
+        orchestrator = start_project(backend=backend, directory=Path(tmp), manual_review=True)
+        first = orchestrator.run_pipeline().stages[STAGE1_NAME]
+        assert first.status == STAGE_AWAITING_REVIEW
+        
+        resumed = resume_from_file(
+            backend=backend, manifest_path=manifest_path, manual_review=True,
+            rerun_stage=STAGE1_NAME,
+        )
+        assert load_manifest(manifest_path=manifest_path).stages[STAGE1_NAME] == first, (
+            "The reset is not saved until the run goes ahead"
+        )
+        manifest = resumed.run_pipeline()
+        
+        second = manifest.stages[STAGE1_NAME]
+        assert (second.attempt, second.status) == (2, STAGE_AWAITING_REVIEW)
+        assert second.input_commit == first.input_commit
+        assert second.agent_id != first.agent_id
+        assert second.output_commit != first.output_commit
+        assert launch_count(backend=backend) == 2
+        assert [previous["agent_id"] for previous in manifest.previous_attempts] == [first.agent_id]
+        
+        resumed.approve_stage(stage_name=STAGE1_NAME)
+        expect_state_error(
+            action=lambda: resume_from_file(
+                backend=backend, manifest_path=manifest_path, manual_review=True,
+                rerun_stage=STAGE1_NAME,
+            ),
+            expected_message_part="cannot be rerun: its status is COMPLETE",
+        )
+        assert launch_count(backend=backend) == 2
+    print("✓ test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun passed")
+
+
 def test_artifacts_are_downloaded_only_to_safe_paths_inside_the_project_folder():
     """Safe artifacts are saved and recorded; unsafe paths are recorded and never written."""
     safe = {

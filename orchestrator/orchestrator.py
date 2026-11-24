@@ -329,9 +329,11 @@ LAUNCHABLE_STATUSES = (
     STAGE_PENDING, STAGE_BLOCKED, STAGE_DRY_RUN, STAGE_LAUNCH_REJECTED, STAGE_LAUNCHING,
 )
 
-# An agent ran for a stage in one of these states and left no usable output.
-# Launching again is a new paid run, so it happens only with --rerun-stage.
-RERUNNABLE_STATUSES = (STAGE_RUN_FAILED, STAGE_GATE_FAILED)
+# An agent ran for a stage in one of these states, and its output is not
+# (or not yet) accepted: the run failed, the output check failed, or the
+# output waits for a review that may reject it. Launching again is a new
+# paid run, so it happens only with --rerun-stage.
+RERUNNABLE_STATUSES = (STAGE_RUN_FAILED, STAGE_GATE_FAILED, STAGE_AWAITING_REVIEW)
 
 MANIFEST_FORMAT_VERSION = 2
 COMMIT_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
@@ -807,19 +809,20 @@ class Orchestrator:
         return existing is None or existing.status in LAUNCHABLE_STATUSES
     
     def _reset_stage_for_rerun(self, manifest: PipelineManifest, stage_name: str) -> None:
-        """Set a failed stage back to PENDING, keeping the failed attempt's record.
+        """Set a stage back to PENDING, keeping the replaced attempt's record.
 
         Raises:
-            ProjectStateError: unless the stage's run failed or its output
-                check failed.
+            ProjectStateError: unless the stage's run failed, its output
+                check failed, or its output is awaiting review.
         """
         result = manifest.stages.get(stage_name)
         if result is None or result.status not in RERUNNABLE_STATUSES:
             state = "it has not been run" if result is None else f"its status is {result.status}"
             raise ProjectStateError(
                 f"Stage '{stage_name}' cannot be rerun: {state}. --rerun-stage "
-                f"applies only to a stage whose run failed or whose output check "
-                f"failed ({', '.join(RERUNNABLE_STATUSES)})."
+                f"applies only to a stage whose run failed, whose output check "
+                f"failed, or whose output is awaiting review "
+                f"({', '.join(RERUNNABLE_STATUSES)})."
             )
         manifest.previous_attempts.append(asdict(result))
         manifest.stages[stage_name] = StageResult(name=stage_name, attempt=result.attempt + 1)
@@ -842,8 +845,9 @@ class Orchestrator:
 
         Args:
             manifest: The project's manifest.
-            rerun_stage: Name of a failed stage to launch again (a new paid
-                run). The change is made in memory; checkpoint() saves it.
+            rerun_stage: Name of a stage to launch again (a new paid run):
+                one that failed, or one awaiting review whose output is
+                rejected. The change is made in memory; checkpoint() saves it.
 
         Raises:
             ProjectStateError: if the manifest belongs to another repository
@@ -1730,7 +1734,10 @@ def load_manifest(manifest_path: Path) -> PipelineManifest:
 
 NEXT_STEP_BY_STATUS = {
     STAGE_AWAITING_REVIEW: (
-        "Review the output, then approve it: --resume {manifest} --approve {stage}"
+        "Review the output, then approve it: --resume {manifest} --approve {stage}\n"
+        "            (approving also launches the next stage). To reject it and launch "
+        "a NEW paid\n            agent for this stage instead: "
+        "--resume {manifest} --rerun-stage {stage}"
     ),
     STAGE_LAUNCHING: (
         "It is not known whether the agent was created. --resume {manifest} first "
@@ -1843,7 +1850,8 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
     parser.add_argument(
         "--approve",
         metavar="STAGE",
-        help="With --resume: approve a stage that is paused for manual review",
+        help="With --resume: approve a stage that is paused for manual "
+             "review, then go on to the next stage",
     )
     parser.add_argument(
         "--approve-commit",
@@ -1855,7 +1863,8 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
         "--rerun-stage",
         metavar="STAGE",
         help="With --resume: launch a NEW paid agent for a stage whose run "
-             "failed or whose output check failed",
+             "failed, whose output check failed, or whose output is awaiting "
+             "review and is rejected",
     )
     
     args = parser.parse_args(argv)
