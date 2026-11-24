@@ -1,0 +1,297 @@
+# Research Pipeline Orchestrator Configuration
+# Owner: Yang Lu
+# Repository: RMB_AI
+#
+# This orchestrator calls the Cursor Cloud Agents API to run a 4-stage
+# research pipeline. Each stage can use a different model.
+#
+# IMPORTANT: Cloud agents execute against the COMMITTED repository snapshot
+# on GitHub. Local uncommitted changes are NOT visible to cloud agents.
+# Commit and push repository inputs (reference/, data/) before running
+# the pipeline.
+#
+# The model setup / equilibrium definition document is different: the
+# orchestrator asks for its location at the start of every new project and
+# sends its text to the first stage inside the launch request.
+
+pipeline:
+  name: "equilibrium-research-pipeline"
+  description: "Four-stage pipeline: derivation -> pseudocode -> implementation -> writing"
+  
+  # Repository configuration
+  repository:
+    url: "https://github.com/yangluust/RMB_AI"
+    # Starting ref: a branch name or a full 40-character commit SHA. When a
+    # project is started the orchestrator reads the commit this ref points
+    # at and records it; the first stage starts from that exact commit.
+    starting_ref: "main"
+
+# Cursor Cloud Agents API configuration
+# Official docs: https://cursor.com/docs/cloud-agent/api/endpoints
+api:
+  base_url: "https://api.cursor.com/v1"
+  # Authentication: set CURSOR_API_KEY environment variable
+  # Generate at: Cursor Dashboard -> API Keys
+  # Do NOT store API keys in this file
+  
+  # Polling configuration for run status
+  polling:
+    interval_seconds: 30
+    # 1 hour of waiting per command. A run that is still going after that
+    # stays recorded as RUNNING; --resume waits for the same run again.
+    max_attempts: 120
+    
+  # Retries for transient failures (no response, HTTP 429, HTTP 5xx).
+  # max_attempts counts every try, the first included. backoff_seconds are
+  # the waits before the 2nd, 3rd, ... try; the last value repeats.
+  # Read-only requests are simply tried again. A launch request is never
+  # simply sent again: see "Launch Safety" in docs/pipeline-design.md.
+  retries:
+    max_attempts: 3
+    backoff_seconds: [5, 15, 30]
+
+# Stage definitions
+# Each stage runs as a separate cloud agent, with outputs passed via Git
+#
+# Model selection:
+#   - Set model_id to a value from GET /v1/models (e.g., "composer-2", "claude-4.6-sonnet-thinking")
+#   - Set model_id to null or omit to use your configured default
+#   - The orchestrator validates model_id against live /v1/models before launch
+#
+# Model parameters:
+#   - Optional params array with {id, value} entries; write both as quoted strings
+#   - Valid params come from GET /v1/models for the selected model
+#   - If a model ID, parameter or value is not listed there, validation fails
+#     and nothing is launched. Nothing is substituted or dropped.
+stages:
+  # Stage 1: Equilibrium Derivation
+  # Input: The model setup / equilibrium definition document (.qmd or .tex)
+  #        that the orchestrator asks for when a project is started
+  # Output: LaTeX derivations committed to outputs/stage1_derivation/
+  - name: "equilibrium_derivation"
+    display_name: "Equilibrium Derivation"
+    description: "Derive theoretical equilibrium conditions from economic models"
+    
+    # Requested by Yang Lu: Claude Fable 5.2, second-highest reasoning.
+    # The options reported for "effort" are low, medium, high, xhigh, max,
+    # so the second-highest is xhigh. Sent in the launch request as
+    #   "model": {"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "claude-fable-5-2"
+    model_params:
+      - id: "effort"
+        value: "xhigh"
+    
+    # The orchestrator asks for the location of the model setup /
+    # equilibrium definition document every time a new project is started,
+    # and appends the full text of that document to the prompt below at
+    # launch. No path is stored in this file. The first stage must keep
+    # this set to true. See "Project Input" in docs/pipeline-design.md.
+    receives_model_setup_document: true
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Derive the equilibrium of the economic model. The model setup
+      and the equilibrium definition are in the document given below under
+      "MODEL SETUP AND EQUILIBRIUM DEFINITION DOCUMENT". Use only the
+      setup and the equilibrium definition stated in that document. Do not
+      substitute, extend or assume a different setup or definition. If the
+      document does not state an equilibrium definition, or what it states
+      is not enough to carry out the derivation, stop and report what is
+      missing instead of filling the gap yourself.
+      
+      INPUT SOURCES:
+      - The model setup and equilibrium definition document given below
+        (it is in this prompt, not in the repository)
+      - Reference papers in reference/ directory
+      - Data context in data/ directory
+      
+      OUTPUT REQUIREMENTS:
+      - Write LaTeX derivations to outputs/stage1_derivation/derivation.tex
+      - Include step-by-step mathematical reasoning
+      - Document all assumptions
+      - Create outputs/stage1_derivation/summary.md with key results
+      
+      Commit your outputs before finishing.
+    
+    # Output check: after the run finishes, each of these files must exist
+    # at the head commit of the branch the agent pushed. Otherwise the
+    # stage stops with GATE_FAILED and no later stage is launched.
+    output_manifest:
+      required_files:
+        - "outputs/stage1_derivation/derivation.tex"
+        - "outputs/stage1_derivation/summary.md"
+    
+    # Manual review: after the output check passes, the pipeline pauses.
+    # The next stage is launched only after
+    #   python orchestrator.py --resume <manifest> --approve equilibrium_derivation
+    manual_review: true
+      
+  # Stage 2: Equilibrium to Pseudocode
+  # Input: Stage 1 derivations
+  # Output: Algorithmic pseudocode in outputs/stage2_pseudocode/
+  - name: "equilibrium_to_pseudocode"
+    display_name: "Equilibrium to Pseudocode"
+    description: "Translate equilibrium conditions into algorithmic pseudocode"
+    depends_on: "equilibrium_derivation"
+    
+    # Requested by Yang Lu: Claude Fable 5.2, second-highest reasoning
+    # (xhigh; see the note on the first stage).
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "claude-fable-5-2"
+    model_params:
+      - id: "effort"
+        value: "xhigh"
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Translate the equilibrium derivations into algorithmic pseudocode.
+      
+      INPUT:
+      - Read the derivations from outputs/stage1_derivation/
+      
+      OUTPUT REQUIREMENTS:
+      - Write pseudocode to outputs/stage2_pseudocode/algorithm.md
+      - Document numerical stability considerations
+      - Note computational complexity
+      - Create outputs/stage2_pseudocode/summary.md
+      
+      Commit your outputs before finishing.
+    
+    output_manifest:
+      required_files:
+        - "outputs/stage2_pseudocode/algorithm.md"
+        - "outputs/stage2_pseudocode/summary.md"
+    
+    manual_review: true
+
+  # Stage 3: Pseudocode to Python/Plots
+  # Input: Stage 2 pseudocode
+  # Output: Python implementation and visualizations
+  - name: "pseudocode_to_implementation"
+    display_name: "Python Implementation"
+    description: "Implement pseudocode in Python and generate plots"
+    depends_on: "equilibrium_to_pseudocode"
+    
+    # Requested by Yang Lu: Grok, low reasoning. Sent in the launch request as
+    #   "model": {"id": "grok-4.7", "params": [{"id": "reasoning_effort", "value": "low"}]}
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "grok-4.7"
+    model_params:
+      - id: "reasoning_effort"
+        value: "low"
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Implement the pseudocode in Python and generate visualizations.
+      
+      INPUT:
+      - Read pseudocode from outputs/stage2_pseudocode/
+      - Use data from data/ directory for validation
+      
+      OUTPUT REQUIREMENTS:
+      - Write Python code to outputs/stage3_implementation/
+      - Use numpy, scipy, matplotlib, pandas
+      - Follow PEP 8 style
+      - Generate publication-quality plots as PNG files
+      - Create outputs/stage3_implementation/README.md with usage instructions
+      
+      Commit your outputs before finishing.
+    
+    # Reproducibility guardrails supplied by Yang Lu. When the orchestrator
+    # launches this stage it appends this list, numbered, to the prompt above.
+    # Keep it identical to "Reproducibility Guardrails (Stage 3)" in
+    # docs/pipeline-design.md; test_orchestrator.py fails if the two differ.
+    guardrails:
+      - "Reusable code without duplication."
+      - "Configuration-driven parameters, saved with the results."
+      - "Stable semantic paths, without timestamps or version suffixes."
+      - "Named function arguments."
+      - "Version-controlled code, configs, and documentation."
+      - "Declared dependency versions."
+      - "Explicit random seeds."
+      - "External specification kept in sync with clear code."
+      - "Property-based, unit, and integration tests."
+      - "Programmatically generated outputs, never manually edited."
+      - "Raw inputs left unchanged."
+      - "Secrets and large generated files kept outside Git."
+    
+    output_manifest:
+      required_files:
+        - "outputs/stage3_implementation/README.md"
+    
+    manual_review: true
+
+  # Stage 4: Academic Writing
+  # Input: All previous stage outputs
+  # Output: Polished academic prose
+  - name: "academic_writing"
+    display_name: "Academic Writing"
+    description: "Polish research output for academic publication"
+    depends_on: "pseudocode_to_implementation"
+    
+    # Requested by Yang Lu: GPT-5.6 Sol, high reasoning. Sent in the launch request as
+    #   "model": {"id": "gpt-5.6-sol", "params": [{"id": "reasoning", "value": "high"}]}
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "gpt-5.6-sol"
+    model_params:
+      - id: "reasoning"
+        value: "high"
+    
+    prompt: |
+      You are working on the RMB_AI research project for Yang Lu.
+      
+      TASK: Polish the research outputs for academic publication.
+      
+      INPUT:
+      - Read derivations from outputs/stage1_derivation/
+      - Read implementation from outputs/stage3_implementation/
+      
+      OUTPUT REQUIREMENTS:
+      - Write polished prose to outputs/stage4_writing/
+      - Target AER/Econometrica style
+      - Ensure clarity and precision
+      - Create outputs/stage4_writing/draft.tex
+      - Create outputs/stage4_writing/summary.md
+      
+      Commit your outputs before finishing.
+    
+    output_manifest:
+      required_files:
+        - "outputs/stage4_writing/draft.tex"
+        - "outputs/stage4_writing/summary.md"
+    
+    # Last stage: no later stage waits on a review.
+    manual_review: false
+
+# Artifact collection settings
+# Artifacts are files the agent saves to its artifacts/ directory. After a
+# stage's output check passes, the orchestrator lists them and downloads
+# each one to
+#   <folder of the manifest>/<local_output_dir>/<manifest name>/<stage>/
+# A path that is unsafe to write (absolute, with "..", a backslash, a colon
+# or a Windows device name) is not saved; it is recorded in the manifest.
+artifacts:
+  collect: true
+  local_output_dir: "collected_artifacts"
+
+# Execution settings
+# Whether agents are launched is decided by the command line (--dry-run,
+# --check-online, --execute, --resume), not by a setting here.
+execution:
+  # Whether to auto-create PRs for each stage's output
+  auto_create_pr: false
+
+# Project manifest
+# Records, for each stage: the agent and run IDs, the exact input commit,
+# the output branch and commit, the output check, collected artifacts and
+# the review state. Written after every step, so a project can be resumed.
+manifest:
+  output_file: "pipeline_manifest.json"
