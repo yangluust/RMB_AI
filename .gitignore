@@ -43,3 +43,7 @@ Thumbs.db
 *.key
 .env.local
 .env.*.local
+
+# Orchestrator downloads and in-progress manifest writes
+collected_artifacts/
+*.json.tmp

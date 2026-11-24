@@ -21,8 +21,9 @@ pipeline:
   # Repository configuration
   repository:
     url: "https://github.com/yangluust/RMB_AI"
-    # Starting ref (branch or commit SHA). The orchestrator creates a new
-    # cursor/* branch from this ref for each stage.
+    # Starting ref: a branch name or a full 40-character commit SHA. When a
+    # project is started the orchestrator reads the commit this ref points
+    # at and records it; the first stage starts from that exact commit.
     starting_ref: "main"
 
 # Cursor Cloud Agents API configuration
@@ -38,7 +39,11 @@ api:
     interval_seconds: 30
     max_attempts: 120  # 1 hour maximum wait per stage
     
-  # Retry configuration for transient failures
+  # Retries for transient failures (no response, HTTP 429, HTTP 5xx).
+  # max_attempts counts every try, the first included. backoff_seconds are
+  # the waits before the 2nd, 3rd, ... try; the last value repeats.
+  # Read-only requests are simply tried again. A launch request is never
+  # simply sent again: see "Launch Safety" in docs/pipeline-design.md.
   retries:
     max_attempts: 3
     backoff_seconds: [5, 15, 30]
@@ -109,11 +114,18 @@ stages:
       
       Commit your outputs before finishing.
     
-    # Validation gate: files that must exist before next stage
+    # Output check: after the run finishes, each of these files must exist
+    # at the head commit of the branch the agent pushed. Otherwise the
+    # stage stops with GATE_FAILED and no later stage is launched.
     output_manifest:
       required_files:
         - "outputs/stage1_derivation/derivation.tex"
         - "outputs/stage1_derivation/summary.md"
+    
+    # Manual review: after the output check passes, the pipeline pauses.
+    # The next stage is launched only after
+    #   python orchestrator.py --resume <manifest> --approve equilibrium_derivation
+    manual_review: true
       
   # Stage 2: Equilibrium to Pseudocode
   # Input: Stage 1 derivations
@@ -152,6 +164,8 @@ stages:
       required_files:
         - "outputs/stage2_pseudocode/algorithm.md"
         - "outputs/stage2_pseudocode/summary.md"
+    
+    manual_review: true
 
   # Stage 3: Pseudocode to Python/Plots
   # Input: Stage 2 pseudocode
@@ -209,6 +223,8 @@ stages:
     output_manifest:
       required_files:
         - "outputs/stage3_implementation/README.md"
+    
+    manual_review: true
 
   # Stage 4: Academic Writing
   # Input: All previous stage outputs
@@ -249,28 +265,31 @@ stages:
       required_files:
         - "outputs/stage4_writing/draft.tex"
         - "outputs/stage4_writing/summary.md"
+    
+    # Last stage: no later stage waits on a review.
+    manual_review: false
 
 # Artifact collection settings
-# Artifacts are files the agent saves to its artifacts/ directory
-# They can be downloaded via the API after the run completes
+# Artifacts are files the agent saves to its artifacts/ directory. After a
+# stage's output check passes, the orchestrator lists them and downloads
+# each one to
+#   <folder of the manifest>/<local_output_dir>/<manifest name>/<stage>/
+# A path that is unsafe to write (absolute, with "..", a backslash, a colon
+# or a Windows device name) is not saved; it is recorded in the manifest.
 artifacts:
   collect: true
   local_output_dir: "collected_artifacts"
 
 # Execution settings
+# Whether agents are launched is decided by the command line (--dry-run,
+# --check-online, --execute, --resume), not by a setting here.
 execution:
-  # dry_run: true means validate config and models without launching agents
-  # This is the default to prevent accidental paid runs
-  dry_run: true
-  
   # Whether to auto-create PRs for each stage's output
   auto_create_pr: false
-  
-  # Stop on first stage failure
-  fail_fast: true
 
-# Git ref manifest
-# Records the commit SHAs for each stage's input and output
-# Written to manifest.json after pipeline completion
+# Project manifest
+# Records, for each stage: the agent and run IDs, the exact input commit,
+# the output branch and commit, the output check, collected artifacts and
+# the review state. Written after every step, so a project can be resumed.
 manifest:
   output_file: "pipeline_manifest.json"
