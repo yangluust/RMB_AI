@@ -73,16 +73,22 @@ The original design specified Grok-only models with specific xAI reasoning tiers
 
 #### Reproducibility Guardrails (Stage 3)
 
-> **⚠️ PLACEHOLDER: Yang Lu to specify reproducibility guardrails**
->
-> This section is reserved for reproducibility requirements that Yang Lu will define later. These may include:
-> - Random seed handling
-> - Version pinning for dependencies
-> - Deterministic algorithm requirements
-> - Output validation criteria
-> - Numerical precision requirements
->
-> **Content pending — do not invent specifications.**
+Principles supplied by Yang Lu for the Stage 3 Python implementation:
+
+1. Reusable code without duplication.
+2. Configuration-driven parameters, saved with the results.
+3. Stable semantic paths, without timestamps or version suffixes.
+4. Named function arguments.
+5. Version-controlled code, configs, and documentation.
+6. Declared dependency versions.
+7. Explicit random seeds.
+8. External specification kept in sync with clear code.
+9. Property-based, unit, and integration tests.
+10. Programmatically generated outputs, never manually edited.
+11. Raw inputs left unchanged.
+12. Secrets and large generated files kept outside Git.
+
+**Status:** These principles are recorded in this design document only. The Stage 3 prompt in `orchestrator/config.yaml` does not yet state them, so a pipeline run would not pass them to the Stage 3 agent until that prompt is updated.
 
 ### Stage 4: Academic Writing
 
@@ -464,11 +470,9 @@ This would require:
 
 4. **Grok Version**: Stage 3 requests "Grok" without a specific version. Need to determine which Grok version is available and appropriate.
 
-5. **Reproducibility Guardrails**: ⚠️ Yang Lu to specify Stage 3 reproducibility requirements.
+5. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
 
-6. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
-
-7. **Error Recovery**: If Stage 2 fails, should we allow manual fixes and resume, or require re-running from Stage 1?
+6. **Error Recovery**: If Stage 2 fails, should we allow manual fixes and resume, or require re-running from Stage 1?
 
 ---
 
@@ -489,14 +493,14 @@ This would require:
 |------|--------|---------|
 | 2026-11-24 | Cloud Agent | Initial draft |
 | 2026-11-24 | Cloud Agent | Updated with specific model requests: Claude Fable 5.2 (Stages 1-2), Grok (Stage 3), GPT-5.6 (Stage 4). Added Stage 1 input format (QMD/LaTeX). Added pending sections for equilibrium definition and reproducibility guardrails. |
+| 2026-11-24 | Cloud Agent | Replaced the Stage 3 reproducibility guardrails placeholder with the twelve principles supplied by Yang Lu. Equilibrium definition remains pending. |
 
 ---
 
 ## Next Steps
 
 1. **Yang Lu: Provide equilibrium definition** for Stage 1 derivation task
-2. **Yang Lu: Specify reproducibility guardrails** for Stage 3 Python implementation
-3. **Resolve model IDs** by querying `GET /v1/models` and mapping requested names
-4. **Commit input files** (economic model specification in QMD or LaTeX)
-5. **Test dry-run** to validate configuration and model availability
-6. **Execute first pipeline run** with close monitoring
+2. **Resolve model IDs** by querying `GET /v1/models` and mapping requested names
+3. **Commit input files** (economic model specification in QMD or LaTeX)
+4. **Test dry-run** to validate configuration and model availability
+5. **Execute first pipeline run** with close monitoring
