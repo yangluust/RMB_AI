@@ -11,6 +11,8 @@
 
 This document describes the design for a four-stage research pipeline that runs on the **Cursor Public Cloud Agents API**. A local Windows orchestrator script at `D:\RMB_AI` triggers separate cloud agents for each stage, with configurable model selection per stage and sequential artifact handoff through the Git repository.
 
+The four stages are: (1) derive the equilibrium of the model as implementable mathematical conditions, (2) translate those conditions into pseudocode, (3) translate the pseudocode into Python code, (4) determine a parameter configuration, run the computation and report the results. All four write into one cumulative working document. After every stage the pipeline stops, shows the stage's output in the local checkout and waits for the owner's approval.
+
 **Implementation status.** What this document says the orchestrator does is implemented in `orchestrator/` and tested against stand-ins for the services it talks to. Nothing has been run against the live Cursor API: no agent has been launched and no pipeline has run end to end. See [What Has and Has Not Been Tested](#what-has-and-has-not-been-tested).
 
 ### Design Goals
@@ -19,8 +21,9 @@ This document describes the design for a four-stage research pipeline that runs 
 2. **Sequential chaining on exact commits**: Stages run in order. Each starts from the exact commit that passed the previous stage's output check.
 3. **Repository-based handoff**: Stage outputs are commits on Git branches that the agents push. Later stages read them from the repository.
 4. **No duplicate paid runs**: Every step is recorded in a manifest file. A resume continues from that record and never launches a second agent for a stage that already has one, unless it is told to.
-5. **Review between stages**: The pipeline can pause after a stage until its output is approved.
-6. **Nothing paid without an explicit command**: Only `--execute` and `--resume` can launch agents. `--dry-run` works offline. `--check-online` uses the network and launches nothing.
+5. **Review after every stage**: The pipeline stops after each of the four stages, the last one included. Before it says a stage is ready for review, it checks the stage's output out in the owner's local checkout. Nothing advances without an explicit approval of that exact commit.
+6. **One cumulative working document**: Every stage adds its own section to one file in `docs/`. An approved section is not changed by a later stage, and the document never holds content for a stage that has not been carried out.
+7. **Nothing paid without an explicit command**: Only `--execute` and `--resume` can launch agents. `--dry-run` works offline. `--check-online` uses the network and launches nothing.
 
 ### Historical Note
 
@@ -76,13 +79,15 @@ Markdown has no include syntax of its own. The check on a `.md` file covers the 
 
 The cloud agent cannot open a path on the local machine, and `POST /v1/agents` has no field for uploading an input file. The orchestrator therefore reads the file and puts its full text into `prompt.text` of the Stage 1 launch request. The text comes after the task, between a `----- BEGIN DOCUMENT -----` line and an `----- END DOCUMENT -----` line, together with the file name, format and SHA-256 hash. The local path is not sent.
 
-The orchestrator only reads the file. It does not change, move, copy or commit it, and it runs no Git command.
+The orchestrator only reads the file. It does not change, move, copy or commit it.
+
+**The committed copy.** Stages 2 to 4 do not get the document in their prompts; they read it from the repository. The document must therefore also be committed, unchanged, at the path `working_document.source_document` names (`docs/intervention-incomplete-information-source.md`), in the commit the project starts from. When a project is started, the orchestrator reads that file from GitHub at the source commit and stops, before anything is launched, if it is missing or if its SHA-256 differs from the document selected for the project. `--check-online` asks for no document and checks only that the committed copy is there. The simplest way to satisfy this is to answer the question with the path of the committed copy in the local checkout.
 
 Limits of this handoff:
 
 - **One file only.** Only the text of the selected file is sent. That is why a file that pulls in other files is refused; write that text into the file itself. Figures and bibliography files that the document refers to are not sent.
 - **The text goes to Cursor.** It is part of the agent's prompt and is visible in that agent's conversation. Do not put secrets in the document.
-- **Not recorded in Git by the orchestrator.** The repository holds the document only if Yang commits it himself. The project manifest records which file was used (see below).
+- **Not committed by the orchestrator.** The orchestrator never commits or pushes anything. The committed copy is put in the repository by a normal commit. The project manifest records which file was used (see below).
 - **Size.** The API documentation states no size limit for `prompt.text`, and the orchestrator sets none. A very large document may be rejected by the API; this has not been tested.
 - **Content is not judged.** The orchestrator checks that the file is a readable, non-empty, self-contained `.qmd`, `.tex` or `.md` file. It cannot tell whether the file states an equilibrium definition, or a correct one. The Stage 1 prompt tells the agent to stop and report what is missing if the document does not state enough, instead of filling the gap itself.
 - **Stand-in tests only.** This has been checked against a stand-in for the API. No Stage 1 agent has been launched.
@@ -111,39 +116,69 @@ Yang decides what the document contains and how it is laid out. The list below i
 
 ## Pipeline Stages
 
+| Stage | ID in `config.yaml` | Task | Writes |
+|-------|---------------------|------|--------|
+| 1 | `equilibrium_derivation` | Derive the equilibrium as implementable mathematical conditions | Section 1 of the working document |
+| 2 | `equilibrium_to_pseudocode` | Translate the conditions into pseudocode | Section 2 of the working document |
+| 3 | `pseudocode_to_implementation` | Translate the pseudocode into Python code, with tests | Section 3 of the working document; code in `outputs/stage3_implementation/` |
+| 4 | `parameterization_and_results` | Determine a parameter configuration, run the code, report the results | Section 4 of the working document; files in `outputs/stage4_results/` |
+
+Stage 4 replaced the earlier "Academic Writing" stage (`academic_writing`), which no longer exists. The IDs of Stages 1 to 3 are unchanged; their tasks and outputs changed as described below. Each stage does its own task only: Stage 1 writes no pseudocode, Stage 2 no code, Stage 3 no parameter configuration and no results.
+
+### Working Document
+
+All four stages write into `docs/equilibrium-working-document.md` (`working_document.path` in `config.yaml`). Each stage's section is enclosed by two marker lines:
+
+```
+<!-- BEGIN STAGE 2: equilibrium_to_pseudocode -->
+...
+<!-- END STAGE 2: equilibrium_to_pseudocode -->
+```
+
+The orchestrator appends the exact marker lines and the rules below to each stage's prompt, and checks the same rules at the commit the stage pushes (see [Output Check After Each Stage](#output-check-after-each-stage)):
+
+1. The stage's own section is there, each marker exactly once on a line of its own, and is not empty.
+2. The sections of the earlier stages are byte-for-byte as they are in the commit the stage started from, which is the commit the owner approved. A stage that finds an error in an earlier section reports it in its own section and does not edit the earlier one.
+3. No marker of a later stage is in the document. The document therefore never holds content, or a placeholder, for a stage that has not been carried out.
+4. The committed source document (`working_document.source_document`, `docs/intervention-incomplete-information-source.md`) is byte-for-byte unchanged.
+
+The source document in `docs/` is the owner's original file, unchanged (79,082 bytes, SHA-256 `560b2ee1a7189ed8183dcc5ec8d6db9292f85ac645351bfe65a0a3292cad5960`, CRLF line endings). `.gitattributes` marks it `-text`, so Git converts its line endings on no platform. A test fails if its bytes change.
+
 ### Stage 1: Equilibrium Derivation
 
 | Attribute | Value |
 |-----------|-------|
-| **Purpose** | Derive theoretical equilibrium conditions from economic model specification |
+| **Purpose** | Derive the equilibrium of the model and write it as implementable mathematical conditions |
 | **Input** | QMD (`.qmd`), LaTeX (`.tex`) or Markdown (`.md`) file stating the economic model setup and the equilibrium definition |
-| **Input Location** | Asked for at the start of every new project; the file's text is sent in the Stage 1 launch request (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)) |
-| **Output** | LaTeX derivations in `outputs/stage1_derivation/` |
+| **Input Location** | Asked for at the start of every new project; the file's text is sent in the Stage 1 launch request (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)). The same file must be committed at `docs/intervention-incomplete-information-source.md` |
+| **Scope** | Section 1 of the document, together with the lagged-price rule that Section 1.2 refers to, equation (12) in Section 4. The other sections are secondary reference only |
+| **Output** | Section 1 of the working document: mathematics only |
 | **Equilibrium Definition** | Stated in the input document; this design document and the orchestrator supply none |
 | **Requested Model** | **Claude Fable 5.2** |
 | **Requested Reasoning** | **Second-highest** |
 | **Configured** | `claude-fable-5-2` with `effort` = `xhigh` (see [Model Selection](#model-selection)) |
 
-**Stage 1 Task:** The agent receives the text of the input document in its prompt, understands the model structure, and derives the equilibrium using only the setup and the equilibrium definition stated in that document. If the document does not state enough, the agent is told to stop and report what is missing. Stage 1 cannot launch until a usable document has been given for the project; see [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
+**Stage 1 Task:** The agent receives the text of the input document in its prompt and writes: the exogenous processes, parameters, state variables and unknowns; the timing and information; the equilibrium conditions as residual equations, each with its source equation; which terms are expectations and under which information; the boundary, positivity and admissibility conditions; for every condition whether it is exact or a first-order approximation in the source; and a numbered list of missing closures and ambiguities. It is told to keep as a symbol every functional form, value, initial condition and distribution the document does not give, and to stop and report rather than fill a gap. Stage 1 cannot launch until a usable document has been given for the project; see [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
 
 ### Stage 2: Equilibrium to Pseudocode
 
 | Attribute | Value |
 |-----------|-------|
-| **Purpose** | Translate equilibrium conditions into algorithmic pseudocode |
-| **Input** | Stage 1 outputs (`outputs/stage1_derivation/`) |
-| **Output** | Pseudocode in `outputs/stage2_pseudocode/` |
+| **Purpose** | Translate the equilibrium conditions into algorithmic pseudocode |
+| **Input** | Section 1 of the working document, as approved |
+| **Output** | Section 2 of the working document: pseudocode only (no program code, no parameter values) |
 | **Requested Model** | **Claude Fable 5.2** |
 | **Requested Reasoning** | **Second-highest** |
 | **Configured** | `claude-fable-5-2` with `effort` = `xhigh` (see [Model Selection](#model-selection)) |
 
-### Stage 3: Python Implementation and Plots
+### Stage 3: Python Implementation
 
 | Attribute | Value |
 |-----------|-------|
-| **Purpose** | Implement pseudocode in Python, generate visualizations |
-| **Input** | Stage 2 outputs (`outputs/stage2_pseudocode/`), data (`data/`) |
-| **Output** | Python code and plots in `outputs/stage3_implementation/` |
+| **Purpose** | Translate the pseudocode into Python code and test it |
+| **Input** | Sections 1 and 2 of the working document, as approved |
+| **Output** | `outputs/stage3_implementation/solve_equilibrium.py`, `test_solve_equilibrium.py`, `requirements.txt`, `README.md`; Section 3 of the working document (the code, the map from pseudocode steps to functions, the test command and its printed output) |
+| **Not in this stage** | The project's parameter configuration, results, plots. The code reads every parameter and functional-form choice from a configuration file and holds no built-in values |
 | **Requested Model** | **Grok** |
 | **Requested Reasoning** | **Low** |
 | **Configured** | `grok-4.7` with `reasoning_effort` = `low` (see [Model Selection](#model-selection)) |
@@ -167,16 +202,20 @@ Principles supplied by Yang Lu for the Stage 3 Python implementation:
 
 **Runtime:** The same twelve principles are listed under `guardrails` for this stage in `orchestrator/config.yaml`. When the orchestrator launches Stage 3 it appends them, numbered, to the stage prompt, so the agent receives them in the launch request. `orchestrator/test_orchestrator.py` fails if the list in the config differs from the list above, so edit both together. This has been checked against a stand-in for the API only; no Stage 3 agent has been launched.
 
-### Stage 4: Academic Writing
+### Stage 4: Parameters, Computation and Results
 
 | Attribute | Value |
 |-----------|-------|
-| **Purpose** | Polish research output for academic publication |
-| **Input** | Stages 1 and 3 outputs |
-| **Output** | Polished prose in `outputs/stage4_writing/` |
+| **Purpose** | Determine a parameter configuration, run the Stage 3 code with it, report the results |
+| **Input** | Sections 1 to 3 of the working document, as approved; the Stage 3 code; the source document |
+| **Output** | `outputs/stage4_results/parameters.json`, `results.json`, `run_record.json`; Section 4 of the working document (the configuration as a table, the command that was run, the results with residuals, convergence status and admissibility checks) |
 | **Requested Model** | **GPT-5.6 Sol** |
 | **Requested Reasoning** | **High** |
 | **Configured** | `gpt-5.6-sol` with `reasoning` = `high` (see [Model Selection](#model-selection)) |
+
+**What the source does not supply.** The source document gives no functional form for the reserve cost function, no numerical calibration, no initial stocks and no shock distributions. The Stage 4 prompt allows the agent to propose clearly labelled *illustrative* choices for such items, each with its reason and the statement that the source does not supply it, and forbids presenting them as the source's calibration. Where an open item is a structural ambiguity of the model rather than a value or form that can be chosen for illustration, the agent is told to stop and report it, not to invent the missing structure.
+
+**Run record.** Stage 4 writes `outputs/stage4_results/run_record.json`: `"status": "completed"` with the command, `exit_code` 0, the parameters and results files, `converged` and `max_abs_residual` as the code reported them; or `"status": "blocked"` with `blocked_reason`. The agent is told not to change the Stage 3 code and to report only numbers the code produced.
 
 ---
 
@@ -191,7 +230,7 @@ Each stage's model and reasoning level is set in `orchestrator/config.yaml` and 
 | 1. Equilibrium Derivation | Claude Fable 5.2, second-highest reasoning | `{"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}` |
 | 2. Equilibrium → Pseudocode | Claude Fable 5.2, second-highest reasoning | `{"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}` |
 | 3. Python Implementation | Grok, low reasoning | `{"id": "grok-4.7", "params": [{"id": "reasoning_effort", "value": "low"}]}` |
-| 4. Academic Writing | GPT-5.6 Sol, high reasoning | `{"id": "gpt-5.6-sol", "params": [{"id": "reasoning", "value": "high"}]}` |
+| 4. Parameters, Computation and Results | GPT-5.6 Sol, high reasoning | `{"id": "gpt-5.6-sol", "params": [{"id": "reasoning", "value": "high"}]}` |
 
 `orchestrator/test_orchestrator.py` fails if this table and `config.yaml` differ, so edit both together.
 
@@ -250,6 +289,8 @@ Each item has an `id` (the value for `model.id`), optional `aliases`, `parameter
 │    - reads config.yaml and the model setup document                      │
 │    - writes the project manifest after every step                        │
 │    - saves downloaded artifacts under the project folder                 │
+│    - runs git fetch / checkout / merge --ff-only in the local checkout   │
+│      to show a stage's output for review (never commits or pushes)       │
 └────────┬───────────────────────────┬──────────────────────┬─────────────┘
          │ HTTPS                     │ HTTPS, read-only     │ HTTPS
          │ with CURSOR_API_KEY       │                      │ no credentials
@@ -260,7 +301,7 @@ Each item has an `id` (the value for `model.id`), optional `aliases`, `parameter
 │  - list models          │  │  - branch -> commit   │  │ (artifact bytes) │
 │  - launch / look up     │  │  - commit exists      │  └──────────────────┘
 │    an agent             │  │  - file exists at a   │
-│  - read run status      │  │    commit             │
+│  - read run status      │  │    commit; its bytes  │
 │  - list artifacts       │  └───────────┬───────────┘
 └────────────┬────────────┘              │ reads
              │ one agent per stage       ▼
@@ -271,7 +312,7 @@ Each item has an `id` (the value for `model.id`), optional `aliases`, `parameter
                pushes a branch
 ```
 
-Models are reached only through Cursor. The orchestrator holds no Anthropic, OpenAI or xAI key and calls none of their APIs. It runs no Git command and writes nothing to GitHub; only the cloud agents push.
+Models are reached only through Cursor. The orchestrator holds no Anthropic, OpenAI or xAI key and calls none of their APIs. It writes nothing to GitHub: it never commits or pushes; only the cloud agents push. The only Git commands it runs are the ones that show a stage's output in the local checkout (see [Local Review](#local-review)); `git fetch` there uses the checkout's own Git credentials, with prompting switched off. `--dry-run` runs no Git command.
 
 ### Requests the Orchestrator Sends
 
@@ -285,9 +326,10 @@ Models are reached only through Cursor. The orchestrator holds no Anthropic, Ope
 | Get a download URL for an artifact | Cursor `GET /v1/agents/{id}/artifacts/download?path=...` | No |
 | Read the head commit of a branch | GitHub `GET /repos/{owner}/{repo}/git/ref/heads/{branch}` | No |
 | Check that a commit exists | GitHub `GET /repos/{owner}/{repo}/git/commits/{sha}` | No |
-| Check that a file exists at a commit | GitHub `GET /repos/{owner}/{repo}/contents/{path}?ref={sha}` | No |
+| Check that a file exists at a commit; read the working document, the source document and the run record at a commit | GitHub `GET /repos/{owner}/{repo}/contents/{path}?ref={sha}` | No |
+| Show a stage's output for review | Local `git fetch`, `git checkout`, `git merge --ff-only` in the local checkout | Only the local checkout (see [Local Review](#local-review)) |
 
-The launch request is the only request that changes anything. It is handled differently from the others; see [Launch Safety](#launch-safety).
+The launch request is the only request that changes anything outside the local machine. It is handled differently from the others; see [Launch Safety](#launch-safety).
 
 GitHub is needed because the run response of the Cursor API names the pushed branch but gives no commit SHA and no file listing.
 
@@ -295,17 +337,18 @@ GitHub is needed because the run response of the Cursor API names the pushed bra
 
 | Command | Uses the network | Can launch agents | What it does |
 |---------|------------------|-------------------|--------------|
-| `--dry-run` | No | No | Checks `config.yaml`, asks for the model setup document, prints what each stage would do. Needs no API key. Saves nothing. |
-| `--check-online` | Yes | No | Checks the API key, the configured models against `GET /v1/models`, and that the starting ref can be read on GitHub. Does not ask for the document. |
-| `--execute` | Yes | Yes | Starts a new project: asks for the document, runs the online checks, writes the manifest, then runs the stages until one pauses, stops or the last one completes. |
-| `--resume MANIFEST` | Yes | Yes | Continues a project from its manifest. Never launches a second agent for a stage that already has one. |
-| `--resume MANIFEST --approve STAGE` | Yes | Yes | Approves a stage that is paused for review, then goes on: the next stage is launched by the same command. |
+| `--dry-run` | No | No | Checks `config.yaml`, asks for the model setup document, builds each stage's prompt and prints what each stage would do. Needs no API key. Runs no Git command. Saves nothing. It carries out no stage: nothing is derived, written or computed. |
+| `--check-online` | Yes | No | Checks the API key, the configured models against `GET /v1/models`, that the starting ref can be read on GitHub and holds the committed source document, and that the local checkout can receive stage outputs. Does not ask for the document. |
+| `--execute` | Yes | Yes | Starts a new project: asks for the document, runs the online checks, writes the manifest, then runs the first stage until it stops for review (or fails). |
+| `--resume MANIFEST` | Yes | Yes | Continues a project from its manifest. Never launches a second agent for a stage that already has one, and never goes past a review. |
+| `--resume MANIFEST --approve STAGE` | Yes | Yes | Approves the reviewed output of a stage, then goes on: the next stage is launched by the same command and stops for its own review. |
 | `--resume MANIFEST --approve STAGE --approve-commit SHA` | Yes | Yes | Approves a commit that was pushed to the stage's branch after the output check. |
-| `--resume MANIFEST --rerun-stage STAGE` | Yes | Yes | Launches a **new paid agent** for a stage whose run failed, whose output check failed, or whose output is rejected at review. |
+| `--resume MANIFEST --revise STAGE --feedback FILE` | Yes | Yes | Launches a **new paid agent** that starts from the reviewed output and revises it as the feedback text asks. The revised output comes back for review. `--revise-commit SHA` names a commit pushed to the stage's branch to start from instead. |
+| `--resume MANIFEST --rerun-stage STAGE` | Yes | Yes | Launches a **new paid agent**, from the stage's original input, for a stage whose run failed, whose output check failed, or whose output is rejected at review. |
 
 `--output FILE` names the manifest file of a new project. It is refused together with `--resume`: a resumed project keeps writing to the manifest it was resumed from.
 
-Exit codes: `0` when every stage is complete (or a check passed), `2` when the pipeline is paused for review, `1` otherwise.
+Exit codes: `0` when every stage is approved (or a check passed), `2` when the pipeline is paused for review, `1` otherwise.
 
 ### Execution Flow
 
@@ -322,21 +365,28 @@ python orchestrator.py --execute
    - every stage's model, parameters and values are in GET /v1/models
    - the starting ref can be read on GitHub; the commit it points at
      becomes the project's source commit
+   - the committed source document is at that commit and is the same
+     file (same SHA-256) as the document selected in step 2
 
 4. Write the manifest file (document record, source ref, source commit).
 
-5. For each stage, in order:
-   a. Launch   Choose an agent ID and write it to the manifest. Then
+5. For the first stage (and, after each approval, for the next one):
+   a. Launch   Check that the local checkout could receive the output.
+               Choose an agent ID and write it to the manifest. Then
                POST /v1/agents with startingRef = the input commit.
    b. Wait     Poll the run until it ends.
    c. Check    Read the head commit of the branch the agent pushed.
-               Require a new commit that holds every required file.
-               Record it as the stage's output commit.
+               Require a new commit that holds every required file,
+               keeps the working document rules and (Stage 4) has a
+               well-formed run record. Record it as the output commit.
    d. Collect  Download the agent's artifacts into the project folder.
-   e. Review   If the stage has manual_review: stop until it is approved.
+   e. Show     Check the stage's branch out in the local checkout, at
+               exactly the output commit, and verify it.
+   f. Review   Print READY FOR REVIEW and stop. Every stage stops here,
+               the last one included.
    The manifest is written after each of these steps.
-   The first stage that cannot go on stops the pipeline. Later stages
-   are not started.
+   A stage that cannot go on stops the pipeline. No later stage starts
+   before the stage is approved with --approve.
 
 6. Print each stage's status and, for a stage that stopped, the command
    that continues it.
@@ -356,10 +406,13 @@ The manifest records one status per stage. It decides what a later `--resume` do
 | `GATE_FAILED` | The output check failed. | Does the output check again. Launches nothing. |
 | `OUTPUT_VERIFIED` | The output check passed. Artifacts are not collected yet. | Collects the artifacts. |
 | `ARTIFACTS_FAILED` | Listing or downloading the artifacts failed. | Collects the artifacts again. |
-| `AWAITING_REVIEW` | The stage waits for approval. | Stays paused. Needs `--approve` (or `--rerun-stage` to reject). |
-| `COMPLETE` | Done. Its output commit is handed to the next stage. | Skips the stage. |
+| `LOCAL_SYNC_PENDING` | The output passed its check and the artifacts are collected, but the output is not (yet) checked out in the local checkout. It is not announced for review. | Tries the local checkout again. Launches nothing. |
+| `AWAITING_REVIEW` | The output is in the local checkout and waits for approval. | Stays paused and prints the review notice again. Needs `--approve` (or `--revise`, or `--rerun-stage` to discard). |
+| `COMPLETE` | Approved. Its output commit is handed to the next stage. | Skips the stage. |
 
-A stage with no record has not been started. `PENDING` is a stage reset by `--rerun-stage` that has not been launched again yet. `BLOCKED` means the stage needs the model setup document and none was loaded; the command line always loads it first. `DRY_RUN` appears only inside a dry run and is never saved.
+A stage with no record has not been started. `PENDING` is a stage reset by `--rerun-stage` or `--revise` that has not been launched again yet. `BLOCKED` means nothing was launched: the stage needs the model setup document and none was loaded (the command line always loads it first), or the local checkout could not receive the stage's output (for example, it has uncommitted changes); a plain `--resume` tries again. `DRY_RUN` appears only inside a dry run and is never saved.
+
+`COMPLETE` is reached only through `--approve`. There is no setting that lets a stage complete without a review, and a config with a `manual_review` line is refused.
 
 ### Project Manifest
 
@@ -367,11 +420,11 @@ The manifest is one JSON file per project (`pipeline_manifest.json` unless `--ou
 
 It records:
 
-- `format_version` (now `2`). A manifest with another version, including one written before this field existed, is refused.
+- `format_version` (now `3`). A manifest with another version, including one written before this field existed, is refused.
 - `model_setup_document`: path, format, size, SHA-256 and selection time of the input document. Not its text.
 - `source_ref` and `source_commit`: the configured starting ref and the commit it pointed at when the project was started.
-- For each stage: `status`, `attempt`, `agent_id`, `run_id`, `agent_url`, `run_status`, `input_source`, `input_commit`, `output_branch`, `output_commit`, the output check (`gate`), the collected `artifacts`, the `review` record, `duration_ms`, `error`, `completed_at`.
-- `previous_attempts`: the full record of every attempt replaced by `--rerun-stage`.
+- For each stage: `status`, `attempt`, `agent_id`, `run_id`, `agent_url`, `run_status`, `input_source`, `input_commit`, `output_branch`, `output_commit`, the output check (`gate`, with the problems found and the stage's run record as the stage wrote it), the collected `artifacts`, the local checkout record (`local_sync`: folder, branch, commit, the branch and commit it was on before, whether it was verified), the `review` record, the `revision` record of an attempt started by `--revise` (the feedback text, the attempt it replaces, the commit it starts from), `duration_ms`, `error`, `completed_at`.
+- `previous_attempts`: the full record of every attempt replaced by `--rerun-stage` or `--revise`.
 
 The file is written after every step. Each write goes to a temporary file that then replaces the manifest in one step, so an interrupted write does not leave a half-written manifest.
 
@@ -392,9 +445,9 @@ This means:
 
 ### Input Document for Stage 1
 
-The model setup / equilibrium definition document is the one input that does not have to be committed. The orchestrator asks for its location when a project is started and sends its text to the Stage 1 agent inside the launch request. See [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
+The orchestrator asks for the location of the model setup / equilibrium definition document when a project is started and sends its text to the Stage 1 agent inside the launch request. The same file must also be committed in `docs/`, because the later stages read it from the repository. See [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
 
-Everything else the agents read (`reference/`, `data/`, the outputs of earlier stages) comes from the repository snapshot, so it must be committed and pushed.
+Everything else the agents read (the working document, the outputs of earlier stages) comes from the repository snapshot, so it must be committed and pushed.
 
 ### Branch Creation
 
@@ -408,7 +461,7 @@ By default (`workOnCurrentBranch: false`), Cursor:
 ```
 main ──● source commit            read once, when the project is started
        │
-       └─ Stage 1 agent ─► cursor/... ──● output commit 1   checked, then approved
+       └─ Stage 1 agent ─► cursor/... ──● output commit 1   checked, shown locally, then approved
                                         │
                                         └─ Stage 2 agent ─► cursor/... ──● output commit 2
                                                                          │
@@ -418,7 +471,8 @@ main ──● source commit            read once, when the project is started
 1. When a project is started, the orchestrator reads from GitHub which commit `starting_ref` points at and records it as the project's **source commit**. If `starting_ref` is already a full commit SHA, it checks that the commit exists.
 2. Stage 1 is launched with `startingRef` set to the source commit.
 3. When a stage's run has finished, the orchestrator reads the head commit of the branch the agent pushed and checks it (see [Output Check](#output-check-after-each-stage)). The commit that passes is recorded as the stage's **output commit**.
-4. The next stage is launched with `startingRef` set to that output commit.
+4. After the owner approves it, the next stage is launched with `startingRef` set to that output commit (or to the commit named with `--approve-commit`).
+5. A revision (`--revise`) is launched with `startingRef` set to the reviewed output commit of the same stage.
 
 Every launch request therefore carries a 40-character commit SHA, never a branch name. The reason: a branch can move between two stages. `main` gets new commits; someone pushes to a `cursor/*` branch. With commit SHAs, the next stage reads exactly the content that was checked and approved, and a resume days later uses the same commits as the first run.
 
@@ -438,9 +492,9 @@ Before running the pipeline:
 cd D:\RMB_AI
 git status  # Check for uncommitted changes
 
-# 2. Commit any changes to repository inputs
-git add reference/ data/
-git commit -m "Add input data for pipeline run"
+# 2. Commit any changes to repository inputs (the source document is in docs/)
+git add docs/
+git commit -m "Add inputs for pipeline run"
 
 # 3. Push to GitHub
 git push origin main
@@ -461,16 +515,17 @@ python orchestrator/orchestrator.py --execute
 
 Offline (`--dry-run` stops here):
 
-1. **Configuration**: `config.yaml` is checked. The repository URL must be a github.com URL. Each stage needs a prompt, well-formed model settings and guardrails, a true/false `manual_review`, and `required_files` that are safe relative paths. `api.retries` must be set and well-formed. The first stage must receive the model setup document.
+1. **Configuration**: `config.yaml` is checked. The repository URL must be a github.com URL. Each stage needs a prompt, well-formed model settings and guardrails, and `required_files` (and `completion_record`, if set) that are safe relative paths; a `manual_review` line is refused. `api.retries` and `review` (`local_checkout`, `remote`) must be set and well-formed; `working_document`, if present, must name `path` and `source_document`. The first stage must receive the model setup document.
 2. **Model setup document**: A usable `.qmd`, `.tex` or `.md` document must be given (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)).
 
 Online (`--check-online`, `--execute`, `--resume`):
 
 3. **API key**: `CURSOR_API_KEY` is set.
 4. **Models**: Every stage's model, parameters and values are in `GET /v1/models` (see [Check Before Every Launch](#check-before-every-launch)).
-5. **Source**: The starting ref can be read on GitHub.
+5. **Source**: The starting ref can be read on GitHub, and the committed source document is at that commit. For a project, the document selected at the start must be the same file (same SHA-256): Stage 1 is sent the selected document and the later stages read the committed copy.
+6. **Local checkout** (`--check-online`): the folder named by `review.local_checkout` is the top of a Git checkout whose remote points at the repository, no merge or rebase is under way, and no tracked file has uncommitted changes.
 
-Before each single launch, the orchestrator also requires that the previous stage is `COMPLETE` and that the project has a manifest file to record the launch in.
+Before each single launch, the orchestrator also requires that the previous stage is `COMPLETE` (approved), that the project has a manifest file to record the launch in, and that the local checkout passes the check in item 6. If it does not, the stage is `BLOCKED` and no paid run is started.
 
 ### Output Check After Each Stage
 
@@ -479,7 +534,9 @@ A stage's output is handed on only if all of this holds:
 1. The run ended with status `FINISHED`.
 2. The run reports exactly one pushed branch in this repository (`git.branches[]`). No branch, or more than one, fails the check.
 3. The head commit of that branch, read from GitHub, differs from the stage's input commit. Otherwise the agent pushed nothing.
-4. Every path under the stage's `output_manifest.required_files` exists as a file at that commit.
+4. Every path under the stage's `output_manifest.required_files` exists as a file at that commit. For Stage 3 these include the Python module and its tests, not only a README.
+5. The working document keeps its four rules at that commit (see [Working Document](#working-document)): the stage's section is there and not empty, earlier sections are byte-for-byte as at the stage's input commit, no marker of a later stage is there, and the committed source document is unchanged.
+6. For a stage with `output_manifest.completion_record` (Stage 4): the run record is a JSON object with `"status": "completed"` or `"blocked"`. A completed record must give the command, `exit_code` 0, a boolean `converged`, a numeric `max_abs_residual`, and a parameters file and a results file that exist at that commit. A blocked record must give `blocked_reason`.
 
 If the check passes, that commit is recorded as the stage's output commit.
 
@@ -489,7 +546,8 @@ A failed check can be repeated at no cost: `--resume` reads the branch head agai
 
 Limits:
 
-- The check tests that the files exist. It does not read them and cannot tell whether their content is right. That is what the manual review is for.
+- The check is about form: files, sections and a well-formed run record. It cannot tell whether a derivation, a program or a number is right. A run record is the stage's own report: it is stored and printed in the review notice as *reported by the stage, not verified by the orchestrator*. A record that says the run did not converge passes the check, because it is a finished run that says so; whether the result is usable is for the review. A blocked record passes too, so that the stage's report of what is missing reaches the reviewer.
+- The orchestrator does not run the Stage 3 tests or the Stage 4 computation itself.
 
 ### Artifact Collection
 
@@ -509,11 +567,35 @@ The download URL must be an `https` URL. It is fetched without the Cursor API ke
 
 If listing or downloading fails, the stage gets status `ARTIFACTS_FAILED` and the pipeline stops. `--resume` collects again and launches nothing.
 
-### Manual Review
+### Local Review
 
-A stage with `manual_review: true` pauses the pipeline after its output check and artifact collection. The stage gets status `AWAITING_REVIEW`, the orchestrator prints a link to the output commit on GitHub and exits with code `2`. No later stage is launched.
+The orchestrator runs in the owner's checkout (`D:\RMB_AI`). Each stage's agent pushes its own branch (`cursor/...`), so a `git pull` of `main` would not show a stage's output. After the output check and the artifact collection, the orchestrator therefore checks the stage's branch out in the local checkout named by `review.local_checkout`, at exactly the output commit, with these Git commands:
 
-In the committed `config.yaml`, Stages 1, 2 and 3 pause for review; Stage 4 is the last stage and does not. **These review points were chosen when the feature was built, not specified by Yang Lu.** Change `manual_review` per stage in `config.yaml`.
+1. `git fetch --no-tags <remote> refs/heads/<branch>:refs/remotes/<remote>/<branch>`. The refspec has no `+`, so a remote branch that was rewritten is refused.
+2. It requires the output commit to be on the fetched branch.
+3. If there is no local branch of that name: `git checkout -b <branch> <output commit>`, then `git branch --set-upstream-to=<remote>/<branch>`. If there is one and the output commit is ahead of it: `git checkout <branch>` and `git merge --ff-only <output commit>`.
+4. It reads back that `HEAD` is the output commit, that no tracked file is changed, and that the files to review (the working document and the stage's required files) exist on disk.
+
+Only when step 4 holds does the stage become `AWAITING_REVIEW` and the `READY FOR REVIEW` notice appear. The notice gives the commit, the branch, the files to review in the local checkout and the commands to approve, revise or redo. It is printed in the console only; the orchestrator sends no message through any other service.
+
+The checkout is on the stage's branch afterwards. `main` is not moved and nothing is merged into it, at any point, including after the last approval. `git checkout main` goes back. Because the commit is checked out, not the branch's head, a commit pushed to the branch after the output check is not shown until it is named (see below).
+
+What it never does: `--force`, `reset`, `stash`, a merge other than a fast-forward, or any change while tracked files have uncommitted changes. Untracked files, such as the manifest and `collected_artifacts/`, are left where they are. In each of these cases nothing is changed, the stage stays `LOCAL_SYNC_PENDING` with the reason, it is **not** announced as ready, and `--resume` tries again without launching anything:
+
+| Case | Message tells the owner to |
+|------|----------------------------|
+| Tracked files have uncommitted changes | Commit them (and push them, if they are review edits to hand on) or restore them |
+| A merge, rebase, cherry-pick or revert is under way | Finish or abort it |
+| The local branch of that name has the owner's own commits on top of the output | Push them and name the pushed commit when approving or revising |
+| The local branch of that name has diverged from the output | Rename the local branch |
+| The output commit holds another version of the running orchestrator (`orchestrator.py`, `api_client.py`, `config.yaml`) than the checkout | Bring the checkout to the orchestrator version the project was started from. The running orchestrator is never replaced by a checkout |
+| The folder is not the top of a checkout, its remote points at another repository, the fetch fails, or the commit is not on the branch | Fix that |
+
+The same readiness check runs before every launch, so a paid run does not start while its output could not be shown afterwards.
+
+### Review and Approval
+
+Every stage stops for review after its output is in the local checkout. The stage gets status `AWAITING_REVIEW` and the orchestrator exits with code `2`. No later stage is launched. The last stage stops in the same way: the project is finished, and the exit code is `0`, only after the last stage is approved.
 
 To approve:
 
@@ -521,16 +603,27 @@ To approve:
 python orchestrator/orchestrator.py --resume pipeline_manifest.json --approve equilibrium_derivation
 ```
 
-The approval is recorded in the manifest, the stage becomes `COMPLETE`, and the same command goes on to launch the next stage.
+The approval is recorded in the manifest, the stage becomes `COMPLETE`, and the same command goes on to launch the next stage, which stops for its own review.
 
 Approval names an exact commit:
 
 - Without `--approve-commit`, the commit that passed the output check is approved. This is refused if the stage's branch has moved since the check; the message shows the branch's new head commit.
-- To hand on a commit pushed after the check (for example, a correction made by the reviewer), add `--approve-commit SHA`. The SHA must be the current head of the stage's branch, and the required files are checked again at that commit. It then replaces the stage's output commit; the replaced commit stays in the review record.
+- To hand on a commit pushed after the check (for example, review edits), add `--approve-commit SHA`. The SHA must be the current head of the stage's branch, and the whole output check is made again at that commit, so a commit that changes an earlier, approved section is refused. It then replaces the stage's output commit; the replaced commit stays in the review record.
+- In both cases the local checkout must be at the commit to approve, with no uncommitted changes to tracked files. What is approved is what the checkout shows. Otherwise the approval is refused, with the Git command that shows the commit, or the instructions for the uncommitted changes.
 
-To reject the output and have a new agent redo the stage, use `--rerun-stage` (a new paid run from the same input commit).
+**Revision.** To have the output revised, write the feedback in a UTF-8 text file and run
 
-A plain `--resume` without `--approve` leaves the stage paused.
+```bash
+python orchestrator/orchestrator.py --resume pipeline_manifest.json --revise equilibrium_derivation --feedback stage1_feedback.txt
+```
+
+This launches a new paid agent for the same stage. It starts from the reviewed output commit (not from the stage's original input), gets the stage's whole prompt again and then the feedback, and is told to revise the existing output and change nothing the feedback does not call for. Its output goes through the same output check, artifact collection and local checkout, and comes back as `AWAITING_REVIEW`. The replaced attempt's full record is kept under `previous_attempts`, and the stage's `attempt` number goes up. The feedback text is stored in the manifest, so an interrupted launch is resumed with the same prompt.
+
+The commit to revise must be the current head of the reviewed branch. If the owner pushed edits of their own to that branch, `--revise-commit SHA` names that commit and the revision starts from it. `--revise` is refused while the local checkout has uncommitted changes to tracked files, so that review edits are either pushed and named or deliberately left out, never silently left behind.
+
+**Rejection.** To discard the output and have a new agent redo the stage from its original input, with the original prompt, use `--rerun-stage` (a new paid run).
+
+A plain `--resume` leaves the stage paused, launches nothing and prints the review notice again. The notice then says whether the local checkout is still at the output commit.
 
 ---
 
@@ -577,9 +670,11 @@ Limits:
 | Launch outcome unknown after all tries | `LAUNCHING` | `--resume` (looks the agent up first) |
 | Run still going after `api.polling.max_attempts` polls, or its status cannot be read | `RUNNING` | `--resume` (polls the same run) |
 | Run ended `ERROR`, `CANCELLED` or `EXPIRED` | `RUN_FAILED` | `--resume --rerun-stage STAGE` (new paid agent) |
-| No pushed branch, no new commit, a required file missing, or GitHub unreadable | `GATE_FAILED` | `--resume` checks again; or `--rerun-stage STAGE` |
+| The local checkout cannot receive the output (checked before the launch) | `BLOCKED`; nothing is launched | Fix the cause, then `--resume` |
+| No pushed branch, no new commit, a required file missing, a working document rule broken, a malformed run record, or GitHub unreadable | `GATE_FAILED` | `--resume` checks again; or `--rerun-stage STAGE` |
 | Artifact listing or download failed | `ARTIFACTS_FAILED` | `--resume` (collects again) |
-| Stage waits for review | `AWAITING_REVIEW` | `--resume --approve STAGE`, or `--rerun-stage STAGE` to reject |
+| The output cannot be checked out in the local checkout | `LOCAL_SYNC_PENDING`; not announced for review | Fix the cause, then `--resume` (tries the checkout again) |
+| Stage waits for review | `AWAITING_REVIEW` | `--resume --approve STAGE`, `--revise STAGE --feedback FILE`, or `--rerun-stage STAGE` to discard |
 
 There is no automatic retry of a failed run and no option to skip a failed stage: every later stage needs the earlier stage's output.
 
@@ -588,8 +683,9 @@ There is no automatic retry of a failed run and no option to skip a failed stage
 - `--dry-run` and `--check-online` cannot launch anything.
 - `--execute` refuses to start if the manifest file already exists.
 - `--resume` launches an agent only for a stage that has none: one never started, one whose launch the API refused, or one whose launch outcome is still unknown and whose agent the API says does not exist.
-- A stage that is `RUNNING`, `RUN_FAILED`, `GATE_FAILED`, `ARTIFACTS_FAILED`, `AWAITING_REVIEW` or `COMPLETE` is never launched again by a plain `--resume`.
-- A second agent for a stage is launched only by `--rerun-stage STAGE`. The replaced attempt is kept under `previous_attempts`, and the stage's `attempt` number goes up.
+- A stage that is `RUNNING`, `RUN_FAILED`, `GATE_FAILED`, `ARTIFACTS_FAILED`, `LOCAL_SYNC_PENDING`, `AWAITING_REVIEW` or `COMPLETE` is never launched again by a plain `--resume`.
+- A second agent for a stage is launched only by `--rerun-stage STAGE` or `--revise STAGE --feedback FILE`. The replaced attempt is kept under `previous_attempts`, and the stage's `attempt` number goes up.
+- A stage is launched only after the stage before it was approved. No command advances past a review without `--approve`.
 - `--resume` cannot be combined with `--output`, so the record of launches cannot be split over two files.
 
 ### Resume
@@ -609,7 +705,9 @@ The orchestrator:
 
 ## What Has and Has Not Been Tested
 
-`orchestrator/test_orchestrator.py` holds the tests. They run without the network. The Cursor API, the GitHub API and the download host are replaced by one stand-in (`FakeServices` in the test file) that was written from the public documentation of the two APIs. It is not a recording of the live services.
+`orchestrator/test_orchestrator.py` holds the tests. They run without the network. The Cursor API, the GitHub API and the download host are replaced by one stand-in (`FakeServices` in the test file) that was written from the public documentation of the two APIs. It is not a recording of the live services. Its agents write stand-in outputs that have the required form and no content: no test derives, programs or computes anything of the model.
+
+The local checkout is replaced by a stand-in that runs no Git command, except in `test_local_review_checkout_shows_the_exact_commit_and_never_forces`. That test runs real Git commands on throw-away repositories in a temporary folder, with a local bare repository standing in for GitHub.
 
 Tested against the stand-in:
 
@@ -622,13 +720,20 @@ Tested against the stand-in:
 | A launch with an unknown outcome never creates a second agent; the agent ID is on disk before the request | `test_launch_with_an_unknown_outcome_never_creates_a_second_agent` |
 | A run that outlasts the polls is waited for again, not relaunched | `test_run_that_is_still_going_is_waited_for_again_and_never_relaunched` |
 | A failed stage is relaunched only with `--rerun-stage`; the earlier attempt is kept | `test_failed_run_is_launched_again_only_by_an_explicit_rerun` |
-| Review pauses the pipeline; approval fixes the commit handed on; a moved branch needs `--approve-commit` | `test_manual_review_pauses_the_pipeline_until_the_output_is_approved` |
+| Review pauses the pipeline; approval fixes the commit handed on; a moved branch needs `--approve-commit`, must pass the output check and must be shown in the local checkout | `test_review_pauses_the_pipeline_until_the_output_is_approved` |
+| Every stage stops for review, the last one included; no setting switches a review off | `test_no_stage_can_be_configured_to_skip_its_review`, `test_validate_config_checks_retry_review_path_and_repository_settings` |
+| Each prompt carries its stage's marker lines and rules; a missing or empty section, a changed earlier section, a marker of a later stage or a changed source document fails the output check | `test_working_document_rules_are_in_each_prompt_and_checked_at_the_pushed_commit` |
+| The Stage 4 run record is checked for form, kept as the stage wrote it, and a non-converged or blocked record still reaches the review; Stage 3 must push Python code and tests | `test_stage4_completion_record_is_checked_for_form_and_reported_not_verified` |
+| A stage is announced for review only after the local checkout shows its output; a failed checkout launches nothing on resume; an unusable checkout blocks the launch; approval needs the checkout cleanly at the commit | `test_output_is_announced_for_review_only_once_the_local_checkout_shows_it` |
+| `--revise` launches one new agent from the reviewed output with the feedback, keeps the replaced attempt, and comes back for review; a moved branch needs `--revise-commit`; uncommitted local changes refuse it | `test_revision_starts_from_the_reviewed_output_and_comes_back_for_review` |
+| The local checkout (real Git, throw-away repositories): exact commit, not the branch head; untracked files kept; `main` untouched; refusal on uncommitted changes, local commits on top, a diverged local branch, another orchestrator version, a rewritten remote branch, a wrong remote | `test_local_review_checkout_shows_the_exact_commit_and_never_forces` |
+| The source document in `docs/` is the unchanged original, and a dry run with it sends its whole text and the Section 1 scope to Stage 1 | `test_source_document_in_docs_is_the_unchanged_original_and_reaches_stage1_whole` |
 | An output rejected at review is replaced only with `--rerun-stage` | `test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun` |
 | Artifacts are saved only to safe paths inside the project folder; a non-https download URL is refused | `test_artifacts_are_downloaded_only_to_safe_paths_inside_the_project_folder` |
 | A `.qmd`, `.tex` or `.md` document is accepted and its text reaches Stage 1; another extension, an empty or non-UTF-8 file, or a file that pulls in other files is refused | `test_valid_qmd_tex_and_md_documents_reach_stage1_in_the_launch_request`, `test_unusable_locations_are_rejected_before_any_launch`, `test_document_that_pulls_in_other_files_is_rejected` |
 | `--dry-run` sends no request, needs no API key and saves nothing, with a `.tex`, `.qmd` or `.md` document | `test_cli_dry_run_is_offline_and_saves_nothing` |
-| `--check-online` reads the model listing and the starting ref and launches nothing | `test_cli_check_online_validates_over_the_network_and_launches_nothing` |
-| The committed configuration runs through all four stages with three approvals | `test_cli_execute_asks_records_the_document_and_resume_does_not_ask` |
+| `--check-online` reads the model listing, the starting ref and the committed source document, checks the local checkout and launches nothing | `test_cli_check_online_validates_over_the_network_and_launches_nothing` |
+| The committed configuration runs through all four stages with four approvals; the project is not finished until the last stage is approved | `test_cli_execute_asks_records_the_document_and_resume_does_not_ask` |
 
 **Not tested: anything against the live services.** No request has been sent to the live Cursor API, no agent has been launched, and no pipeline has run end to end. In particular, these documented behaviours are assumed, not observed:
 
@@ -641,7 +746,9 @@ Tested against the stand-in:
 Also not tested:
 
 - The orchestrator's own HTTP transport (the `requests` library). The tests inject stand-in transports, and `requests` was not installed where this was built. The three GitHub endpoints were called by hand on this repository with the GitHub command line tool (read-only), and answered in the shape the orchestrator expects.
-- Running on Windows. The tests ran on Linux. The path checks are written for Windows file names but were not run there.
+- Running on Windows. The tests ran on Linux. The path checks are written for Windows file names but were not run there. The local checkout code was run with Git 2.43 on Linux only; Git for Windows, Windows paths, and a checkout with `core.autocrlf` set were not tried.
+- The GitHub contents endpoint as used to read file content (the base64 `content` field). It was exercised against the stand-in only. GitHub sends no content this way for a file over 1 MB; the orchestrator then stops with an error.
+- Whether cloud agents follow the working document rules in their prompts. The output check catches a broken rule; it cannot make an agent's mathematics, code or numbers right.
 
 The first real use should therefore be `--check-online`, followed by a watched `--execute` that stops at the Stage 1 review.
 
@@ -697,9 +804,14 @@ python orchestrator/orchestrator.py --resume pipeline_manifest.json
 # Approve a stage that is paused for review, and go on to the next stage
 python orchestrator/orchestrator.py --resume pipeline_manifest.json --approve equilibrium_derivation
 
-# Launch a NEW paid agent for a stage that failed or whose output is rejected
+# Launch a NEW paid agent that revises the reviewed output as your feedback file asks
+python orchestrator/orchestrator.py --resume pipeline_manifest.json --revise equilibrium_derivation --feedback D:\notes\stage1_feedback.txt
+
+# Launch a NEW paid agent, from the stage's original input, for a stage that failed or whose output is rejected
 python orchestrator/orchestrator.py --resume pipeline_manifest.json --rerun-stage equilibrium_derivation
 ```
+
+Answer the document question with `D:\RMB_AI\docs\intervention-incomplete-information-source.md`. Start from a checkout of the project's starting ref with no uncommitted changes to tracked files; after each stage the checkout is on that stage's branch (see [Local Review](#local-review)).
 
 The manifest file and the `collected_artifacts` folder are created in the folder the command is run from, unless `--output` names another manifest file.
 
@@ -753,11 +865,17 @@ This would require:
 
 6. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. The orchestrator has no budget control; it only avoids launching an agent twice for the same stage.
 
-7. **Review Points**: The committed configuration pauses for review after Stages 1, 2 and 3. That choice was made when the feature was built. Yang Lu to confirm or change it in `config.yaml`.
+7. **Review Points**: Settled by Yang Lu: every stage stops for review, the last one included, and this cannot be switched off in `config.yaml`.
 
 8. **Live Behaviour of the API**: The launch safety, the commit-based handoff and the artifact download rest on documented API behaviour that has not been observed. See [What Has and Has Not Been Tested](#what-has-and-has-not-been-tested).
 
 9. **Committing the Manifest**: The manifest is a local file and the orchestrator does not commit it. Whether a finished project's manifest should be kept in the repository is open.
+
+10. **Stage Output Produced Outside the Pipeline**: The orchestrator has no command that takes an existing commit as the approved output of a stage. A stage section written without the orchestrator (for example in a coding session) is therefore not part of any project manifest, and a new `--execute` starts at Stage 1. Whether to add such a command is open; none was added, so that no stage can be marked approved without having gone through the output check and the review.
+
+11. **Where the Approved Final Output Goes**: After the last approval the output is a commit on the last stage's `cursor/...` branch. The orchestrator merges nothing into `main` and opens no pull request (`execution.auto_create_pr` is `false`). Bringing the result into `main` is a separate, manual step.
+
+12. **Local Checkout on Windows**: The Git handling was run on Linux only. See [What Has and Has Not Been Tested](#what-has-and-has-not-been-tested).
 
 ---
 
@@ -788,14 +906,15 @@ This would require:
 | 2026-11-24 | Cloud Agent | Set each stage's model and reasoning parameter in `orchestrator/config.yaml` and recorded the mapping, with what is and is not verified, under Model Selection. |
 | 2026-11-24 | Cloud Agent | Implemented the output check, launch safety, bounded retries, artifact download, manual review and commit-based handoff. Rewrote Architecture, Source Snapshot, Validation and Review Gates, and Failure Handling to describe what is implemented. `--dry-run` is now offline; `--check-online` is new. Added What Has and Has Not Been Tested. |
 | 2026-11-24 | Cloud Agent | The model setup document may also be a Markdown (`.md`) file. A `.md` file is checked for the Quarto include shortcode and the MyST include directives. The checks on `.qmd` and `.tex` files are unchanged. |
+| 2026-11-24 | Cloud Agent | Four-stage redesign requested by Yang Lu: equilibrium conditions, pseudocode, Python code, then parameters, computation and results (`parameterization_and_results` replaces `academic_writing`). Models unchanged. One cumulative working document in `docs/` with a section per stage, checked at each pushed commit; the original source document committed unchanged in `docs/`. Every stage now stops for review, the last one included, after its output is checked out in the local checkout; `manual_review` is removed. New `--revise STAGE --feedback FILE`, status `LOCAL_SYNC_PENDING`, Stage 4 run record, manifest format 3. |
 
 ---
 
 ## Next Steps
 
 1. **Yang Lu: have the model setup / equilibrium definition document ready** as one self-contained `.qmd`, `.tex` or `.md` file; the orchestrator asks for its location
-2. **Commit and push repository inputs** the stages need (`reference/`, `data/`)
+2. **Have the document committed** at `docs/intervention-incomplete-information-source.md` in the starting ref (`main`), together with this version of the orchestrator
 3. **Run `--dry-run`** to check the configuration and the document offline
-4. **Run `--check-online` with an API key** to check the configured models against the public `GET /v1/models` listing, and repository access
-5. **Confirm the review points** in `config.yaml` (`manual_review` per stage)
+4. **Run `--check-online` with an API key** to check the configured models against the public `GET /v1/models` listing, repository access, the committed source document and the local checkout
+5. **Try the local checkout on Windows**: the first stage output shown in `D:\RMB_AI` is also the first run of the Git handling on Windows
 6. **Run `--execute` and watch it** up to the Stage 1 review. This is the first contact with the live API; compare what happens with [What Has and Has Not Been Tested](#what-has-and-has-not-been-tested)

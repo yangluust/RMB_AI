@@ -7,15 +7,22 @@ GitHub API and the artifact download host are replaced by stand-ins written
 from the public API documentation. No test launches an agent or reads a
 real repository, so these tests do not show that the live services behave
 as documented.
+
+The local review checkout is replaced by a stand-in that runs no Git
+command, except in the tests of LocalReviewCheckout itself: those run real
+Git commands on throw-away repositories in a temporary folder, with a
+local bare repository standing in for GitHub.
 Run with: python -m pytest test_orchestrator.py -v
 Or simply: python test_orchestrator.py
 """
 
+import base64
 import copy
 import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -43,6 +50,7 @@ from orchestrator import (
     MODEL_SETUP_FORMATS,
     MODEL_SETUP_HEADING,
     MODEL_SETUP_QUESTION,
+    REVISION_HEADING,
     STAGE_ARTIFACTS_FAILED,
     STAGE_AWAITING_REVIEW,
     STAGE_BLOCKED,
@@ -53,6 +61,10 @@ from orchestrator import (
     STAGE_LAUNCHING,
     STAGE_RUN_FAILED,
     STAGE_RUNNING,
+    STAGE_SYNC_PENDING,
+    WORKING_DOCUMENT_HEADING,
+    LocalReviewCheckout,
+    LocalSyncError,
     ModelSetupDocumentError,
     Orchestrator,
     PipelineManifest,
@@ -60,12 +72,16 @@ from orchestrator import (
     StageConfig,
     StageResult,
     UnsafeArtifactPathError,
+    WorkingDocumentError,
     build_stage_prompt,
+    extract_stage_section,
+    github_repository_of,
     load_config,
     load_manifest,
     load_model_setup_document,
     main,
     safe_artifact_destination,
+    stage_section_markers,
     unsafe_relative_path_reason,
 )
 
@@ -76,8 +92,17 @@ DESIGN_DOC_GUARDRAILS_HEADING = "#### Reproducibility Guardrails (Stage 3)"
 STAGE1_NAME = "equilibrium_derivation"
 STAGE2_NAME = "equilibrium_to_pseudocode"
 STAGE3_NAME = "pseudocode_to_implementation"
-STAGE4_NAME = "academic_writing"
+STAGE4_NAME = "parameterization_and_results"
+ALL_STAGE_NAMES = (STAGE1_NAME, STAGE2_NAME, STAGE3_NAME, STAGE4_NAME)
 EXPECTED_GUARDRAIL_COUNT = 12
+
+DOCS_DIR = ORCHESTRATOR_DIR.parent / "docs"
+WORKING_DOCUMENT_PATH = "docs/equilibrium-working-document.md"
+SOURCE_DOCUMENT_PATH = "docs/intervention-incomplete-information-source.md"
+# The original model setup document as the project owner supplied it.
+SOURCE_DOCUMENT_SHA256 = "560b2ee1a7189ed8183dcc5ec8d6db9292f85ac645351bfe65a0a3292cad5960"
+SOURCE_DOCUMENT_SIZE_BYTES = 79082
+STAGE4_RECORD_PATH = "outputs/stage4_results/run_record.json"
 
 # Stand-in document text for tests. It is a sentinel, not a model setup or
 # an equilibrium definition.
@@ -267,10 +292,12 @@ MOCK_CONFIG = {
     "execution": {
         "auto_create_pr": False,
     },
+    "review": {"local_checkout": "..", "remote": "origin"},
 }
 
-# The smallest `api` section a config needs to pass validation.
+# The smallest `api` and `review` sections a config needs to pass validation.
 MINIMAL_API_CONFIG = {"retries": {"max_attempts": 1, "backoff_seconds": [0]}}
+MINIMAL_REVIEW_CONFIG = {"local_checkout": "..", "remote": "origin"}
 
 
 def test_run_status_helpers():
@@ -698,26 +725,75 @@ def new_manifest_path() -> Path:
     return Path(tempfile.mkdtemp(dir=TEST_PROJECTS_DIR.name)) / "manifest.json"
 
 
+class FakeLocalReview:
+    """Stand-in for the local Git checkout that shows outputs for review.
+
+    It runs no Git command. It keeps which branch and commit are "checked
+    out" and what was asked of it. A test changes its behaviour through
+    `problem` (the checkout cannot be used) and `changed_files`
+    (uncommitted changes to tracked files).
+    """
+    
+    def __init__(self):
+        self.path = Path("stand-in-checkout")
+        self.remote = "origin"
+        self.branch: Optional[str] = "main"
+        self.commit = "0" * 40
+        self.changed_files: list[str] = []
+        self.problem: Optional[str] = None
+        self.shown: list[tuple[str, str]] = []
+        self.ready_checks = 0
+    
+    def check_ready(self) -> None:
+        self.ready_checks += 1
+        if self.problem:
+            raise LocalSyncError(self.problem)
+        if self.changed_files:
+            raise LocalSyncError(f"uncommitted changes: {', '.join(self.changed_files)}")
+    
+    def state(self) -> dict:
+        return {
+            "commit": self.commit,
+            "branch": self.branch,
+            "changed_files": list(self.changed_files),
+        }
+    
+    def show_commit(self, branch: str, commit: str, review_files: list[str]) -> dict:
+        self.check_ready()
+        previous_branch, previous_commit = self.branch, self.commit
+        self.branch, self.commit = branch, commit
+        self.shown.append((branch, commit))
+        return {
+            "verified": True,
+            "synced_at": "2026-11-24T00:00:00+00:00",
+            "checkout": str(self.path),
+            "remote": self.remote,
+            "branch": branch,
+            "commit": commit,
+            "previous_branch": previous_branch,
+            "previous_commit": previous_commit,
+            "review_files": [str(self.path / path) for path in review_files],
+        }
+
+
 def load_real_orchestrator(
     mock_http: Any,
     dry_run: bool,
     ask: Callable[[str], str] = must_not_ask,
-    manual_review: bool = False,
     manifest_path: Optional[Path] = None,
 ) -> Orchestrator:
     """Build an orchestrator from the committed config.yaml with mocked HTTP.
 
     Args:
         mock_http: A FakeServices (for tests that launch) or a MockHttpClient.
-        manual_review: False switches off the review pauses of the committed
-            config, for tests that are not about review.
         manifest_path: The project's manifest file. A run that may launch
             gets a fresh one if none is given.
+
+    The local checkout is the stand-in of the FakeServices (one checkout
+    for all the orchestrators that use the same services, as on one
+    machine), or a fresh stand-in.
     """
     config = load_config(config_path=REAL_CONFIG_PATH)
-    if not manual_review:
-        for stage in config["stages"]:
-            stage["manual_review"] = False
     is_fake_services = isinstance(mock_http, FakeServices)
     client = CursorAPIClient(
         api_key="test-key",
@@ -736,6 +812,7 @@ def load_real_orchestrator(
         ask=ask,
         sleep=mock_http.sleep if is_fake_services else must_not_sleep,
         manifest_path=manifest_path,
+        local_review=mock_http.local_review if is_fake_services else FakeLocalReview(),
     )
 
 
@@ -754,7 +831,31 @@ def run_cli(
         github=GitHubRepoReader(repo_url=backend.repo_url, http_client=backend),
         ask=ask,
         sleep=backend.sleep,
+        local_review=backend.local_review,
     )
+
+
+def approve_as_reviewer(orchestrator: Orchestrator, stage_name: str) -> None:
+    """Approve a stage's reviewed output, as the reviewer's --approve does."""
+    orchestrator.approve_stage(stage_name=stage_name)
+
+
+def run_approving_every_stage(orchestrator: Orchestrator) -> PipelineManifest:
+    """Run the pipeline to the end, approving each stage when it pauses for review.
+
+    For tests that are not about the review itself. Every stage still stops
+    for review; this helper gives the approval the reviewer would give.
+    """
+    for _ in range(len(orchestrator.stages) + 1):
+        manifest = orchestrator.run_pipeline()
+        awaiting = [
+            name for name, result in manifest.stages.items()
+            if result.status == STAGE_AWAITING_REVIEW
+        ]
+        if not awaiting:
+            return manifest
+        approve_as_reviewer(orchestrator=orchestrator, stage_name=awaiting[0])
+    raise AssertionError("The pipeline did not come to an end")
 
 
 def get_stage(orchestrator: Orchestrator, name: str) -> StageConfig:
@@ -788,13 +889,13 @@ def test_stage3_launch_request_carries_all_guardrails():
     stage3 = get_stage(orchestrator=orchestrator, name=STAGE3_NAME)
     
     result = orchestrator._run_stage(stage=stage3)
-    assert result.status == STAGE_COMPLETE
+    assert result.status == STAGE_AWAITING_REVIEW
     
     launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
     assert len(launch_requests) == 1
     prompt_text = launch_requests[0][3]["prompt"]["text"]
     
-    assert "TASK: Implement the pseudocode in Python" in prompt_text
+    assert "TASK: Translate the pseudocode into Python code" in prompt_text
     assert GUARDRAILS_HEADING in prompt_text
     doc_guardrails = read_design_doc_guardrails()
     assert len(doc_guardrails) == EXPECTED_GUARDRAIL_COUNT
@@ -852,15 +953,19 @@ class FakeServices:
 
     It keeps the state a launch would create. An agent launched from a commit
     pushes one new commit to a new branch; that commit holds the files of the
-    starting commit plus the required files of the agent's stage. Like the
-    documented API, a second launch request with an agent ID already in use
-    is answered with 409 agent_id_conflict and creates nothing.
+    starting commit plus the stand-in output of the agent's stage: its
+    required files, its section of the working document and, for a stage
+    that has one, its completion record. The stand-in output has the
+    required form and no content: it is not a derivation, code or a result.
+    Like the documented API, a second launch request with an agent ID
+    already in use is answered with 409 agent_id_conflict and creates nothing.
 
     Tests change this behaviour through the attributes set in __init__ and
     through script(). Nothing here uses the network.
     """
     
     def __init__(self, config: dict, models_listing: dict):
+        self.config = config
         self.repo_url = config["pipeline"]["repository"]["url"]
         self.owner, self.repo = parse_github_repo_url(self.repo_url)
         self.models_listing = models_listing
@@ -868,20 +973,32 @@ class FakeServices:
             f"Pipeline: {stage.get('display_name', stage['name'])}": stage
             for stage in config["stages"]
         }
+        # The one local checkout of the machine these services are used from.
+        self.local_review = FakeLocalReview()
         
         # What the orchestrator did.
         self.calls: list[tuple[str, str, dict, dict]] = []
         self.downloads: list[str] = []
         self.sleeps: list[float] = []
         
-        # State of the stand-in repository and API.
+        # State of the stand-in repository and API. The starting branch
+        # holds the committed copy of the stand-in model setup document.
         self.branches: dict[str, str] = {}
-        self.files: dict[str, set[str]] = {}
+        self.files: dict[str, dict[str, bytes]] = {}
         self.agents: dict[str, dict] = {}
-        self.add_commit(files=[], branch="main")
+        self.add_commit(
+            files={SOURCE_DOCUMENT_PATH: SENTINEL_DOCUMENT_TEXT.encode("utf-8")}, branch="main",
+        )
         
         # Behaviour a test can change.
         self.withheld_files: set[str] = set()   # required files agents do not write
+        # How agents break the working document's rules: None, or one of
+        # "no_section", "empty_section", "later_marker", "earlier_changed",
+        # "source_changed".
+        self.working_document_fault: Optional[str] = None
+        # What the Stage 4 agent writes as its run record (None: a record of
+        # a completed run). A str is written as it is.
+        self.completion_record: Any = None
         self.agents_report_branch = True         # False: runs report no pushed branch
         self.agents_push_commit = True           # False: the branch stays at the input commit
         self.run_statuses: dict[str, list[str]] = {}   # stage -> statuses reported in turn
@@ -892,17 +1009,84 @@ class FakeServices:
     
     def add_commit(
         self,
-        files: list[str],
+        files: Any,
         parent: Optional[str] = None,
         branch: Optional[str] = None,
         removed: tuple[str, ...] = (),
     ) -> str:
-        """Add a commit holding the parent's files plus `files`, minus `removed`."""
+        """Add a commit holding the parent's files plus `files`, minus `removed`.
+
+        `files` is a list of paths (each gets stand-in content) or a dict
+        of path -> bytes.
+        """
+        if not isinstance(files, dict):
+            files = {path: f"Stand-in content of {path}.\n".encode("utf-8") for path in files}
         commit = hashlib.sha1(f"fake commit {len(self.files)}".encode()).hexdigest()
-        self.files[commit] = (self.files.get(parent, set()) | set(files)) - set(removed)
+        self.files[commit] = {
+            path: content
+            for path, content in {**self.files.get(parent, {}), **files}.items()
+            if path not in removed
+        }
         if branch is not None:
             self.branches[branch] = commit
         return commit
+    
+    def stage_output_files(self, stage: dict, start_commit: str) -> dict[str, bytes]:
+        """Return the stand-in output of a stage's agent that starts from a commit."""
+        start_files = self.files[start_commit]
+        output_manifest = stage.get("output_manifest", {})
+        files = {
+            path: f"Stand-in content of {path}.\n".encode("utf-8")
+            for path in output_manifest.get("required_files", [])
+        }
+        
+        number = self.config["stages"].index(stage) + 1
+        begin, end = stage_section_markers(number=number, name=stage["name"])
+        text = start_files.get(
+            WORKING_DOCUMENT_PATH, b"# Stand-in working document\n",
+        ).decode("utf-8")
+        attempt = 1 + sum(agent["stage"] == stage["name"] for agent in self.agents.values())
+        section = f"{begin}\nStand-in section of stage {number}, attempt {attempt}.\n{end}\n"
+        fault = self.working_document_fault
+        if fault == "no_section":
+            section = ""
+        elif fault == "empty_section":
+            section = f"{begin}\n\n{end}\n"
+        if begin in text:
+            # A revision: the section is already there and is replaced.
+            text = text[:text.index(begin)] + section + text[text.index(end) + len(end) + 1:]
+        else:
+            text += f"\n{section}"
+        if fault == "later_marker":
+            later = self.config["stages"][number]
+            text += "\n" + stage_section_markers(number=number + 1, name=later["name"])[0] + "\n"
+        elif fault == "earlier_changed":
+            text = text.replace("Stand-in section of stage 1", "Changed section of stage 1")
+        elif fault == "source_changed":
+            files[SOURCE_DOCUMENT_PATH] = start_files[SOURCE_DOCUMENT_PATH] + b"An added line.\n"
+        files[WORKING_DOCUMENT_PATH] = text.encode("utf-8")
+        
+        record_path = output_manifest.get("completion_record")
+        if record_path:
+            parameters_path = "outputs/stage4_results/parameters.json"
+            results_path = "outputs/stage4_results/results.json"
+            files[parameters_path] = b"{}\n"
+            files[results_path] = b"{}\n"
+            record = self.completion_record
+            if record is None:
+                record = {
+                    "status": "completed",
+                    "command": "stand-in command (nothing was run)",
+                    "exit_code": 0,
+                    "parameters_file": parameters_path,
+                    "results_file": results_path,
+                    "converged": True,
+                    "max_abs_residual": 0.0,
+                }
+            files[record_path] = (
+                record if isinstance(record, str) else json.dumps(record)
+            ).encode("utf-8")
+        return {path: content for path, content in files.items() if path not in self.withheld_files}
     
     def script(self, method: str, url_part: Any, *outcomes: Any) -> None:
         """Give the next matching requests these outcomes, in order.
@@ -985,9 +1169,15 @@ class FakeServices:
             return (200, {"sha": rest[2]}) if rest[2] in self.files else not_found
         if rest[:1] == ["contents"]:
             path = "/".join(rest[1:])
-            files = self.files.get(query["ref"][0], set())
+            files = self.files.get(query["ref"][0], {})
             if path in files:
-                return 200, {"type": "file", "path": path}
+                return 200, {
+                    "type": "file",
+                    "path": path,
+                    "size": len(files[path]),
+                    "encoding": "base64",
+                    "content": base64.encodebytes(files[path]).decode("ascii"),
+                }
             if any(file.startswith(path + "/") for file in files):
                 return 200, [{"type": "file", "path": file} for file in sorted(files)]
             return not_found
@@ -1046,12 +1236,11 @@ class FakeServices:
         number = len(self.agents) + 1
         branch = f"cursor/{stage['name']}-{number:04x}"
         if self.agents_push_commit:
-            written = [
-                path
-                for path in stage.get("output_manifest", {}).get("required_files", [])
-                if path not in self.withheld_files
-            ]
-            self.add_commit(files=written, parent=start_commit, branch=branch)
+            self.add_commit(
+                files=self.stage_output_files(stage=stage, start_commit=start_commit),
+                parent=start_commit,
+                branch=branch,
+            )
         else:
             self.branches[branch] = start_commit
         self.agents[agent_id] = {
@@ -1116,7 +1305,12 @@ def open_project_by_hand(
     )
     commit = backend.branches["main"]
     for name in completed:
-        commit = backend.add_commit(files=[], parent=commit, branch=f"cursor/{name}-by-hand")
+        stage = next(stage for stage in backend.config["stages"] if stage["name"] == name)
+        commit = backend.add_commit(
+            files=backend.stage_output_files(stage=stage, start_commit=commit),
+            parent=commit,
+            branch=f"cursor/{name}-by-hand",
+        )
         manifest.stages[name] = StageResult(
             name=name, status=STAGE_COMPLETE,
             output_branch=f"cursor/{name}-by-hand", output_commit=commit,
@@ -1127,7 +1321,6 @@ def open_project_by_hand(
 def start_project(
     backend: FakeServices,
     directory: Path,
-    manual_review: bool = False,
 ) -> Orchestrator:
     """Start a project on the committed config, with its files in `directory`.
 
@@ -1139,7 +1332,6 @@ def start_project(
         mock_http=backend,
         dry_run=False,
         ask=answer_with(str(document_path)),
-        manual_review=manual_review,
         manifest_path=directory / "manifest.json",
     )
     orchestrator.start_new_project()
@@ -1149,14 +1341,12 @@ def start_project(
 def resume_from_file(
     backend: FakeServices,
     manifest_path: Path,
-    manual_review: bool = False,
     rerun_stage: Optional[str] = None,
 ) -> Orchestrator:
     """Resume a project from its saved manifest file, as a new process would."""
     orchestrator = load_real_orchestrator(
         mock_http=backend,
         dry_run=False,
-        manual_review=manual_review,
         manifest_path=manifest_path,
     )
     orchestrator.resume_project(
@@ -1359,7 +1549,7 @@ def test_valid_qmd_tex_and_md_documents_reach_stage1_in_the_launch_request():
             
             result = orchestrator._run_stage(stage=stage1)
             
-            assert result.status == STAGE_COMPLETE, file_name
+            assert result.status == STAGE_AWAITING_REVIEW, file_name
             launch_requests = get_launch_requests(mock_http=mock_http)
             assert len(launch_requests) == 1
             prompt_text = launch_requests[0]["prompt"]["text"]
@@ -1505,7 +1695,7 @@ def test_resume_uses_the_recorded_document_without_asking():
                 stage=get_stage(orchestrator=orchestrator, name=STAGE1_NAME),
             )
             
-            assert result.status == STAGE_COMPLETE, file_name
+            assert result.status == STAGE_AWAITING_REVIEW, file_name
             prompt_text = get_launch_requests(mock_http=mock_http)[0]["prompt"]["text"]
             assert SENTINEL_DOCUMENT_TEXT.rstrip() in prompt_text
             assert orchestrator.manifest.model_setup_document == manifest.model_setup_document
@@ -1557,7 +1747,12 @@ def test_resume_after_stage1_finished_does_not_need_the_document():
         document_path.unlink()
     
     mock_http = make_launch_mock()
-    stage1_commit = mock_http.add_commit(files=[], parent=mock_http.branches["main"])
+    stage1_commit = mock_http.add_commit(
+        files=mock_http.stage_output_files(
+            stage=mock_http.config["stages"][0], start_commit=mock_http.branches["main"],
+        ),
+        parent=mock_http.branches["main"],
+    )
     manifest.stages[STAGE1_NAME] = StageResult(
         name=STAGE1_NAME, status=STAGE_COMPLETE,
         output_branch="cursor/stage1-output", output_commit=stage1_commit,
@@ -1565,7 +1760,7 @@ def test_resume_after_stage1_finished_does_not_need_the_document():
     orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
     orchestrator.resume_project(manifest=manifest)
     
-    result = orchestrator.run_pipeline()
+    result = run_approving_every_stage(orchestrator=orchestrator)
     
     launch_requests = get_launch_requests(mock_http=mock_http)
     assert len(launch_requests) == 3
@@ -1579,7 +1774,9 @@ def test_cli_execute_asks_records_the_document_and_resume_does_not_ask():
     """--execute asks before anything is sent; --resume continues without asking.
 
     Runs the committed config through the command line to the end: each of
-    the first three stages pauses for review and is approved in turn.
+    the four stages pauses for review and is approved in turn. The last
+    stage is not complete, and the project is not finished, until it too
+    is approved.
     """
     with tempfile.TemporaryDirectory() as tmp:
         document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
@@ -1620,13 +1817,24 @@ def test_cli_execute_asks_records_the_document_and_resume_does_not_ask():
         assert exit_code == 2, "A resume without an approval stays paused"
         assert launch_count(backend=backend) == 1
         
-        for approved, expected_exit_code in (
-            (STAGE1_NAME, 2), (STAGE2_NAME, 2), (STAGE3_NAME, 0),
-        ):
+        for approved in (STAGE1_NAME, STAGE2_NAME, STAGE3_NAME):
             exit_code = run_cli(
                 backend=backend, arguments=[*resume_arguments, "--approve", approved],
             )
-            assert exit_code == expected_exit_code, approved
+            assert exit_code == 2, f"Approving {approved} launches the next stage, which pauses"
+        
+        paused = load_manifest(manifest_path=manifest_path)
+        assert [paused.stages[name].status for name in ALL_STAGE_NAMES] == (
+            [STAGE_COMPLETE] * 3 + [STAGE_AWAITING_REVIEW]
+        )
+        assert paused.completed_at is None, "The last stage does not complete by itself"
+        assert run_cli(backend=backend, arguments=resume_arguments) == 2
+        assert load_manifest(manifest_path=manifest_path).completed_at is None
+        
+        exit_code = run_cli(
+            backend=backend, arguments=[*resume_arguments, "--approve", STAGE4_NAME],
+        )
+        assert exit_code == 0, "Only the approval of the last stage finishes the project"
         
         launch_requests = get_launch_requests(mock_http=backend)
         assert len(launch_requests) == 4
@@ -1696,7 +1904,10 @@ def test_cli_check_online_validates_over_the_network_and_launches_nothing():
     ] == [
         ("GET", "api.cursor.com", "/v1/models"),
         ("GET", "api.github.com", f"/repos/{backend.owner}/{backend.repo}/git/ref/heads/main"),
+        ("GET", "api.github.com",
+         f"/repos/{backend.owner}/{backend.repo}/contents/{SOURCE_DOCUMENT_PATH}"),
     ]
+    assert backend.local_review.ready_checks == 1 and backend.local_review.shown == []
     
     unlisted = copy.deepcopy(MOCK_PIPELINE_MODELS_RESPONSE)
     unlisted["items"] = unlisted["items"][:1]
@@ -1705,6 +1916,16 @@ def test_cli_check_online_validates_over_the_network_and_launches_nothing():
     backend = make_launch_mock()
     del backend.branches["main"]
     assert check(backend=backend) == 1, "A starting ref that cannot be read fails the check"
+    
+    backend = make_launch_mock()
+    backend.add_commit(
+        files=[], parent=backend.branches["main"], branch="main", removed=(SOURCE_DOCUMENT_PATH,),
+    )
+    assert check(backend=backend) == 1, "The source document must be at the starting ref"
+    
+    backend = make_launch_mock()
+    backend.local_review.changed_files = ["docs/notes.md"]
+    assert check(backend=backend) == 1, "A local checkout with uncommitted changes fails the check"
     
     old_key = os.environ.pop("CURSOR_API_KEY", None)
     try:
@@ -1715,7 +1936,7 @@ def test_cli_check_online_validates_over_the_network_and_launches_nothing():
         if old_key:
             os.environ["CURSOR_API_KEY"] = old_key
     
-    assert [launch_count(backend=used) for used in used_backends] == [0, 0, 0, 0]
+    assert [launch_count(backend=used) for used in used_backends] == [0] * 6
     print("✓ test_cli_check_online_validates_over_the_network_and_launches_nothing passed")
 
 
@@ -1725,6 +1946,7 @@ def test_validate_config_requires_the_first_stage_to_receive_the_document():
         config = {
             "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
             "api": MINIMAL_API_CONFIG,
+            "review": MINIMAL_REVIEW_CONFIG,
             "stages": [{"name": "s1", "prompt": "test", **first_stage_extra}],
         }
         return Orchestrator(config=config, dry_run=True).validate_config()
@@ -1765,12 +1987,11 @@ def test_launch_requests_carry_each_stage_model_in_the_documented_rest_shape():
             mock_http=mock_http, dry_run=False, ask=answer_with(str(document_path)),
         )
         orchestrator.start_new_project()
-        orchestrator.run_pipeline()
+        run_approving_every_stage(orchestrator=orchestrator)
     
     launch_requests = get_launch_requests(mock_http=mock_http)
     assert [body["model"] for body in launch_requests] == [
-        EXPECTED_STAGE_MODELS[name]
-        for name in (STAGE1_NAME, STAGE2_NAME, STAGE3_NAME, STAGE4_NAME)
+        EXPECTED_STAGE_MODELS[name] for name in ALL_STAGE_NAMES
     ]
     assert json.dumps(launch_requests[0]["model"]) == (
         '{"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}'
@@ -1864,6 +2085,7 @@ def test_validate_config_rejects_model_settings_the_api_field_cannot_carry():
         config = {
             "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
             "api": MINIMAL_API_CONFIG,
+            "review": MINIMAL_REVIEW_CONFIG,
             "stages": [{
                 "name": "s1",
                 "prompt": "test",
@@ -1928,10 +2150,12 @@ def test_each_stage_starts_from_an_exact_commit_and_hands_on_a_verified_commit()
     with tempfile.TemporaryDirectory() as tmp:
         backend = make_launch_mock()
         source_commit = backend.branches["main"]
-        _, stage1 = run_stage1(backend=backend, directory=Path(tmp))
-        assert stage1.status == STAGE_COMPLETE
+        started, stage1 = run_stage1(backend=backend, directory=Path(tmp))
+        assert stage1.status == STAGE_AWAITING_REVIEW
         stage1_commit = stage1.output_commit
         assert stage1_commit == backend.branches[stage1.output_branch]
+        approve_as_reviewer(orchestrator=started, stage_name=STAGE1_NAME)
+        assert stage1.status == STAGE_COMPLETE
         
         # After the handoff is recorded, both the source branch and the
         # Stage 1 branch move on. The recorded commits must still be used.
@@ -1942,7 +2166,7 @@ def test_each_stage_starts_from_an_exact_commit_and_hands_on_a_verified_commit()
         
         manifest_path = Path(tmp) / "manifest.json"
         resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
-        manifest = resumed.run_pipeline()
+        manifest = run_approving_every_stage(orchestrator=resumed)
         assert load_manifest(manifest_path=manifest_path) == manifest, "Every step is on disk"
     
     bodies = get_launch_requests(mock_http=backend)
@@ -1968,7 +2192,7 @@ def test_each_stage_starts_from_an_exact_commit_and_hands_on_a_verified_commit()
 
 def test_missing_output_file_stops_the_pipeline_until_the_file_is_there():
     """A required file missing at the pushed commit stops the chain; re-checking costs no launch."""
-    missing = "outputs/stage1_derivation/summary.md"
+    missing = WORKING_DOCUMENT_PATH
     with tempfile.TemporaryDirectory() as tmp:
         manifest_path = Path(tmp) / "manifest.json"
         backend = make_launch_mock()
@@ -1991,10 +2215,17 @@ def test_missing_output_file_stops_the_pipeline_until_the_file_is_there():
         
         # The missing file is pushed to the stage's branch.
         branch = stage1.output_branch
+        backend.withheld_files = set()
         fixed_commit = backend.add_commit(
-            files=[missing], parent=backend.branches[branch], branch=branch,
+            files=backend.stage_output_files(
+                stage=backend.config["stages"][0], start_commit=backend.branches[branch],
+            ),
+            parent=backend.branches[branch],
+            branch=branch,
         )
-        manifest = resume_from_file(backend=backend, manifest_path=manifest_path).run_pipeline()
+        manifest = run_approving_every_stage(
+            orchestrator=resume_from_file(backend=backend, manifest_path=manifest_path),
+        )
         stage1 = manifest.stages[STAGE1_NAME]
         assert stage1.status == STAGE_COMPLETE
         assert stage1.output_commit == fixed_commit
@@ -2037,7 +2268,7 @@ def test_output_check_fails_without_a_branch_a_new_commit_or_a_readable_reposito
         again = orchestrator._run_stage(
             stage=get_stage(orchestrator=orchestrator, name=STAGE1_NAME),
         )
-        assert again.status == STAGE_COMPLETE
+        assert again.status == STAGE_AWAITING_REVIEW
         assert launch_count(backend=backend) == 1
     print("✓ test_output_check_fails_without_a_branch_a_new_commit_or_a_readable_repository passed")
 
@@ -2138,7 +2369,9 @@ def test_read_requests_are_retried_a_bounded_number_of_times_with_backoff():
     backend.script("GET", "/git/ref/heads/main", (502, {"message": "Bad Gateway"}))
     orchestrator = load_real_orchestrator(mock_http=backend, dry_run=False)
     assert orchestrator.validate_source() == (True, [])
-    assert (len(backend.calls), backend.sleeps) == (2, [5])
+    assert (len(backend.calls), backend.sleeps) == (3, [5]), (
+        "The branch twice (502, then OK), then the committed source document"
+    )
     
     transient = [
         APIError(code=code, message="", status_code=status_code).is_transient
@@ -2160,7 +2393,7 @@ def test_launch_with_an_unknown_outcome_never_creates_a_second_agent():
         backend = make_launch_mock()
         backend.script("POST", "/agents", LOST_RESPONSE)
         _, result = run_stage1(backend=backend, directory=Path(tmp))
-        assert result.status == STAGE_COMPLETE
+        assert result.status == STAGE_AWAITING_REVIEW
         assert launch_count(backend=backend) == 1, "The launch request is not sent again"
         assert list(backend.agents) == [result.agent_id]
         assert result.run_id == backend.agents[result.agent_id]["run_id"]
@@ -2172,7 +2405,7 @@ def test_launch_with_an_unknown_outcome_never_creates_a_second_agent():
         backend.script("POST", "/agents", NO_RESPONSE)
         _, result = run_stage1(backend=backend, directory=Path(tmp))
         bodies = get_launch_requests(mock_http=backend)
-        assert result.status == STAGE_COMPLETE
+        assert result.status == STAGE_AWAITING_REVIEW
         assert len(bodies) == 2 and bodies[0] == bodies[1]
         assert bodies[0]["agentId"] == result.agent_id
         assert list(backend.agents) == [result.agent_id]
@@ -2193,7 +2426,7 @@ def test_launch_with_an_unknown_outcome_never_creates_a_second_agent():
         
         resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
         again = resumed._run_stage(stage=stage1_of(resumed))
-        assert again.status == STAGE_COMPLETE
+        assert again.status == STAGE_AWAITING_REVIEW
         assert again.agent_id == result.agent_id
         assert launch_count(backend=backend) == 1, "The resume found the agent; it sent no launch"
         assert list(backend.agents) == [result.agent_id]
@@ -2209,7 +2442,7 @@ def test_launch_with_an_unknown_outcome_never_creates_a_second_agent():
         )
         _, result = run_stage1(backend=backend, directory=Path(tmp))
         bodies = get_launch_requests(mock_http=backend)
-        assert result.status == STAGE_COMPLETE
+        assert result.status == STAGE_AWAITING_REVIEW
         assert len(bodies) == 2 and bodies[0]["agentId"] == bodies[1]["agentId"]
         assert list(backend.agents) == [result.agent_id], "The same ID cannot create two agents"
     
@@ -2226,7 +2459,7 @@ def test_launch_with_an_unknown_outcome_never_creates_a_second_agent():
         refused_agent_id = result.agent_id
         
         again = orchestrator._run_stage(stage=stage1_of(orchestrator))
-        assert again.status == STAGE_COMPLETE
+        assert again.status == STAGE_AWAITING_REVIEW
         assert again.agent_id != refused_agent_id
         assert launch_count(backend=backend) == 2 and len(backend.agents) == 1
     
@@ -2291,18 +2524,18 @@ def test_run_that_is_still_going_is_waited_for_again_and_never_relaunched():
         
         resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
         result = resumed._run_stage(stage=stage1)
-        assert result.status == STAGE_COMPLETE
+        assert result.status == STAGE_AWAITING_REVIEW
         assert launch_count(backend=backend) == 1, "The same run was waited for; none was launched"
         assert len(backend.agents) == 1
     print("✓ test_run_that_is_still_going_is_waited_for_again_and_never_relaunched passed")
 
 
-def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
+def test_review_pauses_the_pipeline_until_the_output_is_approved():
     """Nothing is launched past a review point; approval fixes the commit that is handed on."""
     with tempfile.TemporaryDirectory() as tmp:
         manifest_path = Path(tmp) / "manifest.json"
         backend = make_launch_mock()
-        orchestrator = start_project(backend=backend, directory=Path(tmp), manual_review=True)
+        orchestrator = start_project(backend=backend, directory=Path(tmp))
         
         manifest = orchestrator.run_pipeline()
         stage1 = manifest.stages[STAGE1_NAME]
@@ -2311,9 +2544,7 @@ def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
         assert STAGE2_NAME not in manifest.stages
         assert launch_count(backend=backend) == 1
         
-        resumed = resume_from_file(
-            backend=backend, manifest_path=manifest_path, manual_review=True,
-        )
+        resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
         resumed.run_pipeline()
         assert launch_count(backend=backend) == 1, "A resume without an approval launches nothing"
         expect_state_error(
@@ -2325,7 +2556,7 @@ def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
         stage1 = resumed.manifest.stages[STAGE1_NAME]
         checked_commit = stage1.output_commit
         corrected_commit = backend.add_commit(
-            files=["outputs/stage1_derivation/reviewer_note.md"],
+            files=["docs/reviewer_note.md"],
             parent=checked_commit,
             branch=stage1.output_branch,
         )
@@ -2340,8 +2571,17 @@ def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
         assert stage1.status == STAGE_AWAITING_REVIEW
         assert stage1.output_commit == checked_commit
         
+        # The corrected commit is approved only once the local checkout shows it.
+        expect_state_error(
+            action=lambda: resumed.approve_stage(stage_name=STAGE1_NAME, commit=corrected_commit),
+            expected_message_part="git pull --ff-only",
+        )
+        assert stage1.status == STAGE_AWAITING_REVIEW
+        backend.local_review.commit = corrected_commit
+        
         resumed.approve_stage(stage_name=STAGE1_NAME, commit=corrected_commit)
         assert stage1.status == STAGE_COMPLETE
+        assert stage1.local_sync["commit"] == corrected_commit
         assert stage1.output_commit == corrected_commit
         assert stage1.review["approved_commit"] == corrected_commit
         assert stage1.review["replaced_commit"] == checked_commit
@@ -2361,11 +2601,25 @@ def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
             files=[],
             parent=stage2_commit,
             branch=stage2.output_branch,
-            removed=("outputs/stage2_pseudocode/algorithm.md",),
+            removed=(WORKING_DOCUMENT_PATH,),
         )
         expect_state_error(
             action=lambda: resumed.approve_stage(stage_name=STAGE2_NAME, commit=broken_commit),
-            expected_message_part="outputs/stage2_pseudocode/algorithm.md",
+            expected_message_part=WORKING_DOCUMENT_PATH,
+        )
+        
+        # Nor can one that changes the approved section of an earlier stage.
+        changed_text = backend.files[stage2_commit][WORKING_DOCUMENT_PATH].replace(
+            b"Stand-in section of stage 1", b"Edited section of stage 1",
+        )
+        edited_commit = backend.add_commit(
+            files={WORKING_DOCUMENT_PATH: changed_text},
+            parent=stage2_commit,
+            branch=stage2.output_branch,
+        )
+        expect_state_error(
+            action=lambda: resumed.approve_stage(stage_name=STAGE2_NAME, commit=edited_commit),
+            expected_message_part="section of stage 1",
         )
         assert stage2.status == STAGE_AWAITING_REVIEW
         
@@ -2375,7 +2629,7 @@ def test_manual_review_pauses_the_pipeline_until_the_output_is_approved():
         assert stage2.review["approved_commit"] == stage2_commit
         assert "replaced_commit" not in stage2.review
         assert launch_count(backend=backend) == 2, "Approving launches nothing by itself"
-    print("✓ test_manual_review_pauses_the_pipeline_until_the_output_is_approved passed")
+    print("✓ test_review_pauses_the_pipeline_until_the_output_is_approved passed")
 
 
 def test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun():
@@ -2383,13 +2637,12 @@ def test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun():
     with tempfile.TemporaryDirectory() as tmp:
         manifest_path = Path(tmp) / "manifest.json"
         backend = make_launch_mock()
-        orchestrator = start_project(backend=backend, directory=Path(tmp), manual_review=True)
+        orchestrator = start_project(backend=backend, directory=Path(tmp))
         first = orchestrator.run_pipeline().stages[STAGE1_NAME]
         assert first.status == STAGE_AWAITING_REVIEW
         
         resumed = resume_from_file(
-            backend=backend, manifest_path=manifest_path, manual_review=True,
-            rerun_stage=STAGE1_NAME,
+            backend=backend, manifest_path=manifest_path, rerun_stage=STAGE1_NAME,
         )
         assert load_manifest(manifest_path=manifest_path).stages[STAGE1_NAME] == first, (
             "The reset is not saved until the run goes ahead"
@@ -2407,8 +2660,7 @@ def test_output_rejected_at_review_is_replaced_only_by_an_explicit_rerun():
         resumed.approve_stage(stage_name=STAGE1_NAME)
         expect_state_error(
             action=lambda: resume_from_file(
-                backend=backend, manifest_path=manifest_path, manual_review=True,
-                rerun_stage=STAGE1_NAME,
+                backend=backend, manifest_path=manifest_path, rerun_stage=STAGE1_NAME,
             ),
             expected_message_part="cannot be rerun: its status is COMPLETE",
         )
@@ -2452,7 +2704,7 @@ def test_artifacts_are_downloaded_only_to_safe_paths_inside_the_project_folder()
         backend.script("DOWNLOAD", "plot.png", (503, b""))
         resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
         result = resumed._run_stage(stage=get_stage(orchestrator=resumed, name=STAGE1_NAME))
-        assert result.status == STAGE_COMPLETE
+        assert result.status == STAGE_AWAITING_REVIEW
         assert launch_count(backend=backend) == 1, "Collecting again launches no agent"
         
         saved_folder = f"collected_artifacts/manifest/{STAGE1_NAME}/attempt_1"
@@ -2520,7 +2772,16 @@ def test_validate_config_checks_retry_review_path_and_repository_settings():
         (lambda c: c["api"]["retries"].update(max_attempts=True), ["max_attempts"]),
         (lambda c: c["api"]["retries"].update(backoff_seconds=[]), ["backoff_seconds"]),
         (lambda c: c["api"]["retries"].update(backoff_seconds=[5, -1]), ["backoff_seconds"]),
-        (lambda c: c["stages"][0].update(manual_review="yes"), ["manual_review"]),
+        (lambda c: c["stages"][0].update(manual_review=False), ["manual_review is not a setting"]),
+        (lambda c: c["stages"][0].update(manual_review=True), ["manual_review is not a setting"]),
+        (lambda c: c.pop("review"), ["review.local_checkout", "review.remote"]),
+        (lambda c: c["review"].update(remote=""), ["review.remote"]),
+        (lambda c: c.update(working_document={"path": "docs/w.md"}),
+         ["working_document.source_document"]),
+        (lambda c: c.update(working_document={"path": "../w.md", "source_document": "s.md"}),
+         ["working_document.path"]),
+        (lambda c: c["stages"][0]["output_manifest"].update(completion_record="/abs.json"),
+         ["completion_record"]),
         (lambda c: c["stages"][0].update(output_manifest={"required_files": ["../secret.txt"]}),
          ["required file '../secret.txt'"]),
         (lambda c: c["stages"][0].update(output_manifest={"required_files": "output1.txt"}),
@@ -2539,7 +2800,11 @@ def test_validate_config_checks_retry_review_path_and_repository_settings():
             assert expected_part in error, f"case {number}: {error}"
     
     committed = load_config(config_path=REAL_CONFIG_PATH)
-    assert [stage["manual_review"] for stage in committed["stages"]] == [True, True, True, False]
+    assert all("manual_review" not in stage for stage in committed["stages"])
+    assert committed["working_document"] == {
+        "path": WORKING_DOCUMENT_PATH, "source_document": SOURCE_DOCUMENT_PATH,
+    }
+    assert committed["review"] == {"local_checkout": "..", "remote": "origin"}
     assert committed["execution"] == {"auto_create_pr": False}
     assert committed["artifacts"]["collect"] is True
     print("✓ test_validate_config_checks_retry_review_path_and_repository_settings passed")
@@ -2562,6 +2827,11 @@ def test_clients_send_the_documented_requests():
     assert reader.file_exists(path="outputs/a/file.txt", commit=branch_commit) is True
     assert reader.file_exists(path="outputs/a", commit=branch_commit) is False, "A folder is not a file"
     assert reader.file_exists(path="outputs/a/file.txt", commit=main_commit) is False
+    assert reader.get_file_bytes(path="outputs/a/file.txt", commit=branch_commit) == (
+        backend.files[branch_commit]["outputs/a/file.txt"]
+    )
+    assert reader.get_file_bytes(path="outputs/a/file.txt", commit=main_commit) is None
+    assert reader.get_file_bytes(path="outputs/a", commit=branch_commit) is None
     
     for read_missing in (
         lambda: reader.get_branch_commit(branch="no-such-branch"),
@@ -2611,6 +2881,723 @@ def test_clients_send_the_documented_requests():
             raise AssertionError(f"Expected HTTP {expected_status}")
     assert len(backend.agents) == 1
     print("✓ test_clients_send_the_documented_requests passed")
+
+
+def test_no_stage_can_be_configured_to_skip_its_review():
+    """Every stage of the committed config stops for review; no setting switches that off."""
+    backend = make_launch_mock()
+    orchestrator = load_real_orchestrator(mock_http=backend, dry_run=False)
+    assert [stage.name for stage in orchestrator.stages] == list(ALL_STAGE_NAMES)
+    assert orchestrator.validate_config() == (True, [])
+    assert not hasattr(orchestrator.stages[0], "manual_review")
+    
+    open_project_by_hand(orchestrator=orchestrator, backend=backend, completed=ALL_STAGE_NAMES[:3])
+    last = orchestrator._run_stage(stage=orchestrator.stages[-1])
+    assert last.status == STAGE_AWAITING_REVIEW, "The last stage waits for an approval too"
+    assert last.review == {
+        "requested_at": last.review["requested_at"], "approved_at": None, "approved_commit": None,
+    }
+    assert orchestrator.run_pipeline().completed_at is None
+    assert launch_count(backend=backend) == 1, "Running again launches nothing"
+    
+    approve_as_reviewer(orchestrator=orchestrator, stage_name=STAGE4_NAME)
+    manifest = orchestrator.run_pipeline()
+    assert last.status == STAGE_COMPLETE and manifest.completed_at is not None
+    assert last.review["approved_commit"] == last.output_commit
+    print("✓ test_no_stage_can_be_configured_to_skip_its_review passed")
+
+
+def test_working_document_rules_are_in_each_prompt_and_checked_at_the_pushed_commit():
+    """Each stage is told its section's marker lines; the output check enforces the same rules."""
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.md")
+        backend = make_launch_mock()
+        orchestrator = load_real_orchestrator(
+            mock_http=backend, dry_run=False, ask=answer_with(str(document_path)),
+        )
+        orchestrator.start_new_project()
+        manifest = run_approving_every_stage(orchestrator=orchestrator)
+    
+    prompts = [body["prompt"]["text"] for body in get_launch_requests(mock_http=backend)]
+    assert len(prompts) == 4
+    markers = [
+        stage_section_markers(number=number, name=name)
+        for number, name in enumerate(ALL_STAGE_NAMES, start=1)
+    ]
+    for number, prompt_text in enumerate(prompts, start=1):
+        assert WORKING_DOCUMENT_HEADING in prompt_text
+        assert f"Path in the repository: {WORKING_DOCUMENT_PATH}" in prompt_text
+        assert f"This is stage {number} of 4." in prompt_text
+        for other_number, (begin, end) in enumerate(markers, start=1):
+            in_prompt = begin in prompt_text and end in prompt_text
+            assert in_prompt == (other_number == number), (number, other_number)
+        assert ("stay byte-for-byte as they are in the commit you start from" in prompt_text) == (
+            number > 1
+        )
+        assert ("no marker line of a later stage" in prompt_text) == (number < 4)
+        assert f"The file {SOURCE_DOCUMENT_PATH}" in prompt_text
+    
+    # The final working document holds the four sections, in order, each
+    # as the stage that wrote it left it.
+    final_commit = manifest.stages[STAGE4_NAME].output_commit
+    final_text = backend.files[final_commit][WORKING_DOCUMENT_PATH].decode("utf-8")
+    for number, name in enumerate(ALL_STAGE_NAMES, start=1):
+        section = extract_stage_section(text=final_text, number=number, name=name)
+        assert section.strip() == f"Stand-in section of stage {number}, attempt 1."
+        written_at = manifest.stages[name].output_commit
+        assert section == extract_stage_section(
+            text=backend.files[written_at][WORKING_DOCUMENT_PATH].decode("utf-8"),
+            number=number, name=name,
+        )
+    assert backend.files[final_commit][SOURCE_DOCUMENT_PATH] == (
+        backend.files[backend.branches["main"]][SOURCE_DOCUMENT_PATH]
+    )
+    
+    # A stage that breaks a rule fails the output check and hands nothing on.
+    faults = [
+        (STAGE1_NAME, "no_section", "the section of stage 1 must be enclosed"),
+        (STAGE1_NAME, "empty_section", "the section of stage 1 in"),
+        (STAGE1_NAME, "later_marker", "holds a marker of stage 2"),
+        (STAGE1_NAME, "source_changed", f"the source document {SOURCE_DOCUMENT_PATH} was changed"),
+        (STAGE2_NAME, "earlier_changed", "the section of stage 1 ('equilibrium_derivation')"),
+        (STAGE2_NAME, "later_marker", "holds a marker of stage 3"),
+    ]
+    for stage_name, fault, expected_message_part in faults:
+        backend = make_launch_mock()
+        orchestrator = load_real_orchestrator(mock_http=backend, dry_run=False)
+        earlier = ALL_STAGE_NAMES[:ALL_STAGE_NAMES.index(stage_name)]
+        open_project_by_hand(orchestrator=orchestrator, backend=backend, completed=earlier)
+        orchestrator.model_setup_document = load_model_setup_document(
+            location=str(DOCS_DIR / Path(SOURCE_DOCUMENT_PATH).name),
+        )
+        backend.working_document_fault = fault
+        result = orchestrator._run_stage(
+            stage=get_stage(orchestrator=orchestrator, name=stage_name),
+        )
+        assert result.status == STAGE_GATE_FAILED, fault
+        assert expected_message_part in result.error, result.error
+        assert result.gate["passed"] is False and result.gate["missing_files"] == []
+        assert result.output_commit is None and result.review is None, fault
+        assert backend.local_review.shown == [], "A failed output is not shown for review"
+    
+    for text, expected_message_part in (
+        ("no markers", "found 0 and 0"),
+        (f"{markers[0][0]}\nx\n{markers[0][1]}\n{markers[0][0]}\n", "found 2 and 1"),
+        (f"{markers[0][1]}\nx\n{markers[0][0]}\n", "comes before its begin marker"),
+        (f"text {markers[0][0]}\nx\n{markers[0][1]}\n", "found 0 and 1"),
+    ):
+        try:
+            extract_stage_section(text=text, number=1, name=STAGE1_NAME)
+        except WorkingDocumentError as error:
+            assert expected_message_part in str(error), str(error)
+        else:
+            raise AssertionError(f"Expected {text!r} to be refused")
+    crlf_text = f"Intro\r\n{markers[0][0]}\r\nline one\r\n{markers[0][1]}\r\n"
+    assert extract_stage_section(text=crlf_text, number=1, name=STAGE1_NAME) == "\nline one\r\n"
+    print("✓ test_working_document_rules_are_in_each_prompt_and_checked_at_the_pushed_commit passed")
+
+
+def test_stage4_completion_record_is_checked_for_form_and_reported_not_verified():
+    """The last stage must leave a well-formed record of its run; its numbers are not judged."""
+    parameters_path = "outputs/stage4_results/parameters.json"
+    results_path = "outputs/stage4_results/results.json"
+    completed = {
+        "status": "completed", "command": "stand-in command", "exit_code": 0,
+        "parameters_file": parameters_path, "results_file": results_path,
+        "converged": True, "max_abs_residual": 0.0,
+    }
+    
+    def run_stage4(record: Any) -> tuple[StageResult, FakeServices]:
+        backend = make_launch_mock()
+        backend.completion_record = record
+        orchestrator = load_real_orchestrator(mock_http=backend, dry_run=False)
+        open_project_by_hand(
+            orchestrator=orchestrator, backend=backend, completed=ALL_STAGE_NAMES[:3],
+        )
+        result = orchestrator._run_stage(
+            stage=get_stage(orchestrator=orchestrator, name=STAGE4_NAME),
+        )
+        return result, backend
+    
+    accepted = [
+        completed,
+        # A run that did not converge is a finished run that says so. The
+        # check passes; whether the result is usable is for the review.
+        {**completed, "converged": False, "max_abs_residual": 12.5},
+        {"status": "blocked", "blocked_reason": "stand-in reason"},
+    ]
+    for record in accepted:
+        result, _ = run_stage4(record=record)
+        assert result.status == STAGE_AWAITING_REVIEW, record
+        assert result.gate["passed"] is True
+        assert result.gate["completion_record"] == record, "The record is kept as the stage wrote it"
+    
+    refused = [
+        ("not json", "is not valid JSON"),
+        ("[1, 2]", "is not a JSON object"),
+        ({**completed, "status": "done"}, '"status" must be "completed" or "blocked"'),
+        ({**completed, "exit_code": 1}, '"exit_code" must be 0'),
+        ({**completed, "exit_code": False}, '"exit_code" must be 0'),
+        ({**completed, "command": ""}, '"command" must be'),
+        ({**completed, "converged": "yes"}, '"converged" must be true or false'),
+        ({**completed, "max_abs_residual": None}, '"max_abs_residual" must be a number'),
+        ({**completed, "results_file": "outputs/stage4_results/missing.json"},
+         "which is not at commit"),
+        ({**completed, "parameters_file": "../parameters.json"}, '"parameters_file" must be a path'),
+        ({"status": "blocked"}, '"blocked_reason" must say'),
+    ]
+    for record, expected_message_part in refused:
+        result, backend = run_stage4(record=record)
+        assert result.status == STAGE_GATE_FAILED, record
+        assert expected_message_part in result.error, result.error
+        assert result.output_commit is None and backend.local_review.shown == []
+    
+    backend = make_launch_mock()
+    backend.withheld_files = {STAGE4_RECORD_PATH}
+    orchestrator = load_real_orchestrator(mock_http=backend, dry_run=False)
+    open_project_by_hand(orchestrator=orchestrator, backend=backend, completed=ALL_STAGE_NAMES[:3])
+    result = orchestrator._run_stage(stage=get_stage(orchestrator=orchestrator, name=STAGE4_NAME))
+    assert result.status == STAGE_GATE_FAILED and result.gate["missing_files"] == [STAGE4_RECORD_PATH]
+    
+    stage3 = get_stage(orchestrator=orchestrator, name=STAGE3_NAME)
+    assert "outputs/stage3_implementation/solve_equilibrium.py" in (
+        stage3.output_manifest["required_files"]
+    ), "Stage 3 must hand on Python code, not only a README"
+    assert "outputs/stage3_implementation/test_solve_equilibrium.py" in (
+        stage3.output_manifest["required_files"]
+    )
+    print("✓ test_stage4_completion_record_is_checked_for_form_and_reported_not_verified passed")
+
+
+def test_output_is_announced_for_review_only_once_the_local_checkout_shows_it():
+    """A failed local checkout blocks the review notice and the approval; nothing is relaunched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest_path = Path(tmp) / "manifest.json"
+        backend = make_launch_mock()
+        local = backend.local_review
+        
+        # Before a launch: an unusable checkout stops the paid run from starting.
+        local.changed_files = ["docs/my_notes.md"]
+        orchestrator, result = run_stage1(backend=backend, directory=Path(tmp))
+        assert result.status == STAGE_BLOCKED
+        assert "No agent was launched" in result.error and "docs/my_notes.md" in result.error
+        assert launch_count(backend=backend) == 0
+        
+        # After the run: the output passes its checks on GitHub, but the
+        # checkout cannot show it.
+        local.changed_files = []
+        stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+        local.problem = None
+        
+        def fail_after_launch(body: dict) -> None:
+            local.problem = "stand-in problem: the checkout cannot be used"
+        
+        backend.before_launch = fail_after_launch
+        result = orchestrator._run_stage(stage=stage1)
+        assert result.status == STAGE_SYNC_PENDING
+        assert "is NOT in the local checkout" in result.error
+        assert "stand-in problem" in result.error
+        assert result.output_commit is not None and result.gate["passed"] is True
+        assert result.review is None, "It is not announced for review"
+        assert result.local_sync["verified"] is False
+        assert local.shown == []
+        expect_state_error(
+            action=lambda: orchestrator.approve_stage(stage_name=STAGE1_NAME),
+            expected_message_part="not awaiting review",
+        )
+        
+        # A resume tries the checkout again. It launches nothing.
+        resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
+        manifest = resumed.run_pipeline()
+        result = manifest.stages[STAGE1_NAME]
+        assert result.status == STAGE_SYNC_PENDING and STAGE2_NAME not in manifest.stages
+        assert launch_count(backend=backend) == 1
+        
+        local.problem = None
+        manifest = resume_from_file(backend=backend, manifest_path=manifest_path).run_pipeline()
+        result = manifest.stages[STAGE1_NAME]
+        assert result.status == STAGE_AWAITING_REVIEW
+        assert local.shown == [(result.output_branch, result.output_commit)]
+        assert (local.branch, local.commit) == (result.output_branch, result.output_commit)
+        assert result.local_sync["verified"] is True
+        assert result.local_sync["commit"] == result.output_commit
+        assert result.local_sync["review_files"] == [
+            str(local.path / WORKING_DOCUMENT_PATH)
+        ]
+        assert launch_count(backend=backend) == 1
+        
+        # The approval needs the checkout to be cleanly at the reviewed commit.
+        resumed = resume_from_file(backend=backend, manifest_path=manifest_path)
+        local.changed_files = [" M " + WORKING_DOCUMENT_PATH]
+        expect_state_error(
+            action=lambda: resumed.approve_stage(stage_name=STAGE1_NAME),
+            expected_message_part="uncommitted changes to tracked files",
+        )
+        local.changed_files = []
+        local.branch, local.commit = "main", backend.branches["main"]
+        expect_state_error(
+            action=lambda: resumed.approve_stage(stage_name=STAGE1_NAME),
+            expected_message_part=f"git checkout {result.output_branch}",
+        )
+        assert resumed.manifest.stages[STAGE1_NAME].status == STAGE_AWAITING_REVIEW
+        assert launch_count(backend=backend) == 1
+        
+        local.branch, local.commit = result.output_branch, result.output_commit
+        resumed.approve_stage(stage_name=STAGE1_NAME)
+        assert resumed.manifest.stages[STAGE1_NAME].status == STAGE_COMPLETE
+    print("✓ test_output_is_announced_for_review_only_once_the_local_checkout_shows_it passed")
+
+
+def test_revision_starts_from_the_reviewed_output_and_comes_back_for_review():
+    """--revise launches one new agent with the feedback, from the reviewed commit."""
+    feedback_text = "TEST-ONLY FEEDBACK: stand-in request to revise the stand-in section.\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.md")
+        feedback_path = Path(tmp) / "feedback.txt"
+        feedback_path.write_text(feedback_text, encoding="utf-8")
+        empty_path = Path(tmp) / "empty.txt"
+        empty_path.write_text(" \n", encoding="utf-8")
+        manifest_path = Path(tmp) / "project_manifest.json"
+        backend = make_launch_mock()
+        resume_arguments = ["--resume", str(manifest_path), "--config", str(REAL_CONFIG_PATH)]
+        revise_arguments = [*resume_arguments, "--revise", STAGE1_NAME]
+        
+        exit_code = run_cli(
+            backend=backend,
+            arguments=[
+                "--execute", "--config", str(REAL_CONFIG_PATH), "--output", str(manifest_path),
+            ],
+            ask=answer_with(str(document_path)),
+        )
+        assert exit_code == 2
+        first = load_manifest(manifest_path=manifest_path).stages[STAGE1_NAME]
+        saved_text = manifest_path.read_text(encoding="utf-8")
+        
+        refused = [
+            revise_arguments,
+            [*revise_arguments, "--feedback", str(empty_path)],
+            [*revise_arguments, "--feedback", str(Path(tmp) / "missing.txt")],
+            [*revise_arguments, "--feedback", str(feedback_path), "--approve", STAGE1_NAME],
+            [*revise_arguments, "--feedback", str(feedback_path), "--rerun-stage", STAGE1_NAME],
+            [*resume_arguments, "--feedback", str(feedback_path)],
+            [*resume_arguments, "--revise-commit", "a" * 40],
+            [*resume_arguments, "--revise", STAGE2_NAME, "--feedback", str(feedback_path)],
+            [*revise_arguments, "--feedback", str(feedback_path), "--revise-commit", "a" * 40],
+        ]
+        for arguments in refused:
+            assert run_cli(backend=backend, arguments=arguments) == 1, arguments
+            assert launch_count(backend=backend) == 1, arguments
+            assert manifest_path.read_text(encoding="utf-8") == saved_text, arguments
+        
+        # Uncommitted review edits are never left behind by a revision.
+        backend.local_review.changed_files = [" M " + WORKING_DOCUMENT_PATH]
+        assert run_cli(
+            backend=backend, arguments=[*revise_arguments, "--feedback", str(feedback_path)],
+        ) == 1
+        assert launch_count(backend=backend) == 1
+        assert manifest_path.read_text(encoding="utf-8") == saved_text
+        backend.local_review.changed_files = []
+        
+        exit_code = run_cli(
+            backend=backend, arguments=[*revise_arguments, "--feedback", str(feedback_path)],
+        )
+        assert exit_code == 2, "The revised output comes back for review"
+        manifest = load_manifest(manifest_path=manifest_path)
+        second = manifest.stages[STAGE1_NAME]
+        assert (second.attempt, second.status) == (2, STAGE_AWAITING_REVIEW)
+        assert second.input_commit == first.output_commit, "It starts from the reviewed output"
+        assert second.output_commit != first.output_commit
+        assert second.agent_id != first.agent_id
+        assert second.revision["replaces_attempt"] == 1
+        assert second.revision["feedback"] == feedback_text
+        assert (second.revision["base_branch"], second.revision["base_commit"]) == (
+            first.output_branch, first.output_commit,
+        )
+        assert [previous["agent_id"] for previous in manifest.previous_attempts] == [first.agent_id]
+        assert manifest.previous_attempts[0]["output_commit"] == first.output_commit
+        
+        bodies = get_launch_requests(mock_http=backend)
+        assert len(bodies) == 2
+        assert bodies[1]["repos"][0]["startingRef"] == first.output_commit
+        revision_prompt = bodies[1]["prompt"]["text"]
+        assert revision_prompt.startswith(bodies[0]["prompt"]["text"].rstrip()), (
+            "The revision is given the whole task again, then the feedback"
+        )
+        assert REVISION_HEADING in revision_prompt and feedback_text.rstrip() in revision_prompt
+        assert REVISION_HEADING not in bodies[0]["prompt"]["text"]
+        assert SENTINEL_DOCUMENT_TEXT.rstrip() in revision_prompt
+        revised_text = backend.files[second.output_commit][WORKING_DOCUMENT_PATH].decode("utf-8")
+        assert extract_stage_section(
+            text=revised_text, number=1, name=STAGE1_NAME,
+        ).strip() == "Stand-in section of stage 1, attempt 2."
+        assert backend.local_review.shown[-1] == (second.output_branch, second.output_commit)
+        
+        assert run_cli(backend=backend, arguments=resume_arguments) == 2
+        assert launch_count(backend=backend) == 2, "A plain resume launches nothing"
+        
+        # The reviewer pushes edits of their own: a revision must name that commit.
+        edited_commit = backend.add_commit(
+            files=["docs/reviewer_note.md"], parent=second.output_commit,
+            branch=second.output_branch,
+        )
+        with_feedback = [*revise_arguments, "--feedback", str(feedback_path)]
+        assert run_cli(backend=backend, arguments=with_feedback) == 1
+        assert launch_count(backend=backend) == 2
+        exit_code = run_cli(
+            backend=backend, arguments=[*with_feedback, "--revise-commit", edited_commit],
+        )
+        assert exit_code == 2
+        third = load_manifest(manifest_path=manifest_path).stages[STAGE1_NAME]
+        assert (third.attempt, third.input_commit) == (3, edited_commit)
+        assert "docs/reviewer_note.md" in backend.files[third.output_commit]
+        assert launch_count(backend=backend) == 3
+        
+        assert run_cli(
+            backend=backend, arguments=[*resume_arguments, "--approve", STAGE1_NAME],
+        ) == 2
+        approved = load_manifest(manifest_path=manifest_path)
+        assert approved.stages[STAGE1_NAME].status == STAGE_COMPLETE
+        assert approved.stages[STAGE2_NAME].input_commit == third.output_commit
+        assert len(approved.previous_attempts) == 2
+    print("✓ test_revision_starts_from_the_reviewed_output_and_comes_back_for_review passed")
+
+
+def run_git(folder: Path, *arguments: str) -> str:
+    """Run a Git command in a test repository and return its output."""
+    completed = subprocess.run(
+        ["git", "-C", str(folder), *arguments],
+        capture_output=True, text=True, encoding="utf-8",
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+        },
+    )
+    assert completed.returncode == 0, f"git {arguments}: {completed.stderr}"
+    return completed.stdout.strip()
+
+
+def commit_file(folder: Path, path: str, text: str, message: str) -> str:
+    """Write a file in a test repository, commit it and return the commit SHA."""
+    target = folder / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(text.encode("utf-8"))
+    run_git(folder, "add", "--", path)
+    run_git(folder, "commit", "--quiet", "-m", message)
+    return run_git(folder, "rev-parse", "HEAD")
+
+
+def make_git_repositories(root: Path) -> tuple[Path, Path, str]:
+    """Make a bare repository standing in for GitHub, a clone that pushes to
+    it as cloud agents do, and a clone that is the owner's local checkout.
+
+    The local checkout's remote is recorded with a github.com URL, which
+    Git is told to read from the bare repository instead.
+
+    Returns:
+        (the agents' clone, the local checkout, the commit of `main`)
+    """
+    github_url = "https://github.com/test/repo"
+    bare = root / "github.git"
+    run_git(root, "init", "--quiet", "--bare", "--initial-branch=main", str(bare))
+    agents = root / "agents"
+    run_git(root, "clone", "--quiet", str(bare), str(agents))
+    main_commit = commit_file(
+        folder=agents, path="orchestrator/orchestrator.py", text="# stand-in v1\n",
+        message="Stand-in orchestrator",
+    )
+    run_git(agents, "push", "--quiet", "origin", "HEAD:main")
+    local = root / "local"
+    run_git(root, "clone", "--quiet", str(bare), str(local))
+    run_git(local, "config", f"url.{bare}.insteadOf", github_url)
+    run_git(local, "config", "remote.origin.url", github_url)
+    return agents, local, main_commit
+
+
+def push_stage_branch(agents: Path, branch: str, start: str, files: dict[str, str]) -> str:
+    """Push a new branch from `start` with the given files, as a stage's agent would."""
+    run_git(agents, "checkout", "--quiet", "-B", branch, start)
+    commit = None
+    for path, text in files.items():
+        commit = commit_file(folder=agents, path=path, text=text, message=f"Write {path}")
+    run_git(agents, "push", "--quiet", "origin", f"{branch}:{branch}")
+    return commit
+
+
+def test_local_review_checkout_shows_the_exact_commit_and_never_forces():
+    """Real Git, throw-away repositories: the checkout is safe, exact and refuses to overwrite."""
+    document = WORKING_DOCUMENT_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        agents, local, main_commit = make_git_repositories(root=root)
+        checkout = LocalReviewCheckout(
+            path=local, repo_url="https://github.com/Test/Repo.git", remote="origin",
+            running_code_paths=["orchestrator/orchestrator.py"],
+        )
+        
+        def expect_refused(action: Callable[[], object], expected_message_part: str) -> None:
+            before = (run_git(local, "rev-parse", "HEAD"), run_git(local, "status", "--porcelain"))
+            try:
+                action()
+            except LocalSyncError as error:
+                assert expected_message_part in str(error), str(error)
+            else:
+                raise AssertionError(f"Expected a refusal mentioning '{expected_message_part}'")
+            after = (run_git(local, "rev-parse", "HEAD"), run_git(local, "status", "--porcelain"))
+            assert after == before, "A refusal changes nothing in the checkout"
+        
+        # Stage 1 pushes a branch; later the branch moves on. The checkout
+        # shows the checked commit, not the branch's later head.
+        stage1 = "cursor/stage1-0001"
+        stage1_commit = push_stage_branch(
+            agents=agents, branch=stage1, start=main_commit,
+            files={document: "Stand-in section of stage 1.\n"},
+        )
+        commit_file(folder=agents, path="later.txt", text="later\n", message="Later commit")
+        run_git(agents, "push", "--quiet", "origin", f"{stage1}:{stage1}")
+        (local / "pipeline_manifest.json").write_text("{}", encoding="utf-8")
+        
+        checkout.check_ready()
+        record = checkout.show_commit(branch=stage1, commit=stage1_commit, review_files=[document])
+        assert record["verified"] is True
+        assert (record["branch"], record["commit"]) == (stage1, stage1_commit)
+        assert (record["previous_branch"], record["previous_commit"]) == ("main", main_commit)
+        assert record["review_files"] == [str(local / document)]
+        assert run_git(local, "rev-parse", "HEAD") == stage1_commit
+        assert checkout.state() == {"commit": stage1_commit, "branch": stage1, "changed_files": []}
+        assert (local / document).read_text(encoding="utf-8") == "Stand-in section of stage 1.\n"
+        assert not (local / "later.txt").exists()
+        assert (local / "pipeline_manifest.json").read_text(encoding="utf-8") == "{}", (
+            "Untracked files stay where they are"
+        )
+        assert run_git(local, "rev-parse", "main") == main_commit, "main is not moved or merged into"
+        assert run_git(local, "rev-parse", "--abbrev-ref", f"{stage1}@{{upstream}}") == (
+            f"origin/{stage1}"
+        )
+        # Showing the same commit again changes nothing.
+        assert checkout.show_commit(
+            branch=stage1, commit=stage1_commit, review_files=[document],
+        )["previous_commit"] == stage1_commit
+        
+        # Uncommitted review edits: nothing is checked out over them.
+        stage2 = "cursor/stage2-0002"
+        stage2_commit = push_stage_branch(
+            agents=agents, branch=stage2, start=stage1_commit,
+            files={document: "Stand-in sections of stages 1 and 2.\n"},
+        )
+        (local / document).write_text("My review edit.\n", encoding="utf-8")
+        show_stage2 = lambda: checkout.show_commit(
+            branch=stage2, commit=stage2_commit, review_files=[document],
+        )
+        expect_refused(action=show_stage2, expected_message_part="uncommitted changes")
+        expect_refused(action=checkout.check_ready, expected_message_part=document)
+        assert (local / document).read_text(encoding="utf-8") == "My review edit.\n"
+        assert checkout.state()["changed_files"] == [f" M {document}"]
+        
+        # The edit is committed locally and not pushed: the next stage's
+        # branch is another branch, so it can be shown; the edit stays on
+        # the Stage 1 branch.
+        run_git(local, "add", "--", document)
+        run_git(
+            local, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "--quiet", "-m", "My review edit",
+        )
+        edit_commit = run_git(local, "rev-parse", "HEAD")
+        # Showing the Stage 1 output again would lose sight of the local commit: refused.
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch=stage1, commit=stage1_commit, review_files=[document],
+            ),
+            expected_message_part="has commits of your own",
+        )
+        assert show_stage2()["commit"] == stage2_commit
+        assert run_git(local, "rev-parse", stage1) == edit_commit, "The local commit is kept"
+        assert (local / document).read_text(encoding="utf-8") == (
+            "Stand-in sections of stages 1 and 2.\n"
+        )
+        
+        # A local branch of the same name that has diverged is not overwritten.
+        stage3 = "cursor/stage3-0003"
+        stage3_commit = push_stage_branch(
+            agents=agents, branch=stage3, start=stage2_commit, files={"code.py": "# stand-in\n"},
+        )
+        run_git(local, "branch", stage3, edit_commit)
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch=stage3, commit=stage3_commit, review_files=[document, "code.py"],
+            ),
+            expected_message_part="have diverged",
+        )
+        run_git(local, "branch", "-m", stage3, "my-own-work")
+        assert checkout.show_commit(
+            branch=stage3, commit=stage3_commit, review_files=[document, "code.py"],
+        )["commit"] == stage3_commit
+        
+        # A local branch that is behind is fast-forwarded, never reset.
+        stage3_next = commit_file(
+            folder=agents, path="code.py", text="# stand-in, corrected\n", message="Correction",
+        )
+        run_git(agents, "push", "--quiet", "origin", f"{stage3}:{stage3}")
+        run_git(local, "checkout", "--quiet", "main")
+        assert checkout.show_commit(
+            branch=stage3, commit=stage3_next, review_files=["code.py"],
+        )["previous_branch"] == "main"
+        assert run_git(local, "rev-parse", "HEAD") == stage3_next
+        
+        # A file to review that is not in the commit: not reported as ready.
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch=stage3, commit=stage3_next, review_files=["missing.md"],
+            ),
+            expected_message_part="missing.md",
+        )
+        
+        # A commit that holds another version of the running orchestrator.
+        stage4 = "cursor/stage4-0004"
+        stage4_commit = push_stage_branch(
+            agents=agents, branch=stage4, start=stage3_next,
+            files={"orchestrator/orchestrator.py": "# stand-in v2\n"},
+        )
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch=stage4, commit=stage4_commit, review_files=[document],
+            ),
+            expected_message_part="another version of the orchestrator",
+        )
+        
+        # A remote branch that was rewritten is not accepted.
+        run_git(agents, "checkout", "--quiet", "-B", stage3, stage2_commit)
+        rewritten = commit_file(folder=agents, path="code.py", text="# rewritten\n", message="Rewrite")
+        run_git(agents, "push", "--quiet", "--force", "origin", f"{stage3}:{stage3}")
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch=stage3, commit=rewritten, review_files=["code.py"],
+            ),
+            expected_message_part="could not be fetched",
+        )
+        
+        # A commit that is not on the named branch; a branch that does not exist.
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch=stage2, commit=stage3_next, review_files=[document],
+            ),
+            expected_message_part="is not on branch",
+        )
+        expect_refused(
+            action=lambda: checkout.show_commit(
+                branch="cursor/no-such-branch", commit=stage2_commit, review_files=[document],
+            ),
+            expected_message_part="could not be fetched",
+        )
+        
+        # The checkout of another repository, a subfolder, and a folder that is no checkout.
+        other = LocalReviewCheckout(
+            path=local, repo_url="https://github.com/test/another", remote="origin",
+        )
+        expect_refused(action=other.check_ready, expected_message_part="not at the pipeline's repository")
+        no_remote = LocalReviewCheckout(
+            path=local, repo_url="https://github.com/test/repo", remote="upstream",
+        )
+        expect_refused(action=no_remote.check_ready, expected_message_part="no remote named 'upstream'")
+        subfolder = LocalReviewCheckout(
+            path=local / "docs", repo_url="https://github.com/test/repo", remote="origin",
+        )
+        expect_refused(action=subfolder.check_ready, expected_message_part="not its top folder")
+        plain_folder = root / "plain"
+        plain_folder.mkdir()
+        try:
+            LocalReviewCheckout(
+                path=plain_folder, repo_url="https://github.com/test/repo", remote="origin",
+            ).check_ready()
+        except LocalSyncError as error:
+            assert "is not a Git checkout" in str(error)
+        else:
+            raise AssertionError("A folder that is no checkout must be refused")
+        
+        assert run_git(local, "rev-parse", "main") == main_commit
+        assert run_git(local, "rev-parse", "my-own-work") == edit_commit
+        assert run_git(local, "stash", "list") == "", "Nothing was ever stashed"
+    
+    assert github_repository_of("git@github.com:YangLuUST/RMB_AI.git") == ("yangluust", "rmb_ai")
+    assert github_repository_of("ssh://git@github.com/yangluust/RMB_AI") == ("yangluust", "rmb_ai")
+    assert github_repository_of("https://github.com/yangluust/RMB_AI.git") == ("yangluust", "rmb_ai")
+    assert github_repository_of("D:\\RMB_AI") is None
+    print("✓ test_local_review_checkout_shows_the_exact_commit_and_never_forces passed")
+
+
+def test_source_document_in_docs_is_the_unchanged_original_and_reaches_stage1_whole():
+    """docs/ holds the owner's original byte-for-byte; a dry run sends its whole text to Stage 1.
+
+    This reads the real document and builds the real prompts. It derives
+    nothing: no stage is carried out.
+    """
+    source_path = DOCS_DIR / Path(SOURCE_DOCUMENT_PATH).name
+    source_bytes = source_path.read_bytes()
+    assert len(source_bytes) == SOURCE_DOCUMENT_SIZE_BYTES
+    assert hashlib.sha256(source_bytes).hexdigest() == SOURCE_DOCUMENT_SHA256
+    assert source_bytes.count(b"\r\n") == 1700, "The original's CRLF line endings are kept"
+    
+    document = load_model_setup_document(location=str(source_path))
+    assert (document.format, document.sha256) == ("md", SOURCE_DOCUMENT_SHA256)
+    assert document.text == source_bytes.decode("utf-8")
+    
+    old_key = os.environ.pop("CURSOR_API_KEY", None)
+    try:
+        backend = make_launch_mock()
+        ask = answer_with(str(source_path))
+        exit_code = run_cli(
+            backend=backend,
+            arguments=["--dry-run", "--config", str(REAL_CONFIG_PATH)],
+            ask=ask,
+            api_key=None,
+        )
+    finally:
+        if old_key:
+            os.environ["CURSOR_API_KEY"] = old_key
+    assert exit_code == 0 and ask.questions == [MODEL_SETUP_QUESTION]
+    assert backend.calls == [] and backend.local_review.ready_checks == 0
+    
+    orchestrator = load_real_orchestrator(mock_http=MockHttpClient(), dry_run=True)
+    orchestrator.model_setup_document = document
+    prompts = {
+        stage.name: build_stage_prompt(
+            stage=stage,
+            model_setup_document=document,
+            working_document_rules=orchestrator.working_document_rules(stage=stage),
+        )
+        for stage in orchestrator.stages
+    }
+    stage1_prompt = prompts[STAGE1_NAME]
+    assert document.text.rstrip() in stage1_prompt, "The whole document is in the Stage 1 prompt"
+    assert f"SHA-256: {SOURCE_DOCUMENT_SHA256}" in stage1_prompt
+    for expected in (
+        "The target is Section 1 of that document",
+        "equation (12) in Section 4",
+        "The other sections are secondary reference only",
+        "NOT IN THIS STAGE: no pseudocode, no program code",
+        "# 1. Environment, information, and equilibrium",
+        "# 4. From delayed intervention to daily fixing responsiveness",
+    ):
+        assert expected in stage1_prompt, expected
+    for name in ALL_STAGE_NAMES[1:]:
+        assert MODEL_SETUP_HEADING not in prompts[name]
+        assert WORKING_DOCUMENT_PATH in prompts[name]
+    assert "ILLUSTRATIVE" in prompts[STAGE4_NAME]
+    assert "Never present an illustrative choice as the source's" in prompts[STAGE4_NAME]
+    
+    # The committed working document holds sections only for stages that
+    # were carried out, without a gap, each enclosed by its marker lines.
+    working_text = (DOCS_DIR / Path(WORKING_DOCUMENT_PATH).name).read_text(encoding="utf-8")
+    present = [
+        any(marker in working_text for marker in stage_section_markers(number=number, name=name))
+        for number, name in enumerate(ALL_STAGE_NAMES, start=1)
+    ]
+    assert present == sorted(present, reverse=True), "No section of a later stage without the earlier ones"
+    for number, name in enumerate(ALL_STAGE_NAMES, start=1):
+        if present[number - 1]:
+            assert extract_stage_section(text=working_text, number=number, name=name).strip()
+    print("✓ test_source_document_in_docs_is_the_unchanged_original_and_reaches_stage1_whole passed")
 
 
 def run_all_tests():

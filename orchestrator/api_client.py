@@ -8,6 +8,7 @@ This client provides a minimal interface to the Cursor Cloud Agents API
 for the research pipeline orchestrator.
 """
 
+import base64
 import os
 import re
 from dataclasses import dataclass, field
@@ -499,8 +500,8 @@ class GitHubRepoReader:
     """
     Read-only access to one GitHub repository through the GitHub REST API.
     
-    Used to turn a branch into a commit SHA and to check that files exist
-    at a commit. It never writes to the repository.
+    Used to turn a branch into a commit SHA, to check that files exist at a
+    commit and to read their content there. It never writes to the repository.
     
     Official docs:
       https://docs.github.com/en/rest/git/refs#get-a-reference
@@ -595,3 +596,37 @@ class GitHubRepoReader:
                 status_code=status_code, body=body, what=f"file '{path}' at {commit}",
             )
         return isinstance(body, dict) and body.get("type") == "file"
+    
+    def get_file_bytes(self, path: str, commit: str) -> Optional[bytes]:
+        """Return the content of a file at a commit, or None if no file is there.
+
+        Raises:
+            GitHubAPIError: if GitHub cannot be read, or does not send the
+                content (it sends none for a file over 1 MB).
+        """
+        status_code, body = self._get(
+            f"contents/{quote(path, safe='/')}?ref={quote(commit, safe='')}"
+        )
+        if status_code == 404:
+            return None
+        what = f"file '{path}' at {commit}"
+        if status_code != 200:
+            raise self._error(status_code=status_code, body=body, what=what)
+        if not isinstance(body, dict) or body.get("type") != "file":
+            return None
+        if body.get("encoding") != "base64" or not isinstance(body.get("content"), str):
+            raise GitHubAPIError(
+                code="github_error",
+                message=(
+                    f"GitHub did not send the content of {what} in {self.full_name} "
+                    f"(size {body.get('size')} bytes; content is sent only for "
+                    f"files up to 1 MB)"
+                ),
+            )
+        try:
+            return base64.b64decode(body["content"], validate=False)
+        except ValueError as error:
+            raise GitHubAPIError(
+                code="github_error",
+                message=f"The content GitHub sent for {what} is not valid base64: {error}",
+            ) from error
