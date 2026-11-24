@@ -21,9 +21,15 @@ clearly in the main conversation chat (the written transcript of the session).
   document. Never change it. `.gitattributes` keeps Git from converting its line endings.
 - `docs/equilibrium-working-document.md` is the single cumulative working document. Each
   stage's section lies between its `BEGIN STAGE n` and `END STAGE n` marker lines. Do not
-  edit a section the owner has approved, and do not add content for a stage that has not
+  edit a section the owner has accepted, and do not add content for a stage that has not
   been carried out.
-- Each stage stops for the owner's review. Do not begin the next stage before the owner
-  has approved the one before it.
+- Every round of every stage ends at the owner's review. Do not begin a further round
+  or the next stage without the owner's decision. Accepting a stage does not start the
+  next one.
+- `docs/pipeline-trial-log.md` is the append-only record of every round. Add entries at
+  its end only; never change or remove an entry, and never write an entry for a round
+  that did not take place.
+- A passed check of the orchestrator is a check of form. Do not present it as proof that
+  mathematics, code or a number is right.
 - The design, the commands and what has and has not been tested are in
   `docs/pipeline-design.md` and `orchestrator/README.md`.
