@@ -62,10 +62,21 @@ stages:
     model_id: null  # Uses configured default
     model_params: []
     
+    # The equilibrium definition is read from the block between the
+    # EQUILIBRIUM_DEFINITION markers in this file (path relative to the
+    # repository root, in the local checkout) and appended to the prompt
+    # below at launch. This stage cannot launch while that block is
+    # unfilled. See "Equilibrium Definition" in docs/pipeline-design.md.
+    equilibrium_definition_file: "docs/pipeline-design.md"
+    
     prompt: |
       You are working on the RMB_AI research project for Yang Lu.
       
-      TASK: Derive the theoretical equilibrium conditions for the FX market model.
+      TASK: Derive the equilibrium of the economic model, using only the
+      equilibrium definition given below under "EQUILIBRIUM DEFINITION".
+      Do not substitute, extend or assume a different definition. If that
+      definition is not enough to carry out the derivation, stop and
+      report what is missing instead of filling the gap yourself.
       
       INPUT SOURCES:
       - Reference papers in reference/ directory

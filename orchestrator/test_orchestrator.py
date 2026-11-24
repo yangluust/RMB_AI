@@ -10,6 +10,7 @@ Or simply: python test_orchestrator.py
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock
@@ -18,21 +19,41 @@ import yaml
 
 from api_client import CursorAPIClient, CursorAPIError, Model, RunStatus
 from orchestrator import (
+    DEFINITION_BEGIN_MARKER,
+    DEFINITION_END_MARKER,
+    DEFINITION_FILLED_STATUS_LINE,
+    DEFINITION_HEADING,
+    DEFINITION_PLACEHOLDER,
     GUARDRAILS_HEADING,
+    REPO_ROOT,
+    DefinitionNotSuppliedError,
     Orchestrator,
     PipelineManifest,
     StageConfig,
     StageResult,
     build_stage_prompt,
     load_config,
+    read_equilibrium_definition,
 )
 
 ORCHESTRATOR_DIR = Path(__file__).resolve().parent
 REAL_CONFIG_PATH = ORCHESTRATOR_DIR / "config.yaml"
-DESIGN_DOC_PATH = ORCHESTRATOR_DIR.parent / "docs" / "pipeline-design.md"
+DESIGN_DOC_RELATIVE_PATH = Path("docs") / "pipeline-design.md"
+DESIGN_DOC_PATH = ORCHESTRATOR_DIR.parent / DESIGN_DOC_RELATIVE_PATH
 DESIGN_DOC_GUARDRAILS_HEADING = "#### Reproducibility Guardrails (Stage 3)"
+STAGE1_NAME = "equilibrium_derivation"
 STAGE3_NAME = "pseudocode_to_implementation"
 EXPECTED_GUARDRAIL_COUNT = 12
+
+# Stand-in definition blocks for tests. The "filled" text is a sentinel, not
+# a real equilibrium definition.
+UNFILLED_DEFINITION_BLOCK = (
+    f"**Status:** UNFILLED\n\n**1. Field.**\n\n> {DEFINITION_PLACEHOLDER}\n"
+)
+SENTINEL_DEFINITION_TEXT = "TEST-ONLY SENTINEL TEXT, not a real definition."
+FILLED_DEFINITION_BLOCK = (
+    f"{DEFINITION_FILLED_STATUS_LINE}\n\n**1. Field.**\n\n> {SENTINEL_DEFINITION_TEXT}\n"
+)
 
 
 class MockHttpClient:
@@ -541,13 +562,18 @@ def read_design_doc_guardrails() -> list[str]:
     return guardrails
 
 
-def load_real_orchestrator(mock_http: MockHttpClient, dry_run: bool) -> Orchestrator:
+def load_real_orchestrator(
+    mock_http: MockHttpClient,
+    dry_run: bool,
+    repo_root: Optional[Path] = None,
+) -> Orchestrator:
     """Build an orchestrator from the committed config.yaml with mocked HTTP."""
     client = CursorAPIClient(api_key="test-key", http_client=mock_http)
     return Orchestrator(
         config=load_config(config_path=REAL_CONFIG_PATH),
         api_client=client,
         dry_run=dry_run,
+        repo_root=repo_root,
     )
 
 
@@ -621,6 +647,281 @@ def test_validate_config_rejects_malformed_guardrails():
         assert not is_valid, f"Expected rejection for guardrails={malformed!r}"
         assert any("guardrails" in error for error in errors)
     print("✓ test_validate_config_rejects_malformed_guardrails passed")
+
+
+def make_launch_mock() -> MockHttpClient:
+    """Mock HTTP that accepts an agent launch and reports the run finished."""
+    mock_http = MockHttpClient()
+    mock_http.add_response("GET", "/models", 200, MOCK_MODELS_RESPONSE)
+    mock_http.add_response("POST", "/agents", 200, MOCK_CREATE_RESPONSE)
+    mock_http.add_response("GET", "/runs/", 200, MOCK_RUN_FINISHED)
+    return mock_http
+
+
+def write_definition_doc(repo_root: Path, block: str) -> Path:
+    """Write a stand-in design doc holding one definition block; return its path."""
+    path = repo_root / DESIGN_DOC_RELATIVE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"# Stand-in doc\n\n{DEFINITION_BEGIN_MARKER}\n{block}\n{DEFINITION_END_MARKER}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def expect_definition_rejected(path: Path, expected_message_part: str) -> None:
+    try:
+        read_equilibrium_definition(path=path)
+    except DefinitionNotSuppliedError as error:
+        assert expected_message_part in str(error), str(error)
+    else:
+        raise AssertionError(f"Expected rejection mentioning '{expected_message_part}'")
+
+
+def test_unfilled_definition_blocks_stage1_launch():
+    """With an unfilled template, --execute sends no request at all for Stage 1."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        write_definition_doc(repo_root=repo_root, block=UNFILLED_DEFINITION_BLOCK)
+        mock_http = make_launch_mock()
+        orchestrator = load_real_orchestrator(
+            mock_http=mock_http, dry_run=False, repo_root=repo_root,
+        )
+        stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+        
+        result = orchestrator._run_stage(stage=stage1)
+    
+    assert result.status == "BLOCKED"
+    assert "placeholder" in result.error
+    assert result.agent_id is None
+    assert mock_http.calls == [], "No HTTP request may be sent for a blocked stage"
+    print("✓ test_unfilled_definition_blocks_stage1_launch passed")
+
+
+def test_dry_run_reports_blocked_for_unfilled_definition():
+    """A dry run does not report Stage 1 as ready while the template is unfilled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        write_definition_doc(repo_root=repo_root, block=UNFILLED_DEFINITION_BLOCK)
+        mock_http = make_launch_mock()
+        orchestrator = load_real_orchestrator(
+            mock_http=mock_http, dry_run=True, repo_root=repo_root,
+        )
+        
+        manifest = orchestrator.run_pipeline()
+    
+    assert manifest.stages[STAGE1_NAME].status == "BLOCKED"
+    assert list(manifest.stages) == [STAGE1_NAME], "Later stages must not run"
+    assert mock_http.calls == []
+    print("✓ test_dry_run_reports_blocked_for_unfilled_definition passed")
+
+
+def test_filled_definition_is_sent_in_stage1_launch_request():
+    """With a filled block, the Stage 1 launch request carries that block."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        write_definition_doc(repo_root=repo_root, block=FILLED_DEFINITION_BLOCK)
+        mock_http = make_launch_mock()
+        orchestrator = load_real_orchestrator(
+            mock_http=mock_http, dry_run=False, repo_root=repo_root,
+        )
+        stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+        
+        result = orchestrator._run_stage(stage=stage1)
+    
+    assert result.status == "FINISHED"
+    launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
+    assert len(launch_requests) == 1
+    prompt_text = launch_requests[0][3]["prompt"]["text"]
+    
+    task_position = prompt_text.index("TASK: Derive the equilibrium")
+    heading_position = prompt_text.index(DEFINITION_HEADING)
+    definition_position = prompt_text.index(SENTINEL_DEFINITION_TEXT)
+    assert task_position < heading_position < definition_position
+    assert DEFINITION_FILLED_STATUS_LINE in prompt_text
+    assert DEFINITION_PLACEHOLDER not in prompt_text
+    print("✓ test_filled_definition_is_sent_in_stage1_launch_request passed")
+
+
+def test_definition_rejected_unless_status_and_content_are_both_filled():
+    """Flipping the status, or removing placeholders, alone is not enough."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        
+        status_flipped_only = f"{DEFINITION_FILLED_STATUS_LINE}\n\n> {DEFINITION_PLACEHOLDER}\n"
+        path = write_definition_doc(repo_root=repo_root, block=status_flipped_only)
+        expect_definition_rejected(path=path, expected_message_part="placeholder")
+        
+        placeholders_removed_only = f"**Status:** UNFILLED\n\n> {SENTINEL_DEFINITION_TEXT}\n"
+        path = write_definition_doc(repo_root=repo_root, block=placeholders_removed_only)
+        expect_definition_rejected(path=path, expected_message_part="status line")
+        
+        path = write_definition_doc(repo_root=repo_root, block=DEFINITION_FILLED_STATUS_LINE)
+        expect_definition_rejected(path=path, expected_message_part="no content")
+        
+        path = write_definition_doc(repo_root=repo_root, block=FILLED_DEFINITION_BLOCK)
+        assert SENTINEL_DEFINITION_TEXT in read_equilibrium_definition(path=path)
+    print("✓ test_definition_rejected_unless_status_and_content_are_both_filled passed")
+
+
+def test_definition_rejected_for_missing_file_or_bad_markers():
+    """A missing file, or missing, duplicated or reversed markers, is rejected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        path = repo_root / DESIGN_DOC_RELATIVE_PATH
+        expect_definition_rejected(path=path, expected_message_part="not found")
+        
+        path.parent.mkdir(parents=True)
+        path.write_text(FILLED_DEFINITION_BLOCK, encoding="utf-8")
+        expect_definition_rejected(path=path, expected_message_part="exactly once")
+        
+        path.write_text(
+            f"{DEFINITION_BEGIN_MARKER}\n{DEFINITION_BEGIN_MARKER}\n"
+            f"{FILLED_DEFINITION_BLOCK}\n{DEFINITION_END_MARKER}\n",
+            encoding="utf-8",
+        )
+        expect_definition_rejected(path=path, expected_message_part="exactly once")
+        
+        path.write_text(
+            f"{DEFINITION_END_MARKER}\n{FILLED_DEFINITION_BLOCK}\n{DEFINITION_BEGIN_MARKER}\n",
+            encoding="utf-8",
+        )
+        expect_definition_rejected(path=path, expected_message_part="before the BEGIN")
+    print("✓ test_definition_rejected_for_missing_file_or_bad_markers passed")
+
+
+def test_build_stage_prompt_refuses_definition_stage_without_text():
+    """A stage that needs a definition cannot get a prompt without definition text."""
+    stage = StageConfig(
+        name="needs_definition",
+        display_name="Needs definition",
+        description="",
+        prompt="Do the task.\n",
+        equilibrium_definition_file=str(DESIGN_DOC_RELATIVE_PATH),
+    )
+    for missing in (None, "", "   \n"):
+        try:
+            build_stage_prompt(stage=stage, equilibrium_definition=missing)
+        except DefinitionNotSuppliedError:
+            continue
+        raise AssertionError(f"Expected refusal for equilibrium_definition={missing!r}")
+    
+    prompt_text = build_stage_prompt(
+        stage=stage, equilibrium_definition=SENTINEL_DEFINITION_TEXT,
+    )
+    assert prompt_text == (
+        f"Do the task.\n\n{DEFINITION_HEADING}\n{SENTINEL_DEFINITION_TEXT}\n"
+    )
+    print("✓ test_build_stage_prompt_refuses_definition_stage_without_text passed")
+
+
+def test_run_validation_fails_only_while_definition_unfilled():
+    """Validation (used by --dry-run, --execute and --resume) follows the block's state."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        
+        write_definition_doc(repo_root=repo_root, block=UNFILLED_DEFINITION_BLOCK)
+        unfilled = load_real_orchestrator(
+            mock_http=make_launch_mock(), dry_run=True, repo_root=repo_root,
+        )
+        definitions_ok, errors = unfilled.validate_equilibrium_definitions()
+        assert not definitions_ok
+        assert len(errors) == 1 and STAGE1_NAME in errors[0]
+        assert unfilled.run_validation() is False
+        
+        write_definition_doc(repo_root=repo_root, block=FILLED_DEFINITION_BLOCK)
+        filled = load_real_orchestrator(
+            mock_http=make_launch_mock(), dry_run=True, repo_root=repo_root,
+        )
+        assert filled.validate_equilibrium_definitions() == (True, [])
+        assert filled.run_validation() is True
+    print("✓ test_run_validation_fails_only_while_definition_unfilled passed")
+
+
+def test_validate_config_rejects_malformed_equilibrium_definition_file():
+    """equilibrium_definition_file must be a non-empty path string when present."""
+    for malformed in ("", "   ", 5, ["docs/pipeline-design.md"]):
+        config = {
+            "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
+            "stages": [
+                {"name": "s1", "prompt": "test", "equilibrium_definition_file": malformed},
+            ],
+        }
+        orchestrator = Orchestrator(config=config, dry_run=True)
+        is_valid, errors = orchestrator.validate_config()
+        assert not is_valid, f"Expected rejection for {malformed!r}"
+        assert any("equilibrium_definition_file" in error for error in errors)
+    print("✓ test_validate_config_rejects_malformed_equilibrium_definition_file passed")
+
+
+def test_committed_design_doc_gates_real_stage1_by_its_own_state():
+    """The committed config and design doc together gate the real Stage 1.
+
+    While the committed template is unfilled, Stage 1 must be blocked with no
+    request sent. Once Yang Lu fills it in, the launch request must carry the
+    committed block. Both branches are asserted, so this test stays valid
+    after the definition is supplied.
+    """
+    doc_text = DESIGN_DOC_PATH.read_text(encoding="utf-8")
+    assert doc_text.count(DEFINITION_BEGIN_MARKER) == 1
+    assert doc_text.count(DEFINITION_END_MARKER) == 1
+    block = doc_text.split(DEFINITION_BEGIN_MARKER)[1].split(DEFINITION_END_MARKER)[0].strip()
+    committed_block_is_unfilled = (
+        DEFINITION_PLACEHOLDER in block or DEFINITION_FILLED_STATUS_LINE not in block
+    )
+    
+    mock_http = make_launch_mock()
+    orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
+    assert orchestrator.repo_root == REPO_ROOT
+    stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+    assert stage1.equilibrium_definition_file == DESIGN_DOC_RELATIVE_PATH.as_posix()
+    
+    result = orchestrator._run_stage(stage=stage1)
+    
+    if committed_block_is_unfilled:
+        assert result.status == "BLOCKED"
+        assert mock_http.calls == []
+    else:
+        assert result.status == "FINISHED"
+        launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
+        assert len(launch_requests) == 1
+        assert block in launch_requests[0][3]["prompt"]["text"]
+    print("✓ test_committed_design_doc_gates_real_stage1_by_its_own_state passed")
+
+
+def test_documented_fill_steps_open_the_gate_for_the_committed_template():
+    """Following the design doc's fill steps on a copy of the committed doc opens the gate.
+
+    The copy gets sentinel text in place of every placeholder and its status
+    set to FILLED. If the committed doc is already filled, both edits are
+    no-ops and the gate must still open.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp)
+        copy_path = repo_root / DESIGN_DOC_RELATIVE_PATH
+        copy_path.parent.mkdir(parents=True)
+        filled_text = (
+            DESIGN_DOC_PATH.read_text(encoding="utf-8")
+            .replace(DEFINITION_PLACEHOLDER, SENTINEL_DEFINITION_TEXT)
+            .replace("**Status:** UNFILLED", DEFINITION_FILLED_STATUS_LINE)
+        )
+        copy_path.write_text(filled_text, encoding="utf-8")
+        
+        block = read_equilibrium_definition(path=copy_path)
+        assert DEFINITION_PLACEHOLDER not in block
+        
+        mock_http = make_launch_mock()
+        orchestrator = load_real_orchestrator(
+            mock_http=mock_http, dry_run=False, repo_root=repo_root,
+        )
+        stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+        result = orchestrator._run_stage(stage=stage1)
+    
+    assert result.status == "FINISHED"
+    launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
+    assert len(launch_requests) == 1
+    assert block in launch_requests[0][3]["prompt"]["text"]
+    print("✓ test_documented_fill_steps_open_the_gate_for_the_committed_template passed")
 
 
 def run_all_tests():

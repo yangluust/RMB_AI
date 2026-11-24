@@ -27,11 +27,57 @@ The original design specified Grok-only models with specific xAI reasoning tiers
 
 ## Equilibrium Definition
 
-> **⚠️ PENDING: Yang Lu to provide equilibrium definition**
->
-> The equilibrium definition that Stage 1 should use for derivation has not yet been supplied. Yang Lu will specify the precise mathematical or economic definition of equilibrium that the agent should derive toward.
->
-> This section will be updated once the definition is provided.
+**Not supplied yet.** Yang Lu has not provided the equilibrium definition. The template below is unfilled: every field holds a placeholder for Yang to replace, and nothing in it describes the model or states a definition.
+
+Stage 1 derives the equilibrium according to this definition. The orchestrator reads the template block from this file in the local checkout and appends it to the Stage 1 prompt at launch. While the block is unfilled the orchestrator refuses to launch Stage 1: `--dry-run`, `--execute` and `--resume` all stop with an error that names this file.
+
+### How to Fill It In
+
+1. Replace every `TODO(Yang)` placeholder in the template with your own text. Formulas can be written as `$$ ... $$`.
+2. Delete any field that does not apply and add fields you need. The field list is only a suggested layout, not a statement about the model.
+3. Change the status line from `UNFILLED` to `FILLED`.
+4. Commit and push this file, so the repository records the definition that Stage 1 used.
+
+Keep the two hidden `EQUILIBRIUM_DEFINITION` comment lines around the template; the orchestrator uses them to find the block.
+
+The orchestrator treats the definition as supplied only when the status line reads `**Status:** FILLED`, no `TODO(Yang)` placeholder remains, and the block has content besides the status line. It cannot judge whether that content is a correct or complete definition; that stays with Yang.
+
+**Limit:** the orchestrator checks the copy of this file in the local checkout. It does not yet check that the same text is in the repository snapshot the Stage 1 agent runs on, which is why step 4 matters.
+
+### Definition Template
+
+<!-- EQUILIBRIUM_DEFINITION:BEGIN -->
+**Status:** UNFILLED
+
+**1. Equilibrium concept.** The name of the concept and, if there is one, the source it follows.
+
+> TODO(Yang)
+
+**2. Objects.** The objects that together make up an equilibrium.
+
+> TODO(Yang)
+
+**3. Conditions.** The conditions those objects must satisfy, one per line.
+
+> TODO(Yang)
+
+**4. Taken as given.** What the definition takes as given from the model setup file.
+
+> TODO(Yang)
+
+**5. Notation.** How the symbols used above map to the symbols in the model setup file.
+
+> TODO(Yang)
+
+**6. Restrictions.** Any restriction on which equilibria Stage 1 should consider.
+
+> TODO(Yang)
+
+**7. Required result.** What the Stage 1 derivation must deliver for this definition.
+
+> TODO(Yang)
+
+<!-- EQUILIBRIUM_DEFINITION:END -->
 
 ---
 
@@ -45,11 +91,11 @@ The original design specified Grok-only models with specific xAI reasoning tiers
 | **Input** | QMD (`.qmd`) or LaTeX (`.tex`) file specifying the economic model setup |
 | **Input Location** | To be committed to repository (e.g., `inputs/model_setup.qmd` or `inputs/model_setup.tex`) |
 | **Output** | LaTeX derivations in `outputs/stage1_derivation/` |
-| **Equilibrium Definition** | ⚠️ **Pending** — Yang Lu to specify |
+| **Equilibrium Definition** | Not supplied yet — unfilled template in [Equilibrium Definition](#equilibrium-definition) |
 | **Requested Model** | **Claude Fable 5.2** |
 | **Requested Reasoning** | **Second-highest** |
 
-**Stage 1 Task:** The agent reads the QMD or LaTeX file containing the economic model setup, understands the model structure, and derives the equilibrium conditions according to the equilibrium definition (once provided by Yang Lu).
+**Stage 1 Task:** The agent reads the QMD or LaTeX file containing the economic model setup, understands the model structure, and derives the equilibrium conditions according to the definition in [Equilibrium Definition](#equilibrium-definition). That definition is not supplied yet, and Stage 1 cannot launch until Yang Lu fills in the template there.
 
 ### Stage 2: Equilibrium to Pseudocode
 
@@ -339,6 +385,7 @@ Before launching each stage:
 2. **Parameter Validation**: Check `model.params` are valid for the model
 3. **Dependency Check**: Prior stage completed successfully
 4. **Input Manifest**: Required input files exist in the starting ref
+5. **Equilibrium Definition**: Stage 1 does not launch while the template in [Equilibrium Definition](#equilibrium-definition) is unfilled
 
 ### Post-Run Validation
 
@@ -462,17 +509,19 @@ This would require:
 
 ### Open Questions
 
-1. **Equilibrium Definition**: ⚠️ Yang Lu to provide the mathematical/economic equilibrium definition for Stage 1 derivation.
+1. **Equilibrium Definition**: Not supplied yet. Yang Lu fills in the template in [Equilibrium Definition](#equilibrium-definition); Stage 1 cannot launch until then.
 
-2. **Model ID Resolution**: The requested model names (Claude Fable 5.2, Grok, GPT-5.6) must be mapped to actual `model.id` values from `GET /v1/models`. This mapping is unresolved until runtime validation.
+2. **Model Setup File Path**: Stage 1 reads a QMD or LaTeX model setup file, but no path has been supplied and the Stage 1 prompt in `orchestrator/config.yaml` does not name one.
 
-3. **Reasoning Level Parameters**: The API may not support ordinal reasoning levels like "second-highest." Need to discover what parameters each model actually exposes and how to map requested levels.
+3. **Model ID Resolution**: The requested model names (Claude Fable 5.2, Grok, GPT-5.6) must be mapped to actual `model.id` values from `GET /v1/models`. This mapping is unresolved until runtime validation.
 
-4. **Grok Version**: Stage 3 requests "Grok" without a specific version. Need to determine which Grok version is available and appropriate.
+4. **Reasoning Level Parameters**: The API may not support ordinal reasoning levels like "second-highest." Need to discover what parameters each model actually exposes and how to map requested levels.
 
-5. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
+5. **Grok Version**: Stage 3 requests "Grok" without a specific version. Need to determine which Grok version is available and appropriate.
 
-6. **Error Recovery**: If Stage 2 fails, should we allow manual fixes and resume, or require re-running from Stage 1?
+6. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
+
+7. **Error Recovery**: If Stage 2 fails, should we allow manual fixes and resume, or require re-running from Stage 1?
 
 ---
 
@@ -495,12 +544,13 @@ This would require:
 | 2026-11-24 | Cloud Agent | Updated with specific model requests: Claude Fable 5.2 (Stages 1-2), Grok (Stage 3), GPT-5.6 (Stage 4). Added Stage 1 input format (QMD/LaTeX). Added pending sections for equilibrium definition and reproducibility guardrails. |
 | 2026-11-24 | Cloud Agent | Replaced the Stage 3 reproducibility guardrails placeholder with the twelve principles supplied by Yang Lu. Equilibrium definition remains pending. |
 | 2026-11-24 | Cloud Agent | The twelve Stage 3 guardrails are now in `orchestrator/config.yaml` and appended to the Stage 3 prompt at launch. |
+| 2026-11-24 | Cloud Agent | Replaced the pending equilibrium-definition notes with an unfilled template for Yang Lu. The orchestrator refuses to launch Stage 1 while the template is unfilled. |
 
 ---
 
 ## Next Steps
 
-1. **Yang Lu: Provide equilibrium definition** for Stage 1 derivation task
+1. **Yang Lu: Fill in the equilibrium definition template** in [Equilibrium Definition](#equilibrium-definition)
 2. **Resolve model IDs** by querying `GET /v1/models` and mapping requested names
 3. **Commit input files** (economic model specification in QMD or LaTeX)
 4. **Test dry-run** to validate configuration and model availability

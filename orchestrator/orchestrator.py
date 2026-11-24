@@ -43,24 +43,109 @@ class StageConfig:
     depends_on: Optional[str] = None
     output_manifest: dict = field(default_factory=dict)
     guardrails: list[str] = field(default_factory=list)
+    equilibrium_definition_file: Optional[str] = None
 
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 GUARDRAILS_HEADING = "REPRODUCIBILITY GUARDRAILS (follow all of these):"
 
+DEFINITION_HEADING = (
+    "EQUILIBRIUM DEFINITION (supplied by Yang Lu; use exactly this definition):"
+)
+DEFINITION_BEGIN_MARKER = "<!-- EQUILIBRIUM_DEFINITION:BEGIN -->"
+DEFINITION_END_MARKER = "<!-- EQUILIBRIUM_DEFINITION:END -->"
+DEFINITION_PLACEHOLDER = "TODO(Yang)"
+DEFINITION_FILLED_STATUS_LINE = "**Status:** FILLED"
 
-def build_stage_prompt(stage: StageConfig) -> str:
+
+class DefinitionNotSuppliedError(Exception):
+    """The equilibrium definition a stage needs has not been filled in."""
+
+
+def read_equilibrium_definition(path: Path) -> str:
+    """Return the filled-in equilibrium definition block from a document.
+
+    The block is the text between the two EQUILIBRIUM_DEFINITION markers.
+    It counts as supplied only when its status line says FILLED, no
+    placeholder remains, and it has content besides the status line.
+    This cannot judge whether the content is a correct definition.
+
+    Raises:
+        DefinitionNotSuppliedError: if the block is missing or unfilled.
+    """
+    if not path.is_file():
+        raise DefinitionNotSuppliedError(f"Equilibrium definition file not found: {path}")
+    
+    text = path.read_text(encoding="utf-8")
+    for marker in (DEFINITION_BEGIN_MARKER, DEFINITION_END_MARKER):
+        if text.count(marker) != 1:
+            raise DefinitionNotSuppliedError(
+                f"{path} must contain the marker '{marker}' exactly once "
+                f"(found {text.count(marker)})"
+            )
+    
+    begin = text.index(DEFINITION_BEGIN_MARKER) + len(DEFINITION_BEGIN_MARKER)
+    end = text.index(DEFINITION_END_MARKER)
+    if end < begin:
+        raise DefinitionNotSuppliedError(
+            f"{path}: the END marker comes before the BEGIN marker"
+        )
+    
+    block = text[begin:end].strip()
+    lines = [line.strip() for line in block.splitlines()]
+    
+    problems = []
+    placeholder_count = block.count(DEFINITION_PLACEHOLDER)
+    if placeholder_count:
+        problems.append(
+            f"{placeholder_count} '{DEFINITION_PLACEHOLDER}' placeholder(s) remain"
+        )
+    if DEFINITION_FILLED_STATUS_LINE not in lines:
+        problems.append(f"the status line is not '{DEFINITION_FILLED_STATUS_LINE}'")
+    if not any(line and line != DEFINITION_FILLED_STATUS_LINE for line in lines):
+        problems.append("the block has no content besides the status line")
+    
+    if problems:
+        raise DefinitionNotSuppliedError(
+            f"Equilibrium definition in {path} is not supplied: " + "; ".join(problems)
+        )
+    return block
+
+
+def build_stage_prompt(
+    stage: StageConfig,
+    equilibrium_definition: Optional[str] = None,
+) -> str:
     """Return the prompt text sent to the cloud agent for a stage.
 
-    A stage's guardrails are appended to its prompt as a numbered list, so
-    the agent receives them in the same launch request as the task.
+    The equilibrium definition (for a stage that needs one) and the stage's
+    guardrails are appended to the stage prompt, so the agent receives them
+    in the same launch request as the task.
+
+    Raises:
+        DefinitionNotSuppliedError: if the stage needs an equilibrium
+            definition and no definition text is given.
     """
-    if not stage.guardrails:
+    sections = [stage.prompt.rstrip()]
+    
+    if stage.equilibrium_definition_file:
+        if not equilibrium_definition or not equilibrium_definition.strip():
+            raise DefinitionNotSuppliedError(
+                f"Stage '{stage.name}' needs an equilibrium definition and none was given"
+            )
+        sections.append(f"{DEFINITION_HEADING}\n{equilibrium_definition.strip()}")
+    
+    if stage.guardrails:
+        numbered = "\n".join(
+            f"{number}. {guardrail}"
+            for number, guardrail in enumerate(stage.guardrails, start=1)
+        )
+        sections.append(f"{GUARDRAILS_HEADING}\n{numbered}")
+    
+    if len(sections) == 1:
         return stage.prompt
-    numbered = "\n".join(
-        f"{number}. {guardrail}"
-        for number, guardrail in enumerate(stage.guardrails, start=1)
-    )
-    return f"{stage.prompt.rstrip()}\n\n{GUARDRAILS_HEADING}\n{numbered}\n"
+    return "\n\n".join(sections) + "\n"
 
 
 @dataclass
@@ -153,10 +238,14 @@ class Orchestrator:
         config: dict,
         api_client: Optional[CursorAPIClient] = None,
         dry_run: bool = True,
+        repo_root: Optional[Path] = None,
     ):
         self.config = config
         self.dry_run = dry_run
         self.api = api_client or CursorAPIClient()
+        # Paths named in the config (such as the equilibrium definition
+        # file) are resolved against the local checkout of the repository.
+        self.repo_root = repo_root if repo_root is not None else REPO_ROOT
         
         self.pipeline_config = config.get("pipeline", {})
         self.repo_config = self.pipeline_config.get("repository", {})
@@ -180,6 +269,7 @@ class Orchestrator:
                 depends_on=stage_data.get("depends_on"),
                 output_manifest=stage_data.get("output_manifest", {}),
                 guardrails=stage_data.get("guardrails", []),
+                equilibrium_definition_file=stage_data.get("equilibrium_definition_file"),
             ))
         return stages
     
@@ -214,7 +304,44 @@ class Orchestrator:
                 errors.append(
                     f"Stage '{stage.name}': guardrails must be a list of non-empty strings"
                 )
+            
+            definition_file = stage.equilibrium_definition_file
+            if definition_file is not None and not (
+                isinstance(definition_file, str) and definition_file.strip()
+            ):
+                errors.append(
+                    f"Stage '{stage.name}': equilibrium_definition_file must be a "
+                    f"non-empty path relative to the repository root"
+                )
         
+        return len(errors) == 0, errors
+    
+    def _load_equilibrium_definition(self, stage: StageConfig) -> Optional[str]:
+        """Return the definition text a stage needs, or None if it needs none.
+
+        Raises:
+            DefinitionNotSuppliedError: if the stage needs a definition and
+                the definition block in the local checkout is unfilled.
+        """
+        if not stage.equilibrium_definition_file:
+            return None
+        return read_equilibrium_definition(
+            path=self.repo_root / stage.equilibrium_definition_file,
+        )
+    
+    def validate_equilibrium_definitions(self) -> tuple[bool, list[str]]:
+        """
+        Check that every stage needing an equilibrium definition has one.
+        
+        Returns:
+            Tuple of (all_supplied, list_of_errors)
+        """
+        errors = []
+        for stage in self.stages:
+            try:
+                self._load_equilibrium_definition(stage=stage)
+            except DefinitionNotSuppliedError as error:
+                errors.append(f"Stage '{stage.name}' cannot launch: {error}")
         return len(errors) == 0, errors
     
     def validate_models(self) -> tuple[bool, list[str]]:
@@ -290,6 +417,16 @@ class Orchestrator:
         else:
             print("  Configuration OK")
         
+        if config_valid:
+            print("\nChecking equilibrium definition...")
+            definitions_ok, definition_errors = self.validate_equilibrium_definitions()
+            if not definitions_ok:
+                all_valid = False
+                for e in definition_errors:
+                    print(f"  ERROR: {e}")
+            else:
+                print("  Every stage that needs an equilibrium definition has one")
+        
         print("\nChecking API key...")
         key_valid, key_errors = self.validate_api_key()
         if not key_valid:
@@ -332,6 +469,23 @@ class Orchestrator:
         print(f"  Model: {stage.model_id or '(default)'}")
         print(f"  Guardrails appended to prompt: {len(stage.guardrails)}")
         
+        # The prompt is built before anything else, so a stage that needs an
+        # equilibrium definition cannot be launched (or reported as ready by
+        # a dry run) while that definition is unfilled.
+        try:
+            prompt_text = build_stage_prompt(
+                stage=stage,
+                equilibrium_definition=self._load_equilibrium_definition(stage=stage),
+            )
+        except DefinitionNotSuppliedError as error:
+            result.status = "BLOCKED"
+            result.error = str(error)
+            print(f"  BLOCKED: {error}")
+            return result
+        
+        if stage.equilibrium_definition_file:
+            print(f"  Equilibrium definition: read from {stage.equilibrium_definition_file}")
+        
         if self.dry_run:
             print("  [DRY RUN] Would launch cloud agent")
             result.status = "DRY_RUN"
@@ -344,7 +498,7 @@ class Orchestrator:
             
             print("  Launching cloud agent...")
             run = self.api.create_agent(
-                prompt_text=build_stage_prompt(stage=stage),
+                prompt_text=prompt_text,
                 repo_url=self.repo_config["url"],
                 starting_ref=input_ref,
                 model_id=stage.model_id,
