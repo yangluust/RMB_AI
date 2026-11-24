@@ -231,14 +231,18 @@ class CursorAPIClient:
             param_value = param.get("value")
             
             if param_id not in allowed_params:
-                errors.append(f"Parameter '{param_id}' not supported by model '{model_id}'")
+                errors.append(
+                    f"Parameter '{param_id}' is not listed for model '{model_id}'. "
+                    f"Parameters listed for this model: {sorted(allowed_params)}"
+                )
                 continue
             
             allowed_values = [v["value"] for v in allowed_params[param_id].get("values", [])]
-            if allowed_values and param_value not in allowed_values:
+            if param_value not in allowed_values:
                 errors.append(
-                    f"Value '{param_value}' not allowed for parameter '{param_id}'. "
-                    f"Allowed: {allowed_values}"
+                    f"Value '{param_value}' is not permitted for parameter "
+                    f"'{param_id}' of model '{model_id}'. "
+                    f"Permitted values: {allowed_values}"
                 )
         
         return len(errors) == 0, errors

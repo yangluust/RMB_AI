@@ -21,7 +21,7 @@ This document describes the design for a four-stage research pipeline that runs 
 
 ### Historical Note
 
-The original design specified Grok-only models with specific xAI reasoning tiers. This was superseded to allow wider model selection. The current design specifies requested model names and reasoning levels per stage, which must be mapped to actual API model IDs at runtime.
+The original design specified Grok-only models with specific xAI reasoning tiers. This was superseded to allow wider model selection. The current design sets a model and a reasoning level for each stage; see [Model Selection](#model-selection).
 
 ---
 
@@ -107,6 +107,7 @@ Yang decides what the document contains and how it is laid out. The list below i
 | **Equilibrium Definition** | Stated in the input document; this design document and the orchestrator supply none |
 | **Requested Model** | **Claude Fable 5.2** |
 | **Requested Reasoning** | **Second-highest** |
+| **Configured** | `claude-fable-5-2` with `effort` = `xhigh` (see [Model Selection](#model-selection)) |
 
 **Stage 1 Task:** The agent receives the text of the input document in its prompt, understands the model structure, and derives the equilibrium using only the setup and the equilibrium definition stated in that document. If the document does not state enough, the agent is told to stop and report what is missing. Stage 1 cannot launch until a usable document has been given for the project; see [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
 
@@ -119,6 +120,7 @@ Yang decides what the document contains and how it is laid out. The list below i
 | **Output** | Pseudocode in `outputs/stage2_pseudocode/` |
 | **Requested Model** | **Claude Fable 5.2** |
 | **Requested Reasoning** | **Second-highest** |
+| **Configured** | `claude-fable-5-2` with `effort` = `xhigh` (see [Model Selection](#model-selection)) |
 
 ### Stage 3: Python Implementation and Plots
 
@@ -127,8 +129,9 @@ Yang decides what the document contains and how it is laid out. The list below i
 | **Purpose** | Implement pseudocode in Python, generate visualizations |
 | **Input** | Stage 2 outputs (`outputs/stage2_pseudocode/`), data (`data/`) |
 | **Output** | Python code and plots in `outputs/stage3_implementation/` |
-| **Requested Model** | **Grok** (version unspecified) |
-| **Requested Reasoning** | Lower (implicit from task nature) |
+| **Requested Model** | **Grok** |
+| **Requested Reasoning** | **Low** |
+| **Configured** | `grok-4.7` with `reasoning_effort` = `low` (see [Model Selection](#model-selection)) |
 
 #### Reproducibility Guardrails (Stage 3)
 
@@ -156,74 +159,65 @@ Principles supplied by Yang Lu for the Stage 3 Python implementation:
 | **Purpose** | Polish research output for academic publication |
 | **Input** | Stages 1 and 3 outputs |
 | **Output** | Polished prose in `outputs/stage4_writing/` |
-| **Requested Model** | **GPT-5.6** |
+| **Requested Model** | **GPT-5.6 Sol** |
 | **Requested Reasoning** | **High** |
+| **Configured** | `gpt-5.6-sol` with `reasoning` = `high` (see [Model Selection](#model-selection)) |
 
 ---
 
 ## Model Selection
 
-### Requested Models vs. Verified API Model IDs
+### Configured Models
 
-**Critical Distinction:** The model names and reasoning levels in this document are **owner-requested specifications**, not verified API model identifiers. The actual `model.id` values that the Cursor API accepts must be discovered at runtime via `GET /v1/models`.
+Each stage's model and reasoning level is set in `orchestrator/config.yaml` and sent in the `model` field of that stage's `POST /v1/agents` request.
 
-#### Summary of Requested Specifications
+| Stage | Requested by Yang Lu | `model` field sent in the launch request |
+|-------|----------------------|------------------------------------------|
+| 1. Equilibrium Derivation | Claude Fable 5.2, second-highest reasoning | `{"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}` |
+| 2. Equilibrium → Pseudocode | Claude Fable 5.2, second-highest reasoning | `{"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}` |
+| 3. Python Implementation | Grok, low reasoning | `{"id": "grok-4.7", "params": [{"id": "reasoning_effort", "value": "low"}]}` |
+| 4. Academic Writing | GPT-5.6 Sol, high reasoning | `{"id": "gpt-5.6-sol", "params": [{"id": "reasoning", "value": "high"}]}` |
 
-| Stage | Requested Model Name | Requested Reasoning Level | API Model ID | API Params |
-|-------|---------------------|--------------------------|--------------|------------|
-| 1. Equilibrium Derivation | Claude Fable 5.2 | Second-highest | **Unresolved** | **Unresolved** |
-| 2. Equilibrium → Pseudocode | Claude Fable 5.2 | Second-highest | **Unresolved** | **Unresolved** |
-| 3. Python Implementation | Grok (version unspecified) | Lower | **Unresolved** | **Unresolved** |
-| 4. Academic Writing | GPT-5.6 | High | **Unresolved** | **Unresolved** |
+`orchestrator/test_orchestrator.py` fails if this table and `config.yaml` differ, so edit both together.
 
-#### What "Unresolved" Means
+**"Second-highest" is `xhigh`.** The reasoning options reported for Claude Fable 5.2 are `low`, `medium`, `high`, `xhigh` and `max`, which makes `xhigh` the second-highest. The orchestrator checks that `xhigh` is a permitted value and prints the values the API lists, but it cannot tell which value is "second-highest". If the list of options changes, look at this mapping again.
 
-- **API Model ID**: The exact string to pass as `model.id` (e.g., `"claude-fable-5.2-high"` or similar) has not been verified against `GET /v1/models`. The orchestrator must query available models and find the matching ID.
+### What Is Verified and What Is Not
 
-- **API Params**: The mapping from "second-highest reasoning" to actual API parameters (if any) is unknown. Not all models expose reasoning-level parameters. The API may not support ordinal reasoning tiers like "second-highest."
+| Claim | Status | Basis |
+|-------|--------|-------|
+| These model IDs, parameter names and values work in Cursor cloud agents | Reported by the owner | One minimal cloud-agent launch per model, each answering `OK`. They were made through Cursor's agent tooling, which takes parameters as a map such as `{effort: xhigh}`. They were not made through the public REST API. |
+| The `model` field has the shape shown above | Taken from the public API documentation | [Create An Agent](https://cursor.com/docs/cloud-agent/api/endpoints): `model.id` is a string and `model.params` is an array of `{id, value}` items. The tool's map `{effort: xhigh}` is therefore written `[{"id": "effort", "value": "xhigh"}]`. |
+| The orchestrator sends exactly that field for each stage | Tested with mocked HTTP | `test_launch_requests_carry_each_stage_model_in_the_documented_rest_shape` |
+| The public `GET /v1/models` lists these IDs, parameter names and values | **Not verified** | No public REST call has been made; no API key was available where this was built. |
+| A launch through the public REST API with these values succeeds | **Not verified** | The orchestrator has launched no agent. |
 
-- **No invented mappings**: This document does not fabricate model IDs or parameter values. Runtime resolution is required.
+The tool and the public REST API may name models or parameters differently. For example, the REST listing could carry the reasoning level in the model ID instead of in a parameter. The check below is what catches such a difference.
 
-### What the Cursor API Actually Supports
+### Check Before Every Launch
 
-According to [Cursor Cloud Agents API documentation](https://cursor.com/docs/cloud-agent/api/endpoints):
+`--dry-run`, `--execute` and `--resume` call `GET /v1/models` before any stage is launched and check, for each stage:
 
-```
-POST /v1/agents
-{
-  "model": {
-    "id": "<model-id-from-GET-/v1/models>",
-    "params": [
-      { "id": "<param-id>", "value": "<param-value>" }
-    ]
-  }
-}
-```
+1. The configured `model_id` is listed, as a model `id` or as one of its `aliases`.
+2. Each configured parameter `id` is among that model's `parameters`.
+3. Each configured `value` is among the permitted `values` of that parameter.
 
-- **`model.id`**: Must be a value returned by `GET /v1/models`
-- **`model.params`**: Optional array of `{id, value}` pairs; valid params come from `GET /v1/models` for the selected model
+If a check fails, validation fails and nothing is launched. The error names the stage and shows what the API lists instead: the listed model IDs, the model's parameter names, or the parameter's permitted values. The orchestrator does not substitute another model, drop a parameter or fall back to the default model. To fix it, change `model_id` and `model_params` for that stage in `config.yaml`, and the table above.
 
-### How to Discover Available Models and Parameters
+`config.yaml` itself is checked first, without the network: `model_params` must be a list of `{id, value}` items with string values, and a stage with `model_params` must have a `model_id`, because the API takes parameters only together with `model.id`.
+
+Limits of this check:
+
+- It does not compare the configured parameters with the model's `variants` (the combinations the API lists as accepted). The API has the final say when the stage is launched; a rejected launch is reported as an error and is not retried with other settings.
+- It has run only against stand-in listings in the tests, not against the live listing.
+
+### Looking at the Live Listing
 
 ```bash
 curl https://api.cursor.com/v1/models -u YOUR_API_KEY:
 ```
 
-Response includes:
-- `id`: The model identifier to pass to `model.id`
-- `parameters`: Per-model parameter definitions with allowed values
-- `variants`: Pre-configured `id`+`params` combinations
-
-**Before first execution:** Run the above command to discover actual model IDs and map them to the requested model names.
-
-### Runtime Model Resolution
-
-The orchestrator should:
-1. Query `GET /v1/models` to get available models
-2. Search for models matching the requested names (e.g., containing "fable", "grok", "gpt-5.6")
-3. If multiple matches exist, prefer variants with reasoning-related parameters matching the requested level
-4. If no match found, fail with a clear error listing available alternatives
-5. Log the resolved `model.id` and `params` for each stage
+Each item has an `id` (the value for `model.id`), optional `aliases`, `parameters` (each with an `id` and its permitted `values`) and `variants`. Leaving `model` out of a launch request makes Cursor use the account's default model; this pipeline sets a model for every stage.
 
 ---
 
@@ -521,11 +515,11 @@ This would require:
 
 2. **Size of the Input Document**: The document's text travels in `prompt.text`, for which the API documentation states no size limit. Whether a long document is accepted has not been tested.
 
-3. **Model ID Resolution**: The requested model names (Claude Fable 5.2, Grok, GPT-5.6) must be mapped to actual `model.id` values from `GET /v1/models`. This mapping is unresolved until runtime validation.
+3. **Model IDs on the Public API**: The configured model IDs come from tool smoke tests. Whether the public `GET /v1/models` lists the same IDs has not been checked; the first `--dry-run` with an API key checks it. See [Model Selection](#model-selection).
 
-4. **Reasoning Level Parameters**: The API may not support ordinal reasoning levels like "second-highest." Need to discover what parameters each model actually exposes and how to map requested levels.
+4. **Reasoning Parameters on the Public API**: The same holds for the parameter names and values (`effort` = `xhigh`, `reasoning_effort` = `low`, `reasoning` = `high`).
 
-5. **Grok Version**: Stage 3 requests "Grok" without a specific version. Need to determine which Grok version is available and appropriate.
+5. **Grok Version**: Stage 3 uses `grok-4.7`, the version named by the owner and used in the smoke test.
 
 6. **Cost Estimation**: Running 4 cloud agents per pipeline execution has cost implications. Need to establish budget controls.
 
@@ -554,13 +548,14 @@ This would require:
 | 2026-11-24 | Cloud Agent | The twelve Stage 3 guardrails are now in `orchestrator/config.yaml` and appended to the Stage 3 prompt at launch. |
 | 2026-11-24 | Cloud Agent | Replaced the pending equilibrium-definition notes with an unfilled template for Yang Lu. The orchestrator refuses to launch Stage 1 while the template is unfilled. |
 | 2026-11-24 | Cloud Agent | The orchestrator now asks for the model setup / equilibrium definition document (`.qmd` or `.tex`) at every new project and sends its text to Stage 1. The fill-in template and its gate are removed; an optional outline remains. |
+| 2026-11-24 | Cloud Agent | Set each stage's model and reasoning parameter in `orchestrator/config.yaml` and recorded the mapping, with what is and is not verified, under Model Selection. |
 
 ---
 
 ## Next Steps
 
 1. **Yang Lu: have the model setup / equilibrium definition document ready** as one self-contained `.qmd` or `.tex` file; the orchestrator asks for its location
-2. **Resolve model IDs** by querying `GET /v1/models` and mapping requested names
+2. **Run `--dry-run` with an API key** to check the configured models against the public `GET /v1/models` listing
 3. **Commit and push repository inputs** the stages need (`reference/`, `data/`)
 4. **Test dry-run** to validate configuration and model availability
 5. **Execute first pipeline run** with close monitoring

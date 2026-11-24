@@ -466,6 +466,8 @@ class Orchestrator:
                     f"Stage '{stage.name}': receives_model_setup_document "
                     f"must be true or false"
                 )
+            
+            errors.extend(self._model_selection_errors(stage=stage))
         
         # The document asked for at project start has to reach the stage
         # that starts the pipeline, or asking for it would have no effect.
@@ -476,6 +478,58 @@ class Orchestrator:
             )
         
         return len(errors) == 0, errors
+    
+    def _model_selection_errors(self, stage: StageConfig) -> list[str]:
+        """Check that a stage's model settings can be written as the API's `model` field.
+
+        The API takes `model.id` (a string) and `model.params` (a list of
+        `{id, value}` items). Whether the API lists these IDs and values is
+        checked separately, by validate_models().
+        """
+        prefix = f"Stage '{stage.name}'"
+        errors = []
+        
+        if stage.model_id is not None and not (
+            isinstance(stage.model_id, str) and stage.model_id.strip()
+        ):
+            errors.append(f"{prefix}: model_id must be a non-empty string or null")
+        
+        params = stage.model_params
+        if not isinstance(params, list):
+            return errors + [f"{prefix}: model_params must be a list of {{id, value}} items"]
+        
+        if params and stage.model_id is None:
+            errors.append(
+                f"{prefix}: model_params is set but model_id is null. The API "
+                f"takes parameters only together with model.id, so they would "
+                f"not be sent"
+            )
+        
+        seen_ids = set()
+        for position, param in enumerate(params, start=1):
+            is_well_formed = (
+                isinstance(param, dict)
+                and set(param) == {"id", "value"}
+                and all(
+                    isinstance(param[key], str) and param[key].strip()
+                    for key in ("id", "value")
+                )
+            )
+            if not is_well_formed:
+                errors.append(
+                    f"{prefix}: model_params item {position} must have exactly "
+                    f"'id' and 'value', both non-empty strings (quote values "
+                    f"such as \"true\")"
+                )
+                continue
+            if param["id"] in seen_ids:
+                errors.append(
+                    f"{prefix}: model_params names the parameter '{param['id']}' "
+                    f"more than once"
+                )
+            seen_ids.add(param["id"])
+        
+        return errors
     
     def select_model_setup_document(self) -> ModelSetupDocument:
         """Ask the user for the model setup document and read it.
@@ -582,12 +636,14 @@ class Orchestrator:
                 is_valid, model = self.api.validate_model(stage.model_id)
                 if not is_valid:
                     errors.append(
-                        f"Stage '{stage.name}': model '{stage.model_id}' not available. "
-                        f"Use GET /v1/models to list available models."
+                        f"Stage '{stage.name}': model '{stage.model_id}' is not "
+                        f"listed by GET /v1/models. Listed model IDs and "
+                        f"aliases: {sorted(available_ids)}"
                     )
                     continue
                 
-                print(f"  Stage '{stage.name}': model '{stage.model_id}' OK")
+                alias_note = "" if model.id == stage.model_id else f" (alias of '{model.id}')"
+                print(f"  Stage '{stage.name}': model '{stage.model_id}' OK{alias_note}")
                 
                 if stage.model_params:
                     params_valid, param_errors = self.api.validate_model_params(
@@ -597,6 +653,17 @@ class Orchestrator:
                     if not params_valid:
                         errors.extend(
                             f"Stage '{stage.name}': {e}" for e in param_errors
+                        )
+                        continue
+                    
+                    permitted = {
+                        definition["id"]: [v["value"] for v in definition.get("values", [])]
+                        for definition in model.parameters
+                    }
+                    for param in stage.model_params:
+                        print(
+                            f"    {param['id']} = {param['value']} OK "
+                            f"(values the API lists: {', '.join(permitted[param['id']])})"
                         )
         
         except CursorAPIError as e:

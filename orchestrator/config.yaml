@@ -52,8 +52,10 @@ api:
 #   - The orchestrator validates model_id against live /v1/models before launch
 #
 # Model parameters:
-#   - Optional params array with {id, value} entries
+#   - Optional params array with {id, value} entries; write both as quoted strings
 #   - Valid params come from GET /v1/models for the selected model
+#   - If a model ID, parameter or value is not listed there, validation fails
+#     and nothing is launched. Nothing is substituted or dropped.
 stages:
   # Stage 1: Equilibrium Derivation
   # Input: The model setup / equilibrium definition document (.qmd or .tex)
@@ -63,10 +65,16 @@ stages:
     display_name: "Equilibrium Derivation"
     description: "Derive theoretical equilibrium conditions from economic models"
     
-    # Model selection - validated against GET /v1/models at runtime
-    # Set to null to use configured default, or specify a model ID
-    model_id: null  # Uses configured default
-    model_params: []
+    # Requested by Yang Lu: Claude Fable 5.2, second-highest reasoning.
+    # The options reported for "effort" are low, medium, high, xhigh, max,
+    # so the second-highest is xhigh. Sent in the launch request as
+    #   "model": {"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "claude-fable-5-2"
+    model_params:
+      - id: "effort"
+        value: "xhigh"
     
     # The orchestrator asks for the location of the model setup /
     # equilibrium definition document every time a new project is started,
@@ -115,8 +123,14 @@ stages:
     description: "Translate equilibrium conditions into algorithmic pseudocode"
     depends_on: "equilibrium_derivation"
     
-    model_id: null
-    model_params: []
+    # Requested by Yang Lu: Claude Fable 5.2, second-highest reasoning
+    # (xhigh; see the note on the first stage).
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "claude-fable-5-2"
+    model_params:
+      - id: "effort"
+        value: "xhigh"
     
     prompt: |
       You are working on the RMB_AI research project for Yang Lu.
@@ -147,8 +161,14 @@ stages:
     description: "Implement pseudocode in Python and generate plots"
     depends_on: "equilibrium_to_pseudocode"
     
-    model_id: null
-    model_params: []
+    # Requested by Yang Lu: Grok, low reasoning. Sent in the launch request as
+    #   "model": {"id": "grok-4.7", "params": [{"id": "reasoning_effort", "value": "low"}]}
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "grok-4.7"
+    model_params:
+      - id: "reasoning_effort"
+        value: "low"
     
     prompt: |
       You are working on the RMB_AI research project for Yang Lu.
@@ -198,8 +218,14 @@ stages:
     description: "Polish research output for academic publication"
     depends_on: "pseudocode_to_implementation"
     
-    model_id: null
-    model_params: []
+    # Requested by Yang Lu: GPT-5.6 Sol, high reasoning. Sent in the launch request as
+    #   "model": {"id": "gpt-5.6-sol", "params": [{"id": "reasoning", "value": "high"}]}
+    # Checked against GET /v1/models before any launch. See "Model
+    # Selection" in docs/pipeline-design.md for what is and is not verified.
+    model_id: "gpt-5.6-sol"
+    model_params:
+      - id: "reasoning"
+        value: "high"
     
     prompt: |
       You are working on the RMB_AI research project for Yang Lu.

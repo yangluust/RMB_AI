@@ -89,13 +89,24 @@ The orchestrator cannot judge whether the document states a correct equilibrium 
 
 ### Model Selection
 
-Models are validated at runtime against `GET /v1/models`. To see available models:
+Each stage sets `model_id` and `model_params`. The orchestrator sends them as the `model` field of the launch request, `{"id": ..., "params": [{"id": ..., "value": ...}]}`.
+
+| Stage | `model_id` | `model_params` |
+|-------|------------|----------------|
+| 1. Equilibrium Derivation | `claude-fable-5-2` | `effort` = `xhigh` |
+| 2. Equilibrium to Pseudocode | `claude-fable-5-2` | `effort` = `xhigh` |
+| 3. Python Implementation | `grok-4.7` | `reasoning_effort` = `low` |
+| 4. Academic Writing | `gpt-5.6-sol` | `reasoning` = `high` |
+
+These values come from tool smoke tests, not from the public REST API. They have **not** been checked against the public `GET /v1/models` listing. Before any launch the orchestrator calls `GET /v1/models` and stops if a model ID, parameter or value is not listed, showing what the API lists instead. It never substitutes another model or drops a parameter. See [Model Selection](../docs/pipeline-design.md#model-selection) in the design document.
+
+To see the listing yourself:
 
 ```bash
 curl https://api.cursor.com/v1/models -u YOUR_API_KEY:
 ```
 
-Set `model_id: null` to use your configured default model.
+Write `model_params` values as quoted strings. A stage with `model_params` must also set `model_id`. Setting `model_id: null` with no `model_params` uses your configured default model.
 
 ## Commands
 

@@ -7,6 +7,7 @@ Run with: python -m pytest test_orchestrator.py -v
 Or simply: python test_orchestrator.py
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ DESIGN_DOC_GUARDRAILS_HEADING = "#### Reproducibility Guardrails (Stage 3)"
 STAGE1_NAME = "equilibrium_derivation"
 STAGE2_NAME = "equilibrium_to_pseudocode"
 STAGE3_NAME = "pseudocode_to_implementation"
+STAGE4_NAME = "academic_writing"
 EXPECTED_GUARDRAIL_COUNT = 12
 
 # Stand-in document text for tests. It is a sentinel, not a model setup or
@@ -120,6 +122,41 @@ MOCK_MODELS_RESPONSE = {
                 {"params": [], "displayName": "GPT 5.6 Sol (High)", "isDefault": True}
             ],
         },
+    ]
+}
+
+
+# The `model` field each stage must send, in the shape the public API docs
+# give for POST /v1/agents: {"id": ..., "params": [{"id": ..., "value": ...}]}.
+EXPECTED_STAGE_MODELS = {
+    STAGE1_NAME: {"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]},
+    STAGE2_NAME: {"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]},
+    STAGE3_NAME: {"id": "grok-4.7", "params": [{"id": "reasoning_effort", "value": "low"}]},
+    STAGE4_NAME: {"id": "gpt-5.6-sol", "params": [{"id": "reasoning", "value": "high"}]},
+}
+
+
+def model_listing_entry(model_id: str, parameter_id: str, values: list[str]) -> dict:
+    return {
+        "id": model_id,
+        "displayName": model_id,
+        "parameters": [{"id": parameter_id, "values": [{"value": value} for value in values]}],
+    }
+
+
+# Stand-in for a GET /v1/models listing that holds the models the committed
+# config asks for. It is NOT a copy of the live listing, which has not been
+# fetched. It holds only the IDs, parameter names and values reported by the
+# owner's tool smoke tests, laid out in the response shape the API docs give.
+MOCK_PIPELINE_MODELS_RESPONSE = {
+    "items": [
+        model_listing_entry(
+            model_id="claude-fable-5-2",
+            parameter_id="effort",
+            values=["low", "medium", "high", "xhigh", "max"],
+        ),
+        model_listing_entry(model_id="grok-4.7", parameter_id="reasoning_effort", values=["low"]),
+        model_listing_entry(model_id="gpt-5.6-sol", parameter_id="reasoning", values=["high"]),
     ]
 }
 
@@ -686,8 +723,13 @@ def test_validate_config_rejects_malformed_guardrails():
 
 def make_launch_mock() -> MockHttpClient:
     """Mock HTTP that accepts an agent launch and reports the run finished."""
+    return make_launch_mock_with_listing(models_listing=MOCK_PIPELINE_MODELS_RESPONSE)
+
+
+def make_launch_mock_with_listing(models_listing: dict) -> MockHttpClient:
+    """Like make_launch_mock, with a given stand-in for the GET /v1/models listing."""
     mock_http = MockHttpClient()
-    mock_http.add_response("GET", "/models", 200, MOCK_MODELS_RESPONSE)
+    mock_http.add_response("GET", "/models", 200, models_listing)
     mock_http.add_response("POST", "/agents", 200, MOCK_CREATE_RESPONSE)
     mock_http.add_response("GET", "/runs/", 200, MOCK_RUN_FINISHED)
     return mock_http
@@ -1108,6 +1150,163 @@ def test_validate_config_requires_the_first_stage_to_receive_the_document():
     ]
     assert real.validate_config() == (True, [])
     print("✓ test_validate_config_requires_the_first_stage_to_receive_the_document passed")
+
+
+def test_committed_config_sets_the_requested_model_for_each_stage():
+    """config.yaml holds the model ID and reasoning parameter requested for each stage."""
+    orchestrator = load_real_orchestrator(mock_http=MockHttpClient(), dry_run=True)
+    configured = {
+        stage.name: {"id": stage.model_id, "params": stage.model_params}
+        for stage in orchestrator.stages
+    }
+    assert configured == EXPECTED_STAGE_MODELS
+    assert orchestrator.validate_config() == (True, [])
+    print("✓ test_committed_config_sets_the_requested_model_for_each_stage passed")
+
+
+def test_launch_requests_carry_each_stage_model_in_the_documented_rest_shape():
+    """Each POST /v1/agents body has model.id and model.params as a list of {id, value}."""
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
+        mock_http = make_launch_mock()
+        orchestrator = load_real_orchestrator(
+            mock_http=mock_http, dry_run=False, ask=answer_with(str(document_path)),
+        )
+        orchestrator.start_new_project()
+        orchestrator.run_pipeline()
+    
+    launch_requests = get_launch_requests(mock_http=mock_http)
+    assert [body["model"] for body in launch_requests] == [
+        EXPECTED_STAGE_MODELS[name]
+        for name in (STAGE1_NAME, STAGE2_NAME, STAGE3_NAME, STAGE4_NAME)
+    ]
+    assert json.dumps(launch_requests[0]["model"]) == (
+        '{"id": "claude-fable-5-2", "params": [{"id": "effort", "value": "xhigh"}]}'
+    )
+    assert MODEL_SETUP_HEADING in launch_requests[0]["prompt"]["text"]
+    assert GUARDRAILS_HEADING in launch_requests[2]["prompt"]["text"]
+    print("✓ test_launch_requests_carry_each_stage_model_in_the_documented_rest_shape passed")
+
+
+def test_model_validation_checks_configured_models_against_the_models_listing():
+    """An ID, parameter or value the listing lacks fails validation, and nothing is launched."""
+    def validate(models_listing: dict) -> tuple[bool, list[str]]:
+        mock_http = make_launch_mock_with_listing(models_listing=models_listing)
+        orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
+        outcome = orchestrator.validate_models()
+        assert get_launch_requests(mock_http=mock_http) == []
+        return outcome
+    
+    def listing_with(model_id: str, replacement: dict) -> dict:
+        listing = copy.deepcopy(MOCK_PIPELINE_MODELS_RESPONSE)
+        listing["items"] = [
+            replacement if item["id"] == model_id else item for item in listing["items"]
+        ]
+        return listing
+    
+    assert validate(models_listing=MOCK_PIPELINE_MODELS_RESPONSE) == (True, [])
+    
+    is_valid, errors = validate(models_listing=listing_with(
+        model_id="claude-fable-5-2",
+        replacement=model_listing_entry(
+            model_id="claude-fable-5-2",
+            parameter_id="effort",
+            values=["low", "medium", "high", "max"],
+        ),
+    ))
+    assert not is_valid
+    assert [STAGE1_NAME in errors[0], STAGE2_NAME in errors[1], len(errors)] == [True, True, 2]
+    assert "Value 'xhigh' is not permitted for parameter 'effort'" in errors[0]
+    assert "Permitted values: ['low', 'medium', 'high', 'max']" in errors[0]
+    
+    is_valid, errors = validate(models_listing=listing_with(
+        model_id="grok-4.7",
+        replacement=model_listing_entry(
+            model_id="grok-4.7", parameter_id="effort", values=["low"],
+        ),
+    ))
+    assert not is_valid and len(errors) == 1
+    assert STAGE3_NAME in errors[0]
+    assert "Parameter 'reasoning_effort' is not listed for model 'grok-4.7'" in errors[0]
+    assert "Parameters listed for this model: ['effort']" in errors[0]
+    
+    is_valid, errors = validate(models_listing=listing_with(
+        model_id="gpt-5.6-sol",
+        replacement=model_listing_entry(
+            model_id="gpt-5.6-sol", parameter_id="reasoning", values=[],
+        ),
+    ))
+    assert not is_valid and len(errors) == 1
+    assert "Value 'high' is not permitted" in errors[0] and "Permitted values: []" in errors[0]
+    
+    reasoning_in_the_id = listing_with(
+        model_id="gpt-5.6-sol",
+        replacement={"id": "gpt-5.6-sol-high", "displayName": "gpt-5.6-sol-high"},
+    )
+    is_valid, errors = validate(models_listing=reasoning_in_the_id)
+    assert not is_valid and len(errors) == 1
+    assert STAGE4_NAME in errors[0]
+    assert "model 'gpt-5.6-sol' is not listed by GET /v1/models" in errors[0]
+    assert "'gpt-5.6-sol-high'" in errors[0], "The error must show what the API lists"
+    
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
+        manifest_path = Path(tmp) / "project_manifest.json"
+        mock_http = make_launch_mock_with_listing(models_listing=reasoning_in_the_id)
+        exit_code = main(
+            argv=["--execute", "--config", str(REAL_CONFIG_PATH), "--output", str(manifest_path)],
+            api_client=CursorAPIClient(api_key="test-key", http_client=mock_http),
+            ask=answer_with(str(document_path)),
+        )
+        assert exit_code == 1
+        assert get_launch_requests(mock_http=mock_http) == []
+        assert not manifest_path.exists()
+    print("✓ test_model_validation_checks_configured_models_against_the_models_listing passed")
+
+
+def test_validate_config_rejects_model_settings_the_api_field_cannot_carry():
+    """model_params must be a list of {id, value} strings, and needs a model_id."""
+    def validate(model_settings: dict) -> tuple[bool, list[str]]:
+        config = {
+            "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
+            "stages": [{
+                "name": "s1",
+                "prompt": "test",
+                "receives_model_setup_document": True,
+                **model_settings,
+            }],
+        }
+        return Orchestrator(config=config, dry_run=True).validate_config()
+    
+    effort = {"id": "effort", "value": "xhigh"}
+    assert validate({"model_id": "some-model", "model_params": [effort]}) == (True, [])
+    assert validate({"model_id": None, "model_params": []}) == (True, [])
+    
+    rejected = [
+        ({"model_id": None, "model_params": [effort]}, "model_id is null"),
+        ({"model_id": "", "model_params": []}, "model_id must be"),
+        ({"model_id": "some-model", "model_params": {"effort": "xhigh"}}, "must be a list"),
+        ({"model_id": "some-model", "model_params": [{"effort": "xhigh"}]}, "item 1"),
+        ({"model_id": "some-model", "model_params": [{"id": "fast", "value": True}]}, "item 1"),
+        ({"model_id": "some-model", "model_params": [effort, {"id": "effort", "value": "low"}]},
+         "more than once"),
+    ]
+    for model_settings, expected_message_part in rejected:
+        is_valid, errors = validate(model_settings)
+        assert not is_valid, model_settings
+        assert len(errors) == 1 and expected_message_part in errors[0], errors
+    print("✓ test_validate_config_rejects_model_settings_the_api_field_cannot_carry passed")
+
+
+def test_design_doc_records_the_configured_model_for_each_stage():
+    """The design doc shows, for every stage, the `model` field config.yaml produces."""
+    doc_text = DESIGN_DOC_PATH.read_text(encoding="utf-8")
+    orchestrator = load_real_orchestrator(mock_http=MockHttpClient(), dry_run=True)
+    for stage in orchestrator.stages:
+        rest_model = json.dumps({"id": stage.model_id, "params": stage.model_params})
+        assert doc_text.count(f"`{rest_model}`") >= 1, f"{stage.name}: {rest_model} not in doc"
+    assert doc_text.count(f"`{json.dumps(EXPECTED_STAGE_MODELS[STAGE1_NAME])}`") >= 2
+    print("✓ test_design_doc_records_the_configured_model_for_each_stage passed")
 
 
 def run_all_tests():
