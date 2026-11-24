@@ -1,207 +1,183 @@
 # Research Pipeline Orchestrator
 
-Local Windows orchestrator for running a multi-stage research pipeline on Cursor Cloud Agents.
+Local Windows orchestrator that runs a four-stage research pipeline on Cursor Cloud Agents: (1) derive the equilibrium as implementable mathematical conditions, (2) translate them to pseudocode, (3) translate the pseudocode to Python code, (4) propose a parameter domain and run approved batches of configurations. All four stages write into one working document, [`docs/equilibrium-working-document.md`](../docs/equilibrium-working-document.md).
 
-## Overview
+**Status.** Tested offline only: against stand-ins for the Cursor API, GitHub and the chat host, and (for the local checkout) against throw-away Git repositories on Linux. Nothing has run against the live API or on Windows, and no agent has been launched by it. **The chat host that posts notices and returns the owner's decisions is outside this repository and does not exist yet** (see [Notices and Decisions](#notices-and-decisions)); until it does, every round stops at `NOTICE_PENDING`.
 
-This orchestrator:
-- Calls the **Cursor Public Cloud Agents API** to run each pipeline stage, one cloud agent per stage
-- Sets a **model per stage** and checks it against `GET /v1/models` before any launch
-- **Asks for the model setup / equilibrium definition document** (`.qmd` or `.tex`) at every new project, before anything is launched
-- Starts each stage from an **exact commit**: the project's source commit, then the commit that passed the previous stage's output check
-- **Checks each stage's output** (required files at the pushed commit), **downloads artifacts**, and can **pause for review** before the next stage
-- Records every step in a **manifest file**, so a project can be resumed without launching any agent twice
-- Launches agents only with `--execute` or `--resume`
+## How a Stage Runs
 
-**Status:** tested against stand-ins for the Cursor API and GitHub only. No agent has been launched and nothing has run against the live API. See [What Has and Has Not Been Tested](../docs/pipeline-design.md#what-has-and-has-not-been-tested).
+A stage runs in **rounds**. Each round is counted, before any work, against the stage's hard limit (`iteration.max_rounds`: 4, 3, 4, 6 for Stages 1 to 4). The limit is not reset by a redo or a resume; only the owner's `raise_limit` decision raises it.
+
+1. **Launch** one agent from an exact commit (three launches with [cross-model review](#cross-model-review)). The agent's ID is recorded before the request, so a resume never launches it twice. A failed launch or run ends the round; nothing is relaunched automatically.
+2. **Check** the pushed commit: required files, working-document rules, unchanged source document, changed paths, the trial log, and the stage's [evidence file](#evidence).
+3. **Close the round**, then either start one more round of the same stage (only with `autonomous_fix: true`, see below) or go to the gate.
+4. **Gate**: check the output commit out in the local checkout, write a signed notice, wait for the host's signed ack. Only then is the round `AWAITING_REVIEW`.
+5. **Decision** of the owner, signed and bound to that notice, round, commit and config. Nothing else moves the project on.
+
+Accepting a round launches nothing. The next stage starts only on a separate `start_stage` decision. No stage is skipped and no gate can be switched off.
+
+**The checks are checks of form and cross-references.** Evidence files are statements of the model that wrote them. A passed check is not a proof that the mathematics, the code or a number is right; that is what the owner's review is for.
 
 ## Quick Start (Windows)
 
 ```powershell
-# 1. Set your API key
-$env:CURSOR_API_KEY = "your-api-key-from-cursor-dashboard"
-
-# 2. Navigate to repository
+$env:CURSOR_API_KEY = "your-api-key"
+$env:RMB_REVIEW_BRIDGE_SECRET = "the secret shared with the chat host"   # 16+ characters, never in a file
 cd D:\RMB_AI
 
-# 3. Offline check (asks for the model setup document; no network, launches nothing)
-python orchestrator/orchestrator.py --dry-run
-
-# 4. Online check (API key, models, repository access; launches nothing)
-python orchestrator/orchestrator.py --check-online
-
-# 5. Start a new project (asks for the model setup document, then launches paid cloud agents)
-python orchestrator/orchestrator.py --execute
-
-# 6. After reviewing a stage's output: approve it and go on to the next stage
-python orchestrator/orchestrator.py --resume pipeline_manifest.json --approve equilibrium_derivation
+python orchestrator/orchestrator.py --dry-run        # offline; asks for the document; launches nothing
+python orchestrator/orchestrator.py --check-online   # API key, models, GitHub, local checkout, secret; launches nothing
+python orchestrator/orchestrator.py --execute        # new project: asks for the document, runs round 1 of Stage 1
+python orchestrator/orchestrator.py --resume pipeline_manifest.json                                # go on from the record
+python orchestrator/orchestrator.py --resume pipeline_manifest.json --apply-decision <file.decision.json>
 ```
 
-Steps 3 and 5 each ask:
-
-```
-Location of the model setup / equilibrium definition document for this project (.qmd or .tex):
-```
-
-Type the path of your file, for example `D:\Research\my_model\setup.qmd`.
-
-With the committed configuration, step 5 runs Stage 1 and then pauses for review (exit code `2`). Each `--approve` launches the next stage.
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `config.yaml` | Pipeline and stage configuration |
-| `orchestrator.py` | Main orchestrator script |
-| `api_client.py` | Cursor Cloud Agents API client and read-only GitHub reader |
-| `test_orchestrator.py` | Tests (stand-in services, no network) |
-| `README.md` | This file |
-
-## Configuration
-
-Edit `config.yaml` to customize:
-
-```yaml
-stages:
-  - name: "my_stage"
-    display_name: "My Stage"
-    model_id: "composer-2"      # From GET /v1/models, or null for default
-    model_params:               # Optional, model-specific params
-      - id: "fast"
-        value: "true"
-    prompt: |
-      Your task prompt here...
-    guardrails:                 # Optional, appended to the prompt at launch
-      - "A rule the agent must follow."
-    receives_model_setup_document: true  # Required on the first stage, see below
-    output_manifest:
-      required_files:           # Must exist at the commit the agent pushed
-        - "outputs/my_stage/result.txt"
-    manual_review: true         # Pause after this stage until it is approved
-```
-
-Other settings: `pipeline.repository` (a github.com URL and the starting ref), `api.polling`, `api.retries` (required), `artifacts`, `execution.auto_create_pr` and `manifest.output_file`. Each is explained in `config.yaml`.
-
-### Guardrails
-
-A stage may list `guardrails`. When the orchestrator launches that stage it appends the list, numbered, to the stage prompt, so the agent receives the guardrails in the launch request.
-
-Stage 3 (`pseudocode_to_implementation`) carries the twelve reproducibility guardrails from [`docs/pipeline-design.md`](../docs/pipeline-design.md#reproducibility-guardrails-stage-3). The tests fail if the list in `config.yaml` differs from the list in the design document, so edit both together.
-
-### Model Setup Document (Asked at Every New Project)
-
-Every new project starts by asking for the location of the model setup / equilibrium definition document. This is mandatory: there is no setting, flag or environment variable that supplies the location, and an earlier project's document is never reused.
-
-- The file must exist, be a `.qmd` or `.tex` file, hold non-empty UTF-8 text, and be self-contained (no `\input`, `\include` or Quarto `{{< include >}}` of other files).
-- If the answer is blank or unusable, or no answer can be read (for example under a scheduler), the run stops with an error and nothing is launched.
-- The file is only read. It is not changed, moved, copied or committed.
-- The first stage must set `receives_model_setup_document: true`. At launch the orchestrator appends the document's full text to that stage's prompt. The cloud agent cannot open a path on your machine, so the text is sent and the path is not.
-- The project manifest records the file's path, size and SHA-256 hash (not its text). `--resume` re-reads the same file without asking, if a stage that receives it may still be launched, and stops if it is missing or has changed.
-- `--execute` refuses to start if the manifest file already exists. Use `--resume` to continue that project, or `--output other_manifest.json` to start another one.
-
-The orchestrator cannot judge whether the document states a correct equilibrium definition. See [Project Input](../docs/pipeline-design.md#project-input-model-setup-and-equilibrium-definition-document) in the design document for the details and limits.
-
-### Model Selection
-
-Each stage sets `model_id` and `model_params`. The orchestrator sends them as the `model` field of the launch request, `{"id": ..., "params": [{"id": ..., "value": ...}]}`.
-
-| Stage | `model_id` | `model_params` |
-|-------|------------|----------------|
-| 1. Equilibrium Derivation | `claude-fable-5-2` | `effort` = `xhigh` |
-| 2. Equilibrium to Pseudocode | `claude-fable-5-2` | `effort` = `xhigh` |
-| 3. Python Implementation | `grok-4.7` | `reasoning_effort` = `low` |
-| 4. Academic Writing | `gpt-5.6-sol` | `reasoning` = `high` |
-
-These values come from tool smoke tests, not from the public REST API. They have **not** been checked against the public `GET /v1/models` listing. Before any launch (and in `--check-online`) the orchestrator calls `GET /v1/models` and stops if a model ID, parameter or value is not listed, showing what the API lists instead. It never substitutes another model or drops a parameter. See [Model Selection](../docs/pipeline-design.md#model-selection) in the design document.
-
-To see the listing yourself:
-
-```bash
-curl https://api.cursor.com/v1/models -u YOUR_API_KEY:
-```
-
-Write `model_params` values as quoted strings. A stage with `model_params` must also set `model_id`. Setting `model_id: null` with no `model_params` uses your configured default model.
+`--dry-run` and `--execute` ask for the model setup document; answer with `D:\RMB_AI\docs\intervention-incomplete-information-source.md`. Run from a checkout with no uncommitted changes to tracked files, whose orchestrator files are those of the commit the project works on.
 
 ## Commands
 
-| Command | Network | Can launch | Description |
-|---------|---------|------------|-------------|
-| `--dry-run` | No | No | Check the config, ask for the model setup document, print what each stage would do. Needs no API key. Saves nothing. |
-| `--check-online` | Yes | No | Check the API key, the models (`GET /v1/models`) and that the starting ref can be read on GitHub. |
-| `--execute` | Yes | Yes | Start a new project: ask for the document, run the online checks, then run the stages. |
-| `--resume MANIFEST` | Yes | Yes | Continue an existing project. Does not ask. Never launches a second agent for a stage that already has one. |
-| `--resume MANIFEST --approve STAGE` | Yes | Yes | Approve a stage that is paused for review, then go on to the next stage. |
-| `... --approve STAGE --approve-commit SHA` | Yes | Yes | Approve a commit pushed to the stage's branch after the output check. |
-| `--resume MANIFEST --rerun-stage STAGE` | Yes | Yes | Launch a **new paid agent** for a stage that failed or whose output is rejected at review. |
-| `--config path/to/config.yaml` | | | Use another config file. |
-| `--output path/to/manifest.json` | | | Manifest file for a new project (default `pipeline_manifest.json`). Not allowed with `--resume`. |
+| Command | Can launch | What it does |
+|---------|------------|--------------|
+| `--dry-run` | No | Offline. Checks the config, asks for the document, builds every prompt. Saves nothing. |
+| `--check-online` | No | Checks the API key, the models (`GET /v1/models`, the second model of an enabled cross-model review included), the starting ref, the committed source document, the local checkout and the bridge secret. |
+| `--execute` | Yes | Starts a new project and runs the first stage's first round to its gate. |
+| `--resume M` | Yes | Continues from the manifest. Never repeats a recorded launch, never starts a stage, never passes a gate. |
+| `--resume M --apply-decision F` | Yes | Applies one signed decision of the owner (table below). |
+| `--adopt STAGE --adopt-branch B --adopt-commit SHA --adopt-input-commit SHA [--adopt-content-commit SHA]` | No | [Adoption](#adoption): registers existing work as round 1 of a stage. Alone: new project, first stage. With `--resume M`: the next stage. |
+| `--resume M --halt REASON` / `--unhalt` | No | Halts the project (no launch, no decision applied) / ends the halt. |
+| `--resume M --repin` | No | Records a changed config for the project. Open notices are written again and must be answered again. Refused while a round is under way. |
+| `--config F`, `--output F` | | Another config file; the manifest file of a new project. |
 
-Exit codes: `0` every stage complete (or a check passed), `2` paused for review, `1` anything else.
+Exit codes: `0` all stages accepted (or a check passed), `2` waiting for the owner, `3` a notice waits for the host's ack, `1` anything else.
 
-## What Happens in a Stage
+Removed: `--approve`, `--approve-commit`, `--revise`, `--feedback`, `--revise-commit`, `--rerun-stage`. A console command is no longer a decision.
 
-1. **Launch.** The orchestrator chooses the agent's ID, writes it to the manifest, then sends the launch request with `startingRef` set to an exact commit.
-2. **Wait.** It polls the run until it ends.
-3. **Output check.** It reads the head commit of the branch the agent pushed and requires a new commit that holds every file in `required_files`. That commit becomes the stage's output and the next stage's starting point.
-4. **Artifacts.** If `artifacts.collect` is `true`, it downloads the agent's artifacts to `collected_artifacts/<manifest name>/<stage>/attempt_<n>/`. Unsafe paths are refused and recorded.
-5. **Review.** If the stage has `manual_review: true`, the pipeline stops until the stage is approved.
+## Decisions
 
-The commits and required files are read through the GitHub REST API (read-only). `yangluust/RMB_AI` is public, so no token is needed; for a private repository set `GITHUB_TOKEN`.
+| Decision | Allowed when | Effect |
+|----------|--------------|--------|
+| `accept` | The round passed every check, has no open item, the reviewer (if any) accepted, and the branch has not moved | Stage accepted. Launches nothing. |
+| `start_stage` | Answers the acceptance notice of the stage before | Counts and launches round 1 of the next stage. |
+| `iterate` (`feedback`, optional `base_commit`, `approve_batch`) | The round has an output commit and the limit is not reached | New round from the reviewed commit (or a commit the owner pushed to its branch), with the feedback. `approve_batch: true` approves the Stage 4 batch that the round proposed. |
+| `redo` | The limit is not reached | New round from the stage's input. |
+| `raise_limit` (`by`) | The limit is reached | Raises the stage's limit for this project. Launches nothing. |
+| `halt` (`reason`) | At every round's gate | Halts the project until `--unhalt`; the round is then announced again. |
 
-In the committed `config.yaml`, Stages 1 to 3 pause for review. This was chosen when the feature was built; change `manual_review` per stage if you want other review points.
+A round that failed a check, has an open owner item, or ended in disagreement cannot be accepted.
 
-## After a Stop
+## Notices and Decisions
 
-The summary printed at the end names each stage's status and the command that continues it.
+The orchestrator holds no chat or mail credentials and sends nothing. It writes files (`review_bridge.py`), next to the manifest:
 
-| Status | Meaning | To continue |
-|--------|---------|-------------|
-| `AWAITING_REVIEW` | Output checked; waiting for you | `--resume M --approve STAGE` (or `--rerun-stage STAGE` to reject) |
-| `LAUNCHING` | Not known whether the agent was created | `--resume M` (looks the agent up first; never creates a second one) |
-| `LAUNCH_REJECTED` | The API refused the launch; no agent exists | Fix the cause, then `--resume M` |
-| `RUNNING` | The run had not ended when polling stopped | `--resume M` (waits for the same run) |
-| `RUN_FAILED` | The run ended with an error | `--resume M --rerun-stage STAGE` (new paid agent) |
-| `GATE_FAILED` | A required file is missing, or nothing was pushed | `--resume M` checks again; or `--rerun-stage STAGE` |
-| `ARTIFACTS_FAILED` | Artifacts could not be downloaded | `--resume M` (downloads again) |
+```
+review_bridge/<manifest name>/outbox/<event_id>.json             signed notice (orchestrator)
+review_bridge/<manifest name>/inbox/<event_id>.ack.json          signed ack (host, after posting in the main chat)
+review_bridge/<manifest name>/inbox/<decision_id>.decision.json  signed decision (host, from the owner's written message)
+```
 
-A plain `--resume` never launches a second agent for a stage. Only `--rerun-stage` does. Details: [Failure Handling and Resume](../docs/pipeline-design.md#failure-handling-and-resume).
+- Records are signed with HMAC-SHA256 using the secret in the environment variable named by `review.delivery.secret_env`. The secret is never written in the config.
+- A notice names the project, stage, round, stop reason, the commits, the checks' result, the local and GitHub paths of the output and the trial log, and the decisions it allows, each with a token.
+- No valid ack: the round stays `NOTICE_PENDING`. Console output is never delivery.
+- A decision is applied only if its signature, token, notice ID and notice content hash, project, round, commit and config hash all match the open notice. The same decision again does nothing; anything else is refused.
+- Before a notice is written, the output commit must be verified in the local checkout. A dirty, diverged or wrong-remote checkout, or another orchestrator version at that commit, leaves the round `LOCAL_SYNC_PENDING` with no notice.
 
-## Important: Repository Snapshots
+**The host is not part of this repository.** It must: verify each notice, deduplicate by ID *and* content hash, post it in the main chat, write the ack, and turn the owner's written reply into a decision file. `build_ack`, `build_decision` and `HostReceiver` in `review_bridge.py` are its reference; the tests use them as an offline stand-in (`FakeHost`). Anyone who holds the secret can sign a decision, so the secret belongs to the host and the owner only.
 
-**Cloud agents execute against committed code on GitHub, not your local working directory.**
+## Configuration
 
-The model setup document is the exception: the orchestrator reads it from your machine and sends its text in the Stage 1 launch request, so it does not have to be committed.
+Per stage, in `config.yaml` (stage models are unchanged):
 
-Before running:
-1. Commit your input data: `git add . && git commit -m "Add inputs"`
-2. Push to GitHub: `git push origin main`
-3. Then run the orchestrator
+```yaml
+iteration:
+  max_rounds: 4            # hard limit; required
+  autonomous_fix: false    # default
+verification:
+  kind: "equilibrium_audit"                      # or traceability, test_map, parameter_batches
+  evidence_file: "outputs/stage1_audit/audit.json"
+cross_model:
+  enabled: false           # default
+  secondary_model_id: null
+  secondary_model_params: []
+  pass_policy: "both_agree"          # or reviewer_accept
+  on_disagreement: "human_review"    # or revise_next_round
+  review_dir: "outputs/stage1_review"
+output_manifest:
+  required_files: [...]
+  allowed_paths: [...]     # with the working document, the evidence, the review folder and the trial log: all a round may change
+```
 
-Local uncommitted changes are **invisible** to cloud agents.
+Top level: `trial_log.path` (`docs/pipeline-trial-log.md`) and `review.delivery` (`directory`, `secret_env`). The rest (`pipeline.repository`, `working_document`, `review.local_checkout`, `api`, `artifacts`) is explained in `config.yaml`. The model setup document, the working-document rules, the Stage 3 guardrails and the model check are described in [`docs/pipeline-design.md`](../docs/pipeline-design.md).
 
-When a project is started, the orchestrator records the commit that `starting_ref` points at. Stage 1 starts from that commit, even if the branch moves later.
+### Autonomous fix
+
+`autonomous_fix: false` (default): every round goes to the gate. `true`: after a round whose checks failed, the orchestrator starts a correction round of the same stage by itself, until a round passes with no open item, the limit is reached, or the stage reports `no_plausible_alternative`. Then the gate, always. It never starts another stage, never repeats a failed launch, and stops at once for an item only the owner can decide. The correction prompt forbids inventing assumptions, changing the model and weakening checks. Not allowed for Stage 4, where every batch needs the owner's approval.
+
+### Cross-model review
+
+Off in every stage; no second model is configured. When enabled (two different models required), a round is one counted iteration with three launches:
+
+1. **Propose**: the proposer writes the candidate.
+2. **Blind assessment**: the reviewer starts from the round's input commit with the same task and criteria, is not shown the candidate, and commits only `review_dir/round_NN/blind_assessment.md`.
+3. **Comparison**: launched from the blind assessment's commit, merges the exact candidate commit unchanged and writes `comparison.json` (accept or reject, agree or disagree, blocking differences).
+
+`both_agree` needs acceptance and agreement; `reviewer_accept` needs acceptance. Both need every stage check. The verdict is bound to the candidate's file hashes; a later commit on the branch cannot be accepted. On disagreement: `human_review` goes to the gate; `revise_next_round` (needs `autonomous_fix: true`) starts the next counted round with a reconciliation prompt. The two models change roles every round. Two models are not statistically independent.
+
+Illustration only, not active configuration: `secondary_model_id: "<a model ID from GET /v1/models>"`, `secondary_model_params: [{id: "<parameter>", value: "<value>"}]`.
+
+### Evidence
+
+| Stage | `kind` | The evidence file must show |
+|-------|--------|-----------------------------|
+| 1 | `equilibrium_audit` | Every `\tag{}` equation of the section audited with its source, exact or first-order status and check result; as many residuals as unknowns; closures (open, or closed by a recorded decision of the owner); exact-versus-first-order consistency; the symbolic check script and log |
+| 2 | `traceability` | Every Stage 1 condition and unknown mapped to a step, every step to a condition; solve blocks with equal counts; open choices |
+| 3 | `test_map` | Every pseudocode step mapped to functions and tests that exist in the code; named tolerances read from configuration; residual and admissibility checks; the saved test output with no failure |
+| 4 | `parameter_batches` | Round 1: a domain proposal only, nothing computed, cannot be accepted. Later rounds: one batch the owner approved (`iterate` with `approve_batch`), at most 25 configurations inside the approved domain, every run counted and classified |
+
+Stage 4 classifies every run: `admissible`, `inadmissible` (names the violated condition), `numerical_failure` (names the reason) or `outside_domain` (counted, no result). A numerical failure is not evidence of a boundary. A boundary claim must name admissible and inadmissible runs and runs that reproduce it, and carries the status `evidence_not_proof`: it is not a proof that no equilibrium exists. An open item is reported to the owner and blocks acceptance; a stage cannot close it itself.
+
+## Trial Log
+
+- **Journal** (`<manifest name>.trial-journal.jsonl`, local): written and flushed by the orchestrator before each next step: round counted, launch, check, failure, round closed (result, KEEP / ABANDON / UNRESOLVED, rationale, next route), notice acknowledged, decision, adoption, halt, repin. It does not depend on model output. Events have stable IDs; a repeated step adds nothing. If it cannot be written, nothing further is done.
+- **Repository log** ([`docs/pipeline-trial-log.md`](../docs/pipeline-trial-log.md)): each launched agent appends the journal entries not yet in it, word for word, and one entry of its own. The output check fails if the file was changed, entries are missing or other entries were added. It holds evidence-based summaries, not private reasoning. It has no entries yet: no stage has run.
+
+## Adoption
+
+For work that is already on a branch, such as the directly written Stage 1:
+
+```powershell
+python orchestrator/orchestrator.py --adopt equilibrium_derivation --adopt-branch <branch> `
+    --adopt-commit <branch head> --adopt-input-commit <commit the work started from> `
+    --adopt-content-commit <commit that holds the stage's files>
+```
+
+The adopted commit must be the branch head and build on the input and content commits; the stage's own files must be identical at the content and adopted commits. It is checked like an agent's candidate, counted as round 1 with origin `adopted`, and recorded with no agent, run or artifact. Missing evidence is a failed check. It then goes to the gate and can only become `AWAITING_REVIEW`; adoption accepts nothing and is never followed by an automatic round. A refused adoption saves nothing. **Nothing has been adopted.**
+
+## Manifest
+
+Format version 4; older manifests are refused, not converted. It records the project ID, the config and code hashes (`provenance`), every round (`stages`, `previous_rounds`) with its launches, prompts' hashes, commits, checks, notice, ack and decision. On resume each status is checked against the signed records that must have led to it, so a hand-written manifest cannot stand in for a launch, a notice or a decision. A changed config is refused until `--repin`. The hashes of the orchestrator's files are recorded with the project; the local checkout refuses an output commit that holds another orchestrator version than the one running.
+
+## Statuses
+
+| Status | Meaning | A plain `--resume M` |
+|--------|---------|----------------------|
+| `BLOCKED` | Nothing launched (local checkout or bridge not ready, no document) | Tries again |
+| `LAUNCHING` / `RUNNING` | Agent may exist / run not ended | Looks the agent up / waits; never a second agent |
+| `RUN_FINISHED` | Output could not be checked yet (GitHub unreadable) | Checks again |
+| `ARTIFACTS_FAILED` | Artifact download failed | Downloads again |
+| `LOCAL_SYNC_PENDING` | Output not in the local checkout; no notice written | Tries the checkout again |
+| `NOTICE_PENDING` | Notice written, no ack from the host | Looks for the ack |
+| `AWAITING_REVIEW` | Notice acknowledged; waiting for a decision | Nothing |
+| `COMPLETE` | Accepted by the owner | Nothing; the next stage needs `start_stage` |
 
 ## Tests
-
-Run the tests. They use stand-ins for the Cursor API, GitHub and the download host, make no network call and launch nothing:
 
 ```powershell
 python orchestrator/test_orchestrator.py
 ```
 
-Or with pytest:
-
-```powershell
-python -m pytest orchestrator/test_orchestrator.py -v
-```
+Offline: stand-ins for the Cursor API, GitHub, the download host and the chat host; real Git only on throw-away repositories. The stand-in agents write files of the required form with no content: no test derives, programs or computes anything of the model. What is and is not tested: [design document](../docs/pipeline-design.md#what-has-and-has-not-been-tested).
 
 ## Official Documentation
 
-- [Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints)
-- [API Authentication](https://cursor.com/docs/api)
-- [OpenAPI Spec](https://cursor.com/docs-static/cloud-agents-openapi.yaml)
-- GitHub REST API: [get a reference](https://docs.github.com/en/rest/git/refs#get-a-reference), [get a commit object](https://docs.github.com/en/rest/git/commits#get-a-commit-object), [get repository content](https://docs.github.com/en/rest/repos/contents#get-repository-content)
-
-## Design Document
-
-See [`docs/pipeline-design.md`](../docs/pipeline-design.md) for the full design specification.
+- [Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints), [authentication](https://cursor.com/docs/api), [OpenAPI spec](https://cursor.com/docs-static/cloud-agents-openapi.yaml)
+- GitHub REST API: [reference](https://docs.github.com/en/rest/git/refs#get-a-reference), [commit](https://docs.github.com/en/rest/git/commits#get-a-commit-object), [content](https://docs.github.com/en/rest/repos/contents#get-repository-content), [compare two commits](https://docs.github.com/en/rest/commits/commits#compare-two-commits)

@@ -1,0 +1,3 @@
+# The original model setup source is kept byte-for-byte (it has CRLF line
+# endings). Git must not convert its line endings on any platform.
+docs/intervention-incomplete-information-source.md -text
