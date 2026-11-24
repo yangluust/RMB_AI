@@ -25,59 +25,72 @@ The original design specified Grok-only models with specific xAI reasoning tiers
 
 ---
 
-## Equilibrium Definition
+## Project Input: Model Setup and Equilibrium Definition Document
 
-**Not supplied yet.** Yang Lu has not provided the equilibrium definition. The template below is unfilled: every field holds a placeholder for Yang to replace, and nothing in it describes the model or states a definition.
+Each project starts from one document written by Yang Lu: a Quarto Markdown (`.qmd`) or LaTeX (`.tex`) file that states the economic model setup and the equilibrium definition. Stage 1 derives the equilibrium from what that document states. This design document states no equilibrium definition, and the orchestrator never supplies one.
 
-Stage 1 derives the equilibrium according to this definition. The orchestrator reads the template block from this file in the local checkout and appends it to the Stage 1 prompt at launch. While the block is unfilled the orchestrator refuses to launch Stage 1: `--dry-run`, `--execute` and `--resume` all stop with an error that names this file.
+### The Orchestrator Asks for the Document
 
-### How to Fill It In
+Starting a new project with `--execute` always asks this question first:
 
-1. Replace every `TODO(Yang)` placeholder in the template with your own text. Formulas can be written as `$$ ... $$`.
-2. Delete any field that does not apply and add fields you need. The field list is only a suggested layout, not a statement about the model.
-3. Change the status line from `UNFILLED` to `FILLED`.
-4. Commit and push this file, so the repository records the definition that Stage 1 used.
+```
+Location of the model setup / equilibrium definition document for this project (.qmd or .tex):
+```
 
-Keep the two hidden `EQUILIBRIUM_DEFINITION` comment lines around the template; the orchestrator uses them to find the block.
+- The question comes before any request is sent to Cursor. No stage is launched until a usable document has been given.
+- It is asked for every new project. The location is never taken from `config.yaml`, an environment variable or an earlier project.
+- `--dry-run` asks the same question and checks the document, then saves nothing. The `--execute` that follows asks again.
+- `--resume` does not ask. It continues an existing project with the document recorded for that project.
 
-The orchestrator treats the definition as supplied only when the status line reads `**Status:** FILLED`, no `TODO(Yang)` placeholder remains, and the block has content besides the status line. It cannot judge whether that content is a correct or complete definition; that stays with Yang.
+The answer is the path of the file on the local machine, for example `D:\Research\my_model\setup.qmd`. Surrounding quotes are accepted. The start stops with an error, and nothing is launched, in each of these cases:
 
-**Limit:** the orchestrator checks the copy of this file in the local checkout. It does not yet check that the same text is in the repository snapshot the Stage 1 agent runs on, which is why step 4 matters.
+| Case | The error says |
+|------|----------------|
+| No answer can be read (input is closed, as under a scheduler or a pipe) | input ended before an answer was given |
+| The answer is blank | no location was given |
+| The path does not exist | the document does not exist |
+| The path is a folder | the location is not a file |
+| The extension is not `.qmd` or `.tex` | the document must be a `.qmd` or `.tex` file |
+| The file is empty or holds only whitespace | the document is empty |
+| The file is not UTF-8 text | the document is not UTF-8 text |
+| The file pulls in other files (`\input`, `\include`, `\subfile`, `\import`, `\subimport`, or Quarto `{{< include ... >}}`) | the document pulls in other files |
 
-### Definition Template
+There is one attempt per run. After an error, run the command again.
 
-<!-- EQUILIBRIUM_DEFINITION:BEGIN -->
-**Status:** UNFILLED
+### How the Document Reaches the Stage 1 Agent
 
-**1. Equilibrium concept.** The name of the concept and, if there is one, the source it follows.
+The cloud agent cannot open a path on the local machine, and `POST /v1/agents` has no field for uploading an input file. The orchestrator therefore reads the file and puts its full text into `prompt.text` of the Stage 1 launch request. The text comes after the task, between a `----- BEGIN DOCUMENT -----` line and an `----- END DOCUMENT -----` line, together with the file name, format and SHA-256 hash. The local path is not sent.
 
-> TODO(Yang)
+The orchestrator only reads the file. It does not change, move, copy or commit it, and it runs no Git command.
 
-**2. Objects.** The objects that together make up an equilibrium.
+Limits of this handoff:
 
-> TODO(Yang)
+- **One file only.** Only the text of the selected file is sent. That is why a file that pulls in other files is refused; write that text into the file itself. Figures and bibliography files that the document refers to are not sent.
+- **The text goes to Cursor.** It is part of the agent's prompt and is visible in that agent's conversation. Do not put secrets in the document.
+- **Not recorded in Git by the orchestrator.** The repository holds the document only if Yang commits it himself. The project manifest records which file was used (see below).
+- **Size.** The API documentation states no size limit for `prompt.text`, and the orchestrator sets none. A very large document may be rejected by the API; this has not been tested.
+- **Content is not judged.** The orchestrator checks that the file is a readable, non-empty, self-contained `.qmd` or `.tex` file. It cannot tell whether the file states an equilibrium definition, or a correct one. The Stage 1 prompt tells the agent to stop and report what is missing if the document does not state enough, instead of filling the gap itself.
+- **Mocked tests only.** This has been checked against mocked HTTP. No Stage 1 agent has been launched.
 
-**3. Conditions.** The conditions those objects must satisfy, one per line.
+### What the Project Records
 
-> TODO(Yang)
+A project is one `--execute` run and its manifest file (`pipeline_manifest.json` unless `--output` names another file). The manifest is written before the first agent is launched. Under `model_setup_document` it records the file's full local path, format, size in bytes, SHA-256 hash and the time it was selected. The document's text is not stored in the manifest.
 
-**4. Taken as given.** What the definition takes as given from the model setup file.
+`--execute` refuses to start when the manifest file already exists, because a new project would overwrite the earlier project's record. Use `--resume` to continue that project, or `--output` to give the new project its own manifest file.
 
-> TODO(Yang)
+`--resume` reads the document again from the recorded path, without asking, and only if a stage that receives the document still has to run. It stops before launching anything if the manifest records no document, if the file is gone, or if its content no longer matches the recorded hash. To use a changed document, start a new project.
 
-**5. Notation.** How the symbols used above map to the symbols in the model setup file.
+### Optional Outline for the Document
 
-> TODO(Yang)
+Yang decides what the document contains and how it is laid out. The list below is only a reminder of points a derivation usually needs. The orchestrator does not read this list or check the document against it, and nothing in it describes the model.
 
-**6. Restrictions.** Any restriction on which equilibria Stage 1 should consider.
-
-> TODO(Yang)
-
-**7. Required result.** What the Stage 1 derivation must deliver for this definition.
-
-> TODO(Yang)
-
-<!-- EQUILIBRIUM_DEFINITION:END -->
+1. Equilibrium concept: its name and, if there is one, the source it follows.
+2. Objects: the objects that together make up an equilibrium.
+3. Conditions: the conditions those objects must satisfy.
+4. Taken as given: what the definition takes as given from the model setup.
+5. Notation: what each symbol means.
+6. Restrictions: any restriction on which equilibria Stage 1 should consider.
+7. Required result: what the Stage 1 derivation must deliver.
 
 ---
 
@@ -88,14 +101,14 @@ The orchestrator treats the definition as supplied only when the status line rea
 | Attribute | Value |
 |-----------|-------|
 | **Purpose** | Derive theoretical equilibrium conditions from economic model specification |
-| **Input** | QMD (`.qmd`) or LaTeX (`.tex`) file specifying the economic model setup |
-| **Input Location** | To be committed to repository (e.g., `inputs/model_setup.qmd` or `inputs/model_setup.tex`) |
+| **Input** | QMD (`.qmd`) or LaTeX (`.tex`) file stating the economic model setup and the equilibrium definition |
+| **Input Location** | Asked for at the start of every new project; the file's text is sent in the Stage 1 launch request (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document)) |
 | **Output** | LaTeX derivations in `outputs/stage1_derivation/` |
-| **Equilibrium Definition** | Not supplied yet — unfilled template in [Equilibrium Definition](#equilibrium-definition) |
+| **Equilibrium Definition** | Stated in the input document; this design document and the orchestrator supply none |
 | **Requested Model** | **Claude Fable 5.2** |
 | **Requested Reasoning** | **Second-highest** |
 
-**Stage 1 Task:** The agent reads the QMD or LaTeX file containing the economic model setup, understands the model structure, and derives the equilibrium conditions according to the definition in [Equilibrium Definition](#equilibrium-definition). That definition is not supplied yet, and Stage 1 cannot launch until Yang Lu fills in the template there.
+**Stage 1 Task:** The agent receives the text of the input document in its prompt, understands the model structure, and derives the equilibrium using only the setup and the equilibrium definition stated in that document. If the document does not state enough, the agent is told to stop and report what is missing. Stage 1 cannot launch until a usable document has been given for the project; see [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
 
 ### Stage 2: Equilibrium to Pseudocode
 
@@ -258,12 +271,14 @@ The orchestrator should:
 ### Execution Flow
 
 ```
-1. User runs: python orchestrator.py --config config.yaml
+1. User runs: python orchestrator.py --execute
 
-2. Orchestrator validates:
-   - Config file syntax
-   - Model IDs against GET /v1/models (resolve requested names to actual IDs)
-   - API key present in CURSOR_API_KEY env var
+2. Orchestrator, before any stage:
+   - Checks config file syntax
+   - Asks for the model setup / equilibrium definition document (.qmd or
+     .tex) and reads it; stops here if no usable document is given
+   - Checks the API key is present in CURSOR_API_KEY env var
+   - Validates model IDs against GET /v1/models
 
 3. For each stage (sequential):
    a. Check dependencies (prior stage completed)
@@ -298,26 +313,11 @@ This means:
 - You must `git commit` and `git push` before the agent can see your changes
 - Each agent starts from the `starting_ref` (branch or commit) you specify
 
-### Input File Requirements for Stage 1
+### Input Document for Stage 1
 
-Stage 1 requires a QMD or LaTeX file specifying the economic model setup. This file must be:
-1. Committed to the repository before pipeline execution
-2. Located at a known path (configure in `config.yaml`)
-3. Contain the full model specification that the agent will use for derivation
+The model setup / equilibrium definition document is the one input that does not have to be committed. The orchestrator asks for its location when a project is started and sends its text to the Stage 1 agent inside the launch request. See [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
 
-**Example workflow:**
-```bash
-# Create your model specification
-# (file: inputs/model_setup.qmd or inputs/model_setup.tex)
-
-# Commit the input file
-git add inputs/model_setup.qmd
-git commit -m "Add economic model specification for equilibrium derivation"
-git push origin main
-
-# Now run the pipeline
-python orchestrator/orchestrator.py --dry-run
-```
+Everything else the agents read (`reference/`, `data/`, the outputs of earlier stages) comes from the repository snapshot, so it must be committed and pushed.
 
 ### Branch Creation
 
@@ -359,8 +359,8 @@ Before running the pipeline:
 cd D:\RMB_AI
 git status  # Check for uncommitted changes
 
-# 2. Commit any input changes (including model specification)
-git add inputs/ reference/ data/
+# 2. Commit any changes to repository inputs
+git add reference/ data/
 git commit -m "Add input data for pipeline run"
 
 # 3. Push to GitHub
@@ -385,7 +385,7 @@ Before launching each stage:
 2. **Parameter Validation**: Check `model.params` are valid for the model
 3. **Dependency Check**: Prior stage completed successfully
 4. **Input Manifest**: Required input files exist in the starting ref
-5. **Equilibrium Definition**: Stage 1 does not launch while the template in [Equilibrium Definition](#equilibrium-definition) is unfilled
+5. **Model Setup Document**: Stage 1 does not launch unless a usable model setup / equilibrium definition document has been given for the project (see [Project Input](#project-input-model-setup-and-equilibrium-definition-document))
 
 ### Post-Run Validation
 
@@ -421,6 +421,7 @@ The orchestrator can pause for manual review:
 ### Resume Capability
 
 The pipeline manifest (`pipeline_manifest.json`) records:
+- The model setup document selected for the project (path and SHA-256 hash, not its text)
 - Each stage's input commit SHA
 - Each stage's output branch and commit SHA
 - Stage completion status
@@ -433,8 +434,9 @@ python orchestrator.py --config config.yaml --resume pipeline_manifest.json
 
 The orchestrator:
 1. Reads the manifest to find the last successful stage
-2. Skips completed stages
-3. Resumes from the first incomplete stage
+2. If Stage 1 still has to run, re-reads the recorded model setup document without asking, and stops if it is missing or has changed
+3. Skips completed stages
+4. Resumes from the first incomplete stage
 
 ---
 
@@ -469,11 +471,14 @@ $env:CURSOR_API_KEY = "your-api-key-here"
 ```powershell
 cd D:\RMB_AI
 
-# Validate config and models (no network calls to launch agents)
+# Validate (asks for the model setup document; launches nothing)
 python orchestrator/orchestrator.py --dry-run
 
-# Execute pipeline (will launch paid cloud agents)
+# Start a new project (asks for the model setup document, then launches paid cloud agents)
 python orchestrator/orchestrator.py --execute
+
+# Continue an existing project (does not ask; uses the document recorded in the manifest)
+python orchestrator/orchestrator.py --resume pipeline_manifest.json
 ```
 
 ### Optional: Task Scheduler Design
@@ -485,6 +490,8 @@ For automated/scheduled runs, Windows Task Scheduler could:
 2. Pass `--execute` flag only when explicitly configured
 3. Log output to a file for review
 4. Send notifications on completion/failure
+
+A scheduled task cannot start a new project: `--execute` asks for the model setup document and fails when no one can answer. A scheduled task could only `--resume` an existing project.
 
 This would require:
 - Secure storage for `CURSOR_API_KEY`
@@ -501,7 +508,8 @@ This would require:
 
 | Limitation | Impact | Source |
 |------------|--------|--------|
-| No file upload endpoint | Inputs must be committed to repo | [API Docs](https://cursor.com/docs/cloud-agent/api/endpoints) |
+| `POST /v1/agents` has no field for input files | Repository inputs must be committed; the model setup document is sent as prompt text | [API Docs](https://cursor.com/docs/cloud-agent/api/endpoints) |
+| `POST /v1/projects` has a `files` field (beta, being rolled out) | Not used: it belongs to Projects, a different API surface from the per-stage agents here | [API Docs](https://cursor.com/docs/cloud-agent/api/endpoints) |
 | No webhooks in v1 (coming soon) | Must poll for status | [API Docs](https://cursor.com/docs/cloud-agent/api/endpoints) |
 | Agent executes repo snapshot | Local changes invisible | [API Docs](https://cursor.com/docs/cloud-agent/api/endpoints) |
 | One active run per agent | Cannot parallelize within agent | [API Docs](https://cursor.com/docs/cloud-agent/api/endpoints) |
@@ -509,9 +517,9 @@ This would require:
 
 ### Open Questions
 
-1. **Equilibrium Definition**: Not supplied yet. Yang Lu fills in the template in [Equilibrium Definition](#equilibrium-definition); Stage 1 cannot launch until then.
+1. **Equilibrium Definition**: Comes from the input document Yang Lu gives when a project is started. The orchestrator cannot check that the document states one; see the limits in [Project Input](#project-input-model-setup-and-equilibrium-definition-document).
 
-2. **Model Setup File Path**: Stage 1 reads a QMD or LaTeX model setup file, but no path has been supplied and the Stage 1 prompt in `orchestrator/config.yaml` does not name one.
+2. **Size of the Input Document**: The document's text travels in `prompt.text`, for which the API documentation states no size limit. Whether a long document is accepted has not been tested.
 
 3. **Model ID Resolution**: The requested model names (Claude Fable 5.2, Grok, GPT-5.6) must be mapped to actual `model.id` values from `GET /v1/models`. This mapping is unresolved until runtime validation.
 
@@ -545,13 +553,14 @@ This would require:
 | 2026-11-24 | Cloud Agent | Replaced the Stage 3 reproducibility guardrails placeholder with the twelve principles supplied by Yang Lu. Equilibrium definition remains pending. |
 | 2026-11-24 | Cloud Agent | The twelve Stage 3 guardrails are now in `orchestrator/config.yaml` and appended to the Stage 3 prompt at launch. |
 | 2026-11-24 | Cloud Agent | Replaced the pending equilibrium-definition notes with an unfilled template for Yang Lu. The orchestrator refuses to launch Stage 1 while the template is unfilled. |
+| 2026-11-24 | Cloud Agent | The orchestrator now asks for the model setup / equilibrium definition document (`.qmd` or `.tex`) at every new project and sends its text to Stage 1. The fill-in template and its gate are removed; an optional outline remains. |
 
 ---
 
 ## Next Steps
 
-1. **Yang Lu: Fill in the equilibrium definition template** in [Equilibrium Definition](#equilibrium-definition)
+1. **Yang Lu: have the model setup / equilibrium definition document ready** as one self-contained `.qmd` or `.tex` file; the orchestrator asks for its location
 2. **Resolve model IDs** by querying `GET /v1/models` and mapping requested names
-3. **Commit input files** (economic model specification in QMD or LaTeX)
+3. **Commit and push repository inputs** the stages need (`reference/`, `data/`)
 4. **Test dry-run** to validate configuration and model availability
 5. **Execute first pipeline run** with close monitoring

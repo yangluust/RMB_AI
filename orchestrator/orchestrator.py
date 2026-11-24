@@ -6,21 +6,27 @@ Orchestrates a multi-stage research pipeline using the Cursor Cloud Agents API.
 Each stage runs as a separate cloud agent with configurable model selection.
 
 Usage:
-    python orchestrator.py --dry-run              # Validate config, no execution
-    python orchestrator.py --execute              # Run the pipeline
-    python orchestrator.py --resume manifest.json # Resume from last checkpoint
+    python orchestrator.py --dry-run              # Validate, launch nothing
+    python orchestrator.py --execute              # Start a new project
+    python orchestrator.py --resume manifest.json # Continue an existing project
+
+Starting a new project (--execute) always asks for the location of the
+model setup / equilibrium definition document (.qmd or .tex). Nothing is
+launched until a valid document has been given.
 
 Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     import yaml
@@ -43,98 +49,240 @@ class StageConfig:
     depends_on: Optional[str] = None
     output_manifest: dict = field(default_factory=dict)
     guardrails: list[str] = field(default_factory=list)
-    equilibrium_definition_file: Optional[str] = None
+    receives_model_setup_document: bool = False
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 GUARDRAILS_HEADING = "REPRODUCIBILITY GUARDRAILS (follow all of these):"
 
-DEFINITION_HEADING = (
-    "EQUILIBRIUM DEFINITION (supplied by Yang Lu; use exactly this definition):"
+MODEL_SETUP_QUESTION = (
+    "Location of the model setup / equilibrium definition document "
+    "for this project (.qmd or .tex): "
 )
-DEFINITION_BEGIN_MARKER = "<!-- EQUILIBRIUM_DEFINITION:BEGIN -->"
-DEFINITION_END_MARKER = "<!-- EQUILIBRIUM_DEFINITION:END -->"
-DEFINITION_PLACEHOLDER = "TODO(Yang)"
-DEFINITION_FILLED_STATUS_LINE = "**Status:** FILLED"
+MODEL_SETUP_FORMATS = {
+    ".qmd": "Quarto Markdown (.qmd)",
+    ".tex": "LaTeX (.tex)",
+}
+MODEL_SETUP_HEADING = (
+    "MODEL SETUP AND EQUILIBRIUM DEFINITION DOCUMENT "
+    "(supplied by the project owner for this project):"
+)
+MODEL_SETUP_BEGIN_LINE = "----- BEGIN DOCUMENT -----"
+MODEL_SETUP_END_LINE = "----- END DOCUMENT -----"
+
+# Directives that pull the text of another file into the document. Only the
+# selected file's own text is sent to the cloud agent, so a document that
+# uses one of these would reach the agent incomplete.
+TEX_COMMENT_PATTERN = re.compile(r"(?<!\\)%.*$")
+INCLUDE_DIRECTIVE_PATTERNS = {
+    ".tex": re.compile(r"\\(?:input|include|subfile|import|subimport)(?![A-Za-z])"),
+    ".qmd": re.compile(r"\{\{<\s*include\s"),
+}
 
 
-class DefinitionNotSuppliedError(Exception):
-    """The equilibrium definition a stage needs has not been filled in."""
+class ModelSetupDocumentError(Exception):
+    """No usable model setup / equilibrium definition document is available."""
 
 
-def read_equilibrium_definition(path: Path) -> str:
-    """Return the filled-in equilibrium definition block from a document.
+@dataclass
+class ModelSetupDocument:
+    """The document that states the model setup and equilibrium definition.
 
-    The block is the text between the two EQUILIBRIUM_DEFINITION markers.
-    It counts as supplied only when its status line says FILLED, no
-    placeholder remains, and it has content besides the status line.
-    This cannot judge whether the content is a correct definition.
+    `text` is the document's content. It is sent to the cloud agent but is
+    not written to the project manifest; `to_record` gives what is.
+    """
+    path: str
+    format: str
+    size_bytes: int
+    sha256: str
+    text: str = field(repr=False)
+    
+    @property
+    def file_name(self) -> str:
+        return Path(self.path).name
+    
+    def to_record(self) -> dict:
+        return {
+            "path": self.path,
+            "format": self.format,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+
+def find_include_directives(text: str, suffix: str) -> list[str]:
+    """Return the lines of a document that pull in the text of another file."""
+    pattern = INCLUDE_DIRECTIVE_PATTERNS[suffix]
+    found = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        checked = TEX_COMMENT_PATTERN.sub("", line) if suffix == ".tex" else line
+        if pattern.search(checked):
+            found.append(f"line {line_number}: {line.strip()}")
+    return found
+
+
+def load_model_setup_document(location: str) -> ModelSetupDocument:
+    """Read the model setup document at a location given by the user.
+
+    The file is only read. It must exist, be a `.qmd` or `.tex` file, hold
+    UTF-8 text, be non-empty and be self-contained. Whether it states a
+    correct or complete equilibrium definition cannot be checked here.
 
     Raises:
-        DefinitionNotSuppliedError: if the block is missing or unfilled.
+        ModelSetupDocumentError: if the location is blank or the file
+            cannot be used.
     """
+    cleaned = location.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in "\"'":
+        cleaned = cleaned[1:-1].strip()
+    if not cleaned:
+        raise ModelSetupDocumentError(
+            "No location was given for the model setup / equilibrium "
+            "definition document. Give the path of a .qmd or .tex file."
+        )
+    
+    path = Path(cleaned).expanduser()
+    if not path.exists():
+        raise ModelSetupDocumentError(f"The model setup document does not exist: {path}")
     if not path.is_file():
-        raise DefinitionNotSuppliedError(f"Equilibrium definition file not found: {path}")
-    
-    text = path.read_text(encoding="utf-8")
-    for marker in (DEFINITION_BEGIN_MARKER, DEFINITION_END_MARKER):
-        if text.count(marker) != 1:
-            raise DefinitionNotSuppliedError(
-                f"{path} must contain the marker '{marker}' exactly once "
-                f"(found {text.count(marker)})"
-            )
-    
-    begin = text.index(DEFINITION_BEGIN_MARKER) + len(DEFINITION_BEGIN_MARKER)
-    end = text.index(DEFINITION_END_MARKER)
-    if end < begin:
-        raise DefinitionNotSuppliedError(
-            f"{path}: the END marker comes before the BEGIN marker"
+        raise ModelSetupDocumentError(
+            f"The model setup document location is not a file: {path}"
         )
     
-    block = text[begin:end].strip()
-    lines = [line.strip() for line in block.splitlines()]
-    
-    problems = []
-    placeholder_count = block.count(DEFINITION_PLACEHOLDER)
-    if placeholder_count:
-        problems.append(
-            f"{placeholder_count} '{DEFINITION_PLACEHOLDER}' placeholder(s) remain"
+    suffix = path.suffix.lower()
+    if suffix not in MODEL_SETUP_FORMATS:
+        raise ModelSetupDocumentError(
+            f"The model setup document must be a .qmd or .tex file, "
+            f"but this file has the extension '{path.suffix}': {path}"
         )
-    if DEFINITION_FILLED_STATUS_LINE not in lines:
-        problems.append(f"the status line is not '{DEFINITION_FILLED_STATUS_LINE}'")
-    if not any(line and line != DEFINITION_FILLED_STATUS_LINE for line in lines):
-        problems.append("the block has no content besides the status line")
     
-    if problems:
-        raise DefinitionNotSuppliedError(
-            f"Equilibrium definition in {path} is not supplied: " + "; ".join(problems)
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ModelSetupDocumentError(
+            f"The model setup document could not be read: {path} ({error})"
+        ) from error
+    
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ModelSetupDocumentError(
+            f"The model setup document is not UTF-8 text: {path} ({error}). "
+            f"Save it as UTF-8 and start again."
+        ) from error
+    
+    if not text.strip():
+        raise ModelSetupDocumentError(f"The model setup document is empty: {path}")
+    
+    includes = find_include_directives(text=text, suffix=suffix)
+    if includes:
+        raise ModelSetupDocumentError(
+            f"The model setup document pulls in other files, and only the "
+            f"text of this one file is sent to the cloud agent: {path}\n  "
+            + "\n  ".join(includes)
+            + "\nGive a single self-contained file with that text written in."
         )
-    return block
+    
+    return ModelSetupDocument(
+        path=str(path.resolve()),
+        format=suffix.lstrip("."),
+        size_bytes=len(raw),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        text=text,
+    )
+
+
+def ask_for_model_setup_document(ask: Callable[[str], str]) -> ModelSetupDocument:
+    """Ask the user where the model setup document is, and read it.
+
+    Raises:
+        ModelSetupDocumentError: if no answer can be read or the answer
+            does not name a usable document.
+    """
+    try:
+        answer = ask(MODEL_SETUP_QUESTION)
+    except EOFError:
+        raise ModelSetupDocumentError(
+            "The location of the model setup / equilibrium definition "
+            "document was asked for, but input ended before an answer was "
+            "given. Run the orchestrator in an interactive terminal and "
+            "type the location when asked."
+        ) from None
+    return load_model_setup_document(location=answer)
+
+
+def restore_model_setup_document(record: Optional[dict]) -> ModelSetupDocument:
+    """Re-read the document a project recorded, and check it is unchanged.
+
+    Raises:
+        ModelSetupDocumentError: if the project recorded no document, or
+            the recorded file is gone, unusable or has different content.
+    """
+    if not record:
+        raise ModelSetupDocumentError(
+            "This project's manifest records no model setup / equilibrium "
+            "definition document, so the stages that need it cannot be "
+            "resumed. Start a new project with --execute."
+        )
+    missing_keys = [key for key in ("path", "sha256") if not record.get(key)]
+    if missing_keys:
+        raise ModelSetupDocumentError(
+            "This project's manifest has an incomplete model setup document "
+            f"record (missing: {', '.join(missing_keys)}), so the stages "
+            "that need it cannot be resumed. Start a new project with --execute."
+        )
+    
+    try:
+        document = load_model_setup_document(location=record["path"])
+    except ModelSetupDocumentError as error:
+        raise ModelSetupDocumentError(
+            f"The model setup document recorded for this project can no "
+            f"longer be used. {error}"
+        ) from error
+    
+    if document.sha256 != record["sha256"]:
+        raise ModelSetupDocumentError(
+            f"The model setup document recorded for this project has changed "
+            f"since the project was started: {document.path} "
+            f"(recorded SHA-256 {record['sha256']}, now {document.sha256}). "
+            f"Restore the recorded version to resume this project, or start "
+            f"a new project with --execute to use the new version."
+        )
+    return document
 
 
 def build_stage_prompt(
     stage: StageConfig,
-    equilibrium_definition: Optional[str] = None,
+    model_setup_document: Optional[ModelSetupDocument] = None,
 ) -> str:
     """Return the prompt text sent to the cloud agent for a stage.
 
-    The equilibrium definition (for a stage that needs one) and the stage's
+    The model setup document (for a stage that receives it) and the stage's
     guardrails are appended to the stage prompt, so the agent receives them
-    in the same launch request as the task.
+    in the same launch request as the task. The document's local path is
+    left out: the cloud agent cannot open it.
 
     Raises:
-        DefinitionNotSuppliedError: if the stage needs an equilibrium
-            definition and no definition text is given.
+        ModelSetupDocumentError: if the stage receives the model setup
+            document and none is given.
     """
     sections = [stage.prompt.rstrip()]
     
-    if stage.equilibrium_definition_file:
-        if not equilibrium_definition or not equilibrium_definition.strip():
-            raise DefinitionNotSuppliedError(
-                f"Stage '{stage.name}' needs an equilibrium definition and none was given"
+    if stage.receives_model_setup_document:
+        if model_setup_document is None:
+            raise ModelSetupDocumentError(
+                f"Stage '{stage.name}' needs the model setup / equilibrium "
+                f"definition document and none has been selected"
             )
-        sections.append(f"{DEFINITION_HEADING}\n{equilibrium_definition.strip()}")
+        sections.append(
+            f"{MODEL_SETUP_HEADING}\n"
+            f"File name: {model_setup_document.file_name}\n"
+            f"Format: {MODEL_SETUP_FORMATS['.' + model_setup_document.format]}\n"
+            f"SHA-256: {model_setup_document.sha256}\n"
+            f"The full text of the document is between the two lines below.\n"
+            f"{MODEL_SETUP_BEGIN_LINE}\n"
+            f"{model_setup_document.text.rstrip()}\n"
+            f"{MODEL_SETUP_END_LINE}"
+        )
     
     if stage.guardrails:
         numbered = "\n".join(
@@ -172,6 +320,9 @@ class PipelineManifest:
     started_at: str
     stages: dict[str, StageResult] = field(default_factory=dict)
     completed_at: Optional[str] = None
+    # The document selected when this project was started: path, format,
+    # size_bytes, sha256 and selected_at. The document's text is not stored.
+    model_setup_document: Optional[dict] = None
     
     def to_dict(self) -> dict:
         return {
@@ -179,6 +330,7 @@ class PipelineManifest:
             "repo_url": self.repo_url,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "model_setup_document": self.model_setup_document,
             "stages": {
                 name: {
                     "name": r.name,
@@ -204,6 +356,7 @@ class PipelineManifest:
             repo_url=data["repo_url"],
             started_at=data["started_at"],
             completed_at=data.get("completed_at"),
+            model_setup_document=data.get("model_setup_document"),
         )
         for name, stage_data in data.get("stages", {}).items():
             manifest.stages[name] = StageResult(
@@ -227,6 +380,7 @@ class Orchestrator:
     Pipeline orchestrator that launches cloud agents for each stage.
     
     Key behaviors:
+    - Asks for the model setup document whenever a new project is started
     - Validates models against GET /v1/models before launch
     - Sequential stage execution with dependency tracking
     - Artifact handoff via Git branches
@@ -238,14 +392,13 @@ class Orchestrator:
         config: dict,
         api_client: Optional[CursorAPIClient] = None,
         dry_run: bool = True,
-        repo_root: Optional[Path] = None,
+        ask: Callable[[str], str] = input,
     ):
         self.config = config
         self.dry_run = dry_run
         self.api = api_client or CursorAPIClient()
-        # Paths named in the config (such as the equilibrium definition
-        # file) are resolved against the local checkout of the repository.
-        self.repo_root = repo_root if repo_root is not None else REPO_ROOT
+        # Called with the question text; returns the user's answer.
+        self.ask = ask
         
         self.pipeline_config = config.get("pipeline", {})
         self.repo_config = self.pipeline_config.get("repository", {})
@@ -254,6 +407,7 @@ class Orchestrator:
         self.execution_config = config.get("execution", {})
         
         self.manifest: Optional[PipelineManifest] = None
+        self.model_setup_document: Optional[ModelSetupDocument] = None
     
     def _parse_stages(self, stages_list: list) -> list[StageConfig]:
         """Parse stage configurations from config."""
@@ -269,7 +423,9 @@ class Orchestrator:
                 depends_on=stage_data.get("depends_on"),
                 output_manifest=stage_data.get("output_manifest", {}),
                 guardrails=stage_data.get("guardrails", []),
-                equilibrium_definition_file=stage_data.get("equilibrium_definition_file"),
+                receives_model_setup_document=stage_data.get(
+                    "receives_model_setup_document", False
+                ),
             ))
         return stages
     
@@ -305,44 +461,100 @@ class Orchestrator:
                     f"Stage '{stage.name}': guardrails must be a list of non-empty strings"
                 )
             
-            definition_file = stage.equilibrium_definition_file
-            if definition_file is not None and not (
-                isinstance(definition_file, str) and definition_file.strip()
-            ):
+            if not isinstance(stage.receives_model_setup_document, bool):
                 errors.append(
-                    f"Stage '{stage.name}': equilibrium_definition_file must be a "
-                    f"non-empty path relative to the repository root"
+                    f"Stage '{stage.name}': receives_model_setup_document "
+                    f"must be true or false"
                 )
         
+        # The document asked for at project start has to reach the stage
+        # that starts the pipeline, or asking for it would have no effect.
+        if self.stages and self.stages[0].receives_model_setup_document is not True:
+            errors.append(
+                f"Stage '{self.stages[0].name}' is the first stage and must set "
+                f"receives_model_setup_document: true"
+            )
+        
         return len(errors) == 0, errors
     
-    def _load_equilibrium_definition(self, stage: StageConfig) -> Optional[str]:
-        """Return the definition text a stage needs, or None if it needs none.
+    def select_model_setup_document(self) -> ModelSetupDocument:
+        """Ask the user for the model setup document and read it.
+
+        The question is asked every time this is called; an earlier answer
+        is never reused.
 
         Raises:
-            DefinitionNotSuppliedError: if the stage needs a definition and
-                the definition block in the local checkout is unfilled.
+            ModelSetupDocumentError: if no usable document is given.
         """
-        if not stage.equilibrium_definition_file:
-            return None
-        return read_equilibrium_definition(
-            path=self.repo_root / stage.equilibrium_definition_file,
-        )
-    
-    def validate_equilibrium_definitions(self) -> tuple[bool, list[str]]:
-        """
-        Check that every stage needing an equilibrium definition has one.
+        print("\n=== Model Setup / Equilibrium Definition Document ===\n")
+        print("The text of this document is sent to the cloud agent in the launch")
+        print("request. The file is only read; it is not changed, moved or committed.\n")
         
-        Returns:
-            Tuple of (all_supplied, list_of_errors)
+        self.model_setup_document = None
+        document = ask_for_model_setup_document(ask=self.ask)
+        self.model_setup_document = document
+        
+        receiving = [s.name for s in self.stages if s.receives_model_setup_document]
+        print(f"  Document: {document.path}")
+        print(f"  Format: {MODEL_SETUP_FORMATS['.' + document.format]}")
+        print(f"  Size: {document.size_bytes} bytes")
+        print(f"  SHA-256: {document.sha256}")
+        print(f"  Sent to stage(s): {', '.join(receiving)}")
+        return document
+    
+    def start_new_project(self) -> PipelineManifest:
+        """Start a new project: ask for its document, then open its manifest.
+
+        Raises:
+            ModelSetupDocumentError: if no usable document is given. No
+                manifest is opened in that case.
         """
-        errors = []
-        for stage in self.stages:
-            try:
-                self._load_equilibrium_definition(stage=stage)
-            except DefinitionNotSuppliedError as error:
-                errors.append(f"Stage '{stage.name}' cannot launch: {error}")
-        return len(errors) == 0, errors
+        self.manifest = None
+        document = self.select_model_setup_document()
+        
+        started_at = datetime.now(timezone.utc).isoformat()
+        self.manifest = PipelineManifest(
+            pipeline_name=self.pipeline_config.get("name", "unnamed"),
+            repo_url=self.repo_config.get("url", ""),
+            started_at=started_at,
+            model_setup_document={**document.to_record(), "selected_at": started_at},
+        )
+        return self.manifest
+    
+    def _is_stage_finished(self, manifest: PipelineManifest, stage: StageConfig) -> bool:
+        existing = manifest.stages.get(stage.name)
+        return existing is not None and RunStatus.is_success(existing.status)
+    
+    def resume_project(self, manifest: PipelineManifest) -> PipelineManifest:
+        """Continue an existing project from its manifest, without asking.
+
+        The document is the one recorded when the project was started. It
+        is re-read only if a stage that receives it still has to run, and
+        it must then have the recorded content.
+
+        Raises:
+            ModelSetupDocumentError: if a stage still needs the document
+                and the recorded document is missing or has changed.
+        """
+        self.manifest = None
+        self.model_setup_document = None
+        
+        document_still_needed = any(
+            stage.receives_model_setup_document
+            and not self._is_stage_finished(manifest=manifest, stage=stage)
+            for stage in self.stages
+        )
+        if document_still_needed:
+            self.model_setup_document = restore_model_setup_document(
+                record=manifest.model_setup_document,
+            )
+            print("\n=== Model Setup / Equilibrium Definition Document ===\n")
+            print("  Using the document recorded for this project (not asked again):")
+            print(f"  Document: {self.model_setup_document.path}")
+            print(f"  SHA-256: {self.model_setup_document.sha256} (matches the record)")
+        
+        self.manifest = manifest
+        return self.manifest
     
     def validate_models(self) -> tuple[bool, list[str]]:
         """
@@ -398,36 +610,34 @@ class Orchestrator:
             return False, ["CURSOR_API_KEY environment variable not set"]
         return True, []
     
-    def run_validation(self) -> bool:
+    def run_config_validation(self) -> bool:
         """
-        Run all validation checks.
+        Check the configuration file. Makes no network call.
         
         Returns:
-            True if all validations pass
+            True if the configuration is valid
         """
-        print("\n=== Validation ===\n")
-        all_valid = True
-        
+        print("\n=== Configuration ===\n")
         print("Checking configuration...")
         config_valid, config_errors = self.validate_config()
         if not config_valid:
-            all_valid = False
             for e in config_errors:
                 print(f"  ERROR: {e}")
         else:
             print("  Configuration OK")
+        return config_valid
+    
+    def run_api_validation(self) -> bool:
+        """
+        Check the API key and the configured models (calls GET /v1/models).
         
-        if config_valid:
-            print("\nChecking equilibrium definition...")
-            definitions_ok, definition_errors = self.validate_equilibrium_definitions()
-            if not definitions_ok:
-                all_valid = False
-                for e in definition_errors:
-                    print(f"  ERROR: {e}")
-            else:
-                print("  Every stage that needs an equilibrium definition has one")
+        Returns:
+            True if all checks pass
+        """
+        print("\n=== API Validation ===\n")
+        all_valid = True
         
-        print("\nChecking API key...")
+        print("Checking API key...")
         key_valid, key_errors = self.validate_api_key()
         if not key_valid:
             all_valid = False
@@ -469,22 +679,26 @@ class Orchestrator:
         print(f"  Model: {stage.model_id or '(default)'}")
         print(f"  Guardrails appended to prompt: {len(stage.guardrails)}")
         
-        # The prompt is built before anything else, so a stage that needs an
-        # equilibrium definition cannot be launched (or reported as ready by
-        # a dry run) while that definition is unfilled.
+        # The prompt is built before anything else, so a stage that receives
+        # the model setup document cannot be launched (or reported as ready
+        # by a dry run) when no document has been selected.
         try:
             prompt_text = build_stage_prompt(
                 stage=stage,
-                equilibrium_definition=self._load_equilibrium_definition(stage=stage),
+                model_setup_document=self.model_setup_document,
             )
-        except DefinitionNotSuppliedError as error:
+        except ModelSetupDocumentError as error:
             result.status = "BLOCKED"
             result.error = str(error)
             print(f"  BLOCKED: {error}")
             return result
         
-        if stage.equilibrium_definition_file:
-            print(f"  Equilibrium definition: read from {stage.equilibrium_definition_file}")
+        if stage.receives_model_setup_document:
+            print(
+                f"  Model setup document in prompt: "
+                f"{self.model_setup_document.file_name} "
+                f"(SHA-256 {self.model_setup_document.sha256})"
+            )
         
         if self.dry_run:
             print("  [DRY RUN] Would launch cloud agent")
@@ -551,30 +765,27 @@ class Orchestrator:
         
         return result
     
-    def run_pipeline(
-        self,
-        resume_manifest: Optional[PipelineManifest] = None,
-    ) -> PipelineManifest:
+    def run_pipeline(self) -> PipelineManifest:
         """
-        Execute the full pipeline.
+        Run the stages of the open project.
         
-        Args:
-            resume_manifest: Optional manifest to resume from
-            
+        A project is opened by start_new_project() (which asks for the
+        model setup document) or by resume_project().
+        
         Returns:
             PipelineManifest with all stage results
+        
+        Raises:
+            RuntimeError: if no project is open.
         """
-        if resume_manifest:
-            self.manifest = resume_manifest
-            print(f"\nResuming pipeline from manifest (started {resume_manifest.started_at})")
-        else:
-            self.manifest = PipelineManifest(
-                pipeline_name=self.pipeline_config.get("name", "unnamed"),
-                repo_url=self.repo_config.get("url", ""),
-                started_at=datetime.now(timezone.utc).isoformat(),
+        if self.manifest is None:
+            raise RuntimeError(
+                "No project is open. Call start_new_project() or "
+                "resume_project() before run_pipeline()."
             )
         
         print(f"\n=== Pipeline: {self.manifest.pipeline_name} ===")
+        print(f"Project started: {self.manifest.started_at}")
         print(f"Repository: {self.manifest.repo_url}")
         print(f"Stages: {len(self.stages)}")
         print(f"Dry run: {self.dry_run}")
@@ -634,15 +845,30 @@ def load_manifest(manifest_path: Path) -> PipelineManifest:
         return PipelineManifest.from_dict(json.load(f))
 
 
-def main():
+def main(
+    argv: Optional[list[str]] = None,
+    api_client: Optional[CursorAPIClient] = None,
+    ask: Callable[[str], str] = input,
+) -> int:
+    """Run the command line interface and return the process exit code.
+
+    Args:
+        argv: Command line arguments (default: those of the process).
+        api_client: API client to use (default: one built from CURSOR_API_KEY).
+        ask: Called with a question, returns the user's answer (default: input).
+    """
     parser = argparse.ArgumentParser(
         description="Research Pipeline Orchestrator for Cursor Cloud Agents",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python orchestrator.py --dry-run              # Validate only
-  python orchestrator.py --execute              # Run pipeline
-  python orchestrator.py --resume manifest.json # Resume from checkpoint
+  python orchestrator.py --dry-run              # Validate, launch nothing
+  python orchestrator.py --execute              # Start a new project
+  python orchestrator.py --resume manifest.json # Continue an existing project
+
+Model setup / equilibrium definition document:
+  --execute and --dry-run always ask for the location of this document
+  (.qmd or .tex). --resume uses the document recorded in the manifest.
 
 Environment:
   CURSOR_API_KEY    API key from Cursor Dashboard -> API Keys
@@ -662,61 +888,101 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
     mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate config and models without launching agents",
+        help="Ask for the model setup document and validate everything "
+             "without launching agents or saving a project",
     )
     mode.add_argument(
         "--execute",
         action="store_true",
-        help="Execute the pipeline (launches paid cloud agents)",
+        help="Start a new project: ask for the model setup document, then "
+             "run the pipeline (launches paid cloud agents)",
     )
     mode.add_argument(
         "--resume",
         type=Path,
         metavar="MANIFEST",
-        help="Resume from a previous manifest JSON file",
+        help="Continue the project recorded in a manifest JSON file",
     )
     
     parser.add_argument(
         "--output",
         type=Path,
-        help="Path to write the output manifest (default: pipeline_manifest.json)",
+        help="Path of the project manifest to write (default for a new "
+             "project: pipeline_manifest.json; default for --resume: the "
+             "manifest being resumed)",
     )
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     if not args.config.exists():
         print(f"Error: Config file not found: {args.config}")
-        sys.exit(1)
+        return 1
     
     print(f"Loading config: {args.config}")
     config = load_config(args.config)
     
-    dry_run = args.dry_run or args.resume is None and not args.execute
-    orchestrator = Orchestrator(config=config, dry_run=dry_run)
+    orchestrator = Orchestrator(
+        config=config,
+        api_client=api_client,
+        dry_run=args.dry_run,
+        ask=ask,
+    )
     
-    if not orchestrator.run_validation():
-        print("\nValidation FAILED")
-        sys.exit(1)
+    if not orchestrator.run_config_validation():
+        print("\nValidation FAILED. No agent was launched.")
+        return 1
+    
+    if args.resume:
+        manifest_path = args.output or args.resume
+    else:
+        manifest_path = args.output or Path(
+            config.get("manifest", {}).get("output_file", "pipeline_manifest.json")
+        )
+    
+    try:
+        if args.resume:
+            if not args.resume.exists():
+                print(f"Error: Manifest file not found: {args.resume}")
+                return 1
+            orchestrator.resume_project(manifest=load_manifest(args.resume))
+        elif args.execute:
+            if manifest_path.exists():
+                print(
+                    f"\nERROR: A project manifest already exists at {manifest_path}. "
+                    f"A new project would overwrite that project's record.\n"
+                    f"Use --resume {manifest_path} to continue that project, or "
+                    f"--output <other file> to start a new project beside it."
+                )
+                print("No agent was launched.")
+                return 1
+            orchestrator.start_new_project()
+        else:
+            orchestrator.select_model_setup_document()
+    except ModelSetupDocumentError as error:
+        print(f"\nERROR: {error}")
+        print("No agent was launched.")
+        return 1
+    
+    if not orchestrator.run_api_validation():
+        print("\nValidation FAILED. No agent was launched.")
+        return 1
     
     print("\nValidation PASSED")
     
     if args.dry_run:
-        print("\n[DRY RUN] No agents launched. Use --execute to run the pipeline.")
-        sys.exit(0)
+        print(
+            "\n[DRY RUN] No agents launched and no project saved. "
+            "Use --execute to start a project; it will ask for the document again."
+        )
+        return 0
     
-    resume_manifest = None
-    if args.resume:
-        if not args.resume.exists():
-            print(f"Error: Manifest file not found: {args.resume}")
-            sys.exit(1)
-        resume_manifest = load_manifest(args.resume)
+    if args.execute:
+        # The project's record, including which document was selected, is
+        # written before the first agent is launched.
+        orchestrator.save_manifest(manifest_path)
     
-    manifest = orchestrator.run_pipeline(resume_manifest=resume_manifest)
-    
-    output_path = args.output or Path(
-        config.get("manifest", {}).get("output_file", "pipeline_manifest.json")
-    )
-    orchestrator.save_manifest(output_path)
+    manifest = orchestrator.run_pipeline()
+    orchestrator.save_manifest(manifest_path)
     
     print("\n=== Pipeline Summary ===")
     all_success = True
@@ -725,11 +991,11 @@ Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
         print(f"  {status_icon} {stage_name}: {result.status}")
         if result.error:
             print(f"      Error: {result.error}")
-        if not RunStatus.is_success(result.status) and result.status != "DRY_RUN":
+        if not RunStatus.is_success(result.status):
             all_success = False
     
-    sys.exit(0 if all_success else 1)
+    return 0 if all_success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

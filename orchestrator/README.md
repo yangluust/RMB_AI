@@ -9,7 +9,8 @@ This orchestrator:
 - Supports **configurable model selection** per stage from available models
 - Validates models against `GET /v1/models` before launch
 - Chains stages via **Git branch artifacts**
-- Defaults to **dry-run mode** (no paid execution without explicit opt-in)
+- **Asks for the model setup / equilibrium definition document** (`.qmd` or `.tex`) at every new project, before anything is launched
+- Launches agents only with `--execute` or `--resume`
 
 ## Quick Start (Windows)
 
@@ -20,12 +21,20 @@ $env:CURSOR_API_KEY = "your-api-key-from-cursor-dashboard"
 # 2. Navigate to repository
 cd D:\RMB_AI
 
-# 3. Validate configuration (dry run, no network calls to launch agents)
+# 3. Validate (asks for the model setup document; launches nothing)
 python orchestrator/orchestrator.py --dry-run
 
-# 4. Execute pipeline (launches paid cloud agents)
+# 4. Start a new project (asks for the model setup document, then launches paid cloud agents)
 python orchestrator/orchestrator.py --execute
 ```
+
+Steps 3 and 4 each ask:
+
+```
+Location of the model setup / equilibrium definition document for this project (.qmd or .tex):
+```
+
+Type the path of your file, for example `D:\Research\my_model\setup.qmd`.
 
 ## Files
 
@@ -53,7 +62,7 @@ stages:
       Your task prompt here...
     guardrails:                 # Optional, appended to the prompt at launch
       - "A rule the agent must follow."
-    equilibrium_definition_file: "docs/pipeline-design.md"  # Optional, see below
+    receives_model_setup_document: true  # Required on the first stage, see below
     output_manifest:
       required_files:
         - "outputs/my_stage/result.txt"
@@ -65,17 +74,18 @@ A stage may list `guardrails`. When the orchestrator launches that stage it appe
 
 Stage 3 (`pseudocode_to_implementation`) carries the twelve reproducibility guardrails from [`docs/pipeline-design.md`](../docs/pipeline-design.md#reproducibility-guardrails-stage-3). The tests fail if the list in `config.yaml` differs from the list in the design document, so edit both together.
 
-### Equilibrium Definition (Stage 1)
+### Model Setup Document (Asked at Every New Project)
 
-Stage 1 (`equilibrium_derivation`) sets `equilibrium_definition_file: "docs/pipeline-design.md"`. At launch the orchestrator reads the definition block from that file in the local checkout and appends it to the Stage 1 prompt.
+Every new project starts by asking for the location of the model setup / equilibrium definition document. This is mandatory: there is no setting, flag or environment variable that supplies the location, and an earlier project's document is never reused.
 
-**The definition has not been supplied yet, so the pipeline cannot run.** The block is an unfilled template, and until Yang Lu fills it in, `--dry-run`, `--execute` and `--resume` all stop with an error like:
+- The file must exist, be a `.qmd` or `.tex` file, hold non-empty UTF-8 text, and be self-contained (no `\input`, `\include` or Quarto `{{< include >}}` of other files).
+- If the answer is blank or unusable, or no answer can be read (for example under a scheduler), the run stops with an error and nothing is launched.
+- The file is only read. It is not changed, moved, copied or committed.
+- The first stage must set `receives_model_setup_document: true`. At launch the orchestrator appends the document's full text to that stage's prompt. The cloud agent cannot open a path on your machine, so the text is sent and the path is not.
+- The project manifest records the file's path, size and SHA-256 hash (not its text). `--resume` re-reads the same file without asking and stops if it is missing or has changed.
+- `--execute` refuses to start if the manifest file already exists. Use `--resume` to continue that project, or `--output other_manifest.json` to start another one.
 
-```
-ERROR: Stage 'equilibrium_derivation' cannot launch: Equilibrium definition in ...\docs\pipeline-design.md is not supplied: 7 'TODO(Yang)' placeholder(s) remain; the status line is not '**Status:** FILLED'
-```
-
-To supply it, follow [How to Fill It In](../docs/pipeline-design.md#how-to-fill-it-in) in the design document. The orchestrator only checks that the template is filled in; it cannot judge whether the definition is correct.
+The orchestrator cannot judge whether the document states a correct equilibrium definition. See [Project Input](../docs/pipeline-design.md#project-input-model-setup-and-equilibrium-definition-document) in the design document for the details and limits.
 
 ### Model Selection
 
@@ -91,15 +101,17 @@ Set `model_id: null` to use your configured default model.
 
 | Command | Description |
 |---------|-------------|
-| `--dry-run` | Validate config and models, no agent launch |
-| `--execute` | Run the pipeline (launches paid agents) |
-| `--resume manifest.json` | Resume from a previous checkpoint |
+| `--dry-run` | Ask for the model setup document, validate config and models; no agent launch, nothing saved |
+| `--execute` | Start a new project: ask for the model setup document, then run the pipeline (launches paid agents) |
+| `--resume manifest.json` | Continue an existing project; does not ask, uses the document recorded in the manifest |
 | `--config path/to/config.yaml` | Use custom config file |
-| `--output path/to/manifest.json` | Custom output manifest path |
+| `--output path/to/manifest.json` | Manifest file for the project (default `pipeline_manifest.json`; for `--resume`, the manifest being resumed) |
 
 ## Important: Repository Snapshots
 
 **Cloud agents execute against committed code on GitHub, not your local working directory.**
+
+The model setup document is the exception: the orchestrator reads it from your machine and sends its text in the Stage 1 launch request, so it does not have to be committed.
 
 Before running:
 1. Commit your input data: `git add . && git commit -m "Add inputs"`

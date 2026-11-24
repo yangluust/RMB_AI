@@ -7,53 +7,52 @@ Run with: python -m pytest test_orchestrator.py -v
 Or simply: python test_orchestrator.py
 """
 
+import hashlib
 import json
 import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from unittest.mock import MagicMock
 
 import yaml
 
 from api_client import CursorAPIClient, CursorAPIError, Model, RunStatus
 from orchestrator import (
-    DEFINITION_BEGIN_MARKER,
-    DEFINITION_END_MARKER,
-    DEFINITION_FILLED_STATUS_LINE,
-    DEFINITION_HEADING,
-    DEFINITION_PLACEHOLDER,
     GUARDRAILS_HEADING,
-    REPO_ROOT,
-    DefinitionNotSuppliedError,
+    MODEL_SETUP_BEGIN_LINE,
+    MODEL_SETUP_END_LINE,
+    MODEL_SETUP_HEADING,
+    MODEL_SETUP_QUESTION,
+    ModelSetupDocumentError,
     Orchestrator,
     PipelineManifest,
     StageConfig,
     StageResult,
     build_stage_prompt,
     load_config,
-    read_equilibrium_definition,
+    load_manifest,
+    load_model_setup_document,
+    main,
 )
 
 ORCHESTRATOR_DIR = Path(__file__).resolve().parent
 REAL_CONFIG_PATH = ORCHESTRATOR_DIR / "config.yaml"
-DESIGN_DOC_RELATIVE_PATH = Path("docs") / "pipeline-design.md"
-DESIGN_DOC_PATH = ORCHESTRATOR_DIR.parent / DESIGN_DOC_RELATIVE_PATH
+DESIGN_DOC_PATH = ORCHESTRATOR_DIR.parent / "docs" / "pipeline-design.md"
 DESIGN_DOC_GUARDRAILS_HEADING = "#### Reproducibility Guardrails (Stage 3)"
 STAGE1_NAME = "equilibrium_derivation"
+STAGE2_NAME = "equilibrium_to_pseudocode"
 STAGE3_NAME = "pseudocode_to_implementation"
 EXPECTED_GUARDRAIL_COUNT = 12
 
-# Stand-in definition blocks for tests. The "filled" text is a sentinel, not
-# a real equilibrium definition.
-UNFILLED_DEFINITION_BLOCK = (
-    f"**Status:** UNFILLED\n\n**1. Field.**\n\n> {DEFINITION_PLACEHOLDER}\n"
+# Stand-in document text for tests. It is a sentinel, not a model setup or
+# an equilibrium definition.
+SENTINEL_DOCUMENT_TEXT = (
+    "TEST-ONLY SENTINEL DOCUMENT.\n"
+    "It stands in for a model setup file and states no economics.\n"
 )
-SENTINEL_DEFINITION_TEXT = "TEST-ONLY SENTINEL TEXT, not a real definition."
-FILLED_DEFINITION_BLOCK = (
-    f"{DEFINITION_FILLED_STATUS_LINE}\n\n**1. Field.**\n\n> {SENTINEL_DEFINITION_TEXT}\n"
-)
+OTHER_SENTINEL_DOCUMENT_TEXT = "TEST-ONLY SECOND SENTINEL DOCUMENT.\n"
 
 
 class MockHttpClient:
@@ -179,6 +178,7 @@ MOCK_CONFIG = {
             "description": "First test stage",
             "model_id": "composer-2",
             "model_params": [{"id": "fast", "value": "true"}],
+            "receives_model_setup_document": True,
             "prompt": "Do something for stage 1",
             "output_manifest": {"required_files": ["output1.txt"]},
         },
@@ -474,6 +474,7 @@ def test_orchestrator_dry_run():
                 "name": "stage1",
                 "display_name": "Test Stage 1",
                 "model_id": "composer-2",
+                "receives_model_setup_document": True,
                 "prompt": "Do something",
             },
         ],
@@ -481,9 +482,16 @@ def test_orchestrator_dry_run():
     }
     
     client = CursorAPIClient(api_key="test-key", http_client=mock_http)
-    orchestrator = Orchestrator(config=config_no_deps, api_client=client, dry_run=True)
-    
-    manifest = orchestrator.run_pipeline()
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="setup.qmd")
+        orchestrator = Orchestrator(
+            config=config_no_deps,
+            api_client=client,
+            dry_run=True,
+            ask=answer_with(str(document_path)),
+        )
+        orchestrator.start_new_project()
+        manifest = orchestrator.run_pipeline()
     
     assert manifest is not None
     assert len(manifest.stages) == 1
@@ -562,10 +570,37 @@ def read_design_doc_guardrails() -> list[str]:
     return guardrails
 
 
+def must_not_ask(question: str) -> str:
+    raise AssertionError(f"The orchestrator asked a question it must not ask: {question}")
+
+
+def answer_with(*answers: str) -> Callable[[str], str]:
+    """Return an `ask` stand-in that gives the answers in order and records the questions."""
+    remaining = list(answers)
+    
+    def ask(question: str) -> str:
+        ask.questions.append(question)
+        return remaining.pop(0)
+    
+    ask.questions = []
+    return ask
+
+
+def write_document(
+    directory: Path,
+    file_name: str,
+    text: str = SENTINEL_DOCUMENT_TEXT,
+) -> Path:
+    """Write a stand-in model setup document and return its path."""
+    path = directory / file_name
+    path.write_bytes(text.encode("utf-8"))
+    return path
+
+
 def load_real_orchestrator(
     mock_http: MockHttpClient,
     dry_run: bool,
-    repo_root: Optional[Path] = None,
+    ask: Callable[[str], str] = must_not_ask,
 ) -> Orchestrator:
     """Build an orchestrator from the committed config.yaml with mocked HTTP."""
     client = CursorAPIClient(api_key="test-key", http_client=mock_http)
@@ -573,7 +608,7 @@ def load_real_orchestrator(
         config=load_config(config_path=REAL_CONFIG_PATH),
         api_client=client,
         dry_run=dry_run,
-        repo_root=repo_root,
+        ask=ask,
     )
 
 
@@ -658,270 +693,421 @@ def make_launch_mock() -> MockHttpClient:
     return mock_http
 
 
-def write_definition_doc(repo_root: Path, block: str) -> Path:
-    """Write a stand-in design doc holding one definition block; return its path."""
-    path = repo_root / DESIGN_DOC_RELATIVE_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        f"# Stand-in doc\n\n{DEFINITION_BEGIN_MARKER}\n{block}\n{DEFINITION_END_MARKER}\n",
-        encoding="utf-8",
-    )
-    return path
+def get_launch_requests(mock_http: MockHttpClient) -> list[dict]:
+    """Return the JSON bodies of the agent launch requests sent so far."""
+    return [call[3] for call in mock_http.calls if call[0] == "POST"]
 
 
-def expect_definition_rejected(path: Path, expected_message_part: str) -> None:
+def expect_document_error(action: Callable[[], object], expected_message_part: str) -> None:
     try:
-        read_equilibrium_definition(path=path)
-    except DefinitionNotSuppliedError as error:
+        action()
+    except ModelSetupDocumentError as error:
         assert expected_message_part in str(error), str(error)
     else:
-        raise AssertionError(f"Expected rejection mentioning '{expected_message_part}'")
+        raise AssertionError(f"Expected an error mentioning '{expected_message_part}'")
 
 
-def test_unfilled_definition_blocks_stage1_launch():
-    """With an unfilled template, --execute sends no request at all for Stage 1."""
+def end_of_input(question: str) -> str:
+    raise EOFError
+
+
+def test_new_project_asks_for_the_document_before_any_request():
+    """Starting a project asks the one question, sends nothing, and records the answer."""
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
-        write_definition_doc(repo_root=repo_root, block=UNFILLED_DEFINITION_BLOCK)
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
         mock_http = make_launch_mock()
-        orchestrator = load_real_orchestrator(
-            mock_http=mock_http, dry_run=False, repo_root=repo_root,
-        )
-        stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+        ask = answer_with(str(document_path))
+        orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False, ask=ask)
         
-        result = orchestrator._run_stage(stage=stage1)
-    
-    assert result.status == "BLOCKED"
-    assert "placeholder" in result.error
-    assert result.agent_id is None
-    assert mock_http.calls == [], "No HTTP request may be sent for a blocked stage"
-    print("✓ test_unfilled_definition_blocks_stage1_launch passed")
+        manifest = orchestrator.start_new_project()
+        
+        assert ask.questions == [MODEL_SETUP_QUESTION]
+        assert mock_http.calls == [], "Nothing may be sent while the document is selected"
+        record = manifest.model_setup_document
+        assert record["path"] == str(document_path.resolve())
+        assert record["format"] == "qmd"
+        assert record["size_bytes"] == len(SENTINEL_DOCUMENT_TEXT.encode("utf-8"))
+        assert record["sha256"] == hashlib.sha256(document_path.read_bytes()).hexdigest()
+        assert record["selected_at"] == manifest.started_at
+        assert set(record) == {"path", "format", "size_bytes", "sha256", "selected_at"}
+    print("✓ test_new_project_asks_for_the_document_before_any_request passed")
 
 
-def test_dry_run_reports_blocked_for_unfilled_definition():
-    """A dry run does not report Stage 1 as ready while the template is unfilled."""
+def test_every_new_project_asks_again_and_never_reuses_a_path():
+    """A second project asks again; a failed answer leaves no earlier document in place."""
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
-        write_definition_doc(repo_root=repo_root, block=UNFILLED_DEFINITION_BLOCK)
-        mock_http = make_launch_mock()
-        orchestrator = load_real_orchestrator(
-            mock_http=mock_http, dry_run=True, repo_root=repo_root,
+        first = write_document(directory=Path(tmp), file_name="first.qmd")
+        second = write_document(
+            directory=Path(tmp), file_name="second.tex", text=OTHER_SENTINEL_DOCUMENT_TEXT,
         )
+        mock_http = make_launch_mock()
+        ask = answer_with(str(first), str(second), "")
+        orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False, ask=ask)
         
-        manifest = orchestrator.run_pipeline()
-    
-    assert manifest.stages[STAGE1_NAME].status == "BLOCKED"
-    assert list(manifest.stages) == [STAGE1_NAME], "Later stages must not run"
+        first_manifest = orchestrator.start_new_project()
+        second_manifest = orchestrator.start_new_project()
+        
+        assert ask.questions == [MODEL_SETUP_QUESTION, MODEL_SETUP_QUESTION]
+        assert first_manifest.model_setup_document["path"] == str(first.resolve())
+        assert second_manifest.model_setup_document["path"] == str(second.resolve())
+        assert orchestrator.model_setup_document.text == OTHER_SENTINEL_DOCUMENT_TEXT
+        
+        expect_document_error(
+            action=orchestrator.start_new_project,
+            expected_message_part="No location was given",
+        )
+        assert len(ask.questions) == 3
+        assert orchestrator.model_setup_document is None
+        assert orchestrator.manifest is None
+        assert mock_http.calls == []
+    print("✓ test_every_new_project_asks_again_and_never_reuses_a_path passed")
+
+
+def test_unusable_locations_are_rejected_before_any_launch():
+    """Blank, missing, non-file, wrong-type, empty and non-UTF-8 answers all stop the start."""
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        (directory / "folder.tex").mkdir()
+        write_document(directory=directory, file_name="notes.txt")
+        write_document(directory=directory, file_name="paper.pdf")
+        write_document(directory=directory, file_name="no_extension")
+        write_document(directory=directory, file_name="empty.tex", text="")
+        write_document(directory=directory, file_name="blank.qmd", text="  \n\n")
+        (directory / "latin1.tex").write_bytes("caf\xe9".encode("latin-1"))
+        
+        cases = [
+            ("", "No location was given"),
+            ("   ", "No location was given"),
+            ('""', "No location was given"),
+            (str(directory / "missing.qmd"), "does not exist"),
+            (str(directory / "folder.tex"), "is not a file"),
+            (str(directory / "notes.txt"), "must be a .qmd or .tex file"),
+            (str(directory / "paper.pdf"), "must be a .qmd or .tex file"),
+            (str(directory / "no_extension"), "must be a .qmd or .tex file"),
+            (str(directory / "empty.tex"), "is empty"),
+            (str(directory / "blank.qmd"), "is empty"),
+            (str(directory / "latin1.tex"), "is not UTF-8 text"),
+        ]
+        for answer, expected_message_part in cases:
+            mock_http = make_launch_mock()
+            orchestrator = load_real_orchestrator(
+                mock_http=mock_http, dry_run=False, ask=answer_with(answer),
+            )
+            expect_document_error(
+                action=orchestrator.start_new_project,
+                expected_message_part=expected_message_part,
+            )
+            assert orchestrator.manifest is None, answer
+            try:
+                orchestrator.run_pipeline()
+            except RuntimeError as error:
+                assert "No project is open" in str(error)
+            else:
+                raise AssertionError(f"run_pipeline must refuse after answer {answer!r}")
+            assert mock_http.calls == [], f"A request was sent after answer {answer!r}"
+    print("✓ test_unusable_locations_are_rejected_before_any_launch passed")
+
+
+def test_end_of_input_when_asked_fails_before_any_launch():
+    """With no interactive input (EOF), the start fails clearly and sends nothing."""
+    mock_http = make_launch_mock()
+    orchestrator = load_real_orchestrator(
+        mock_http=mock_http, dry_run=False, ask=end_of_input,
+    )
+    expect_document_error(
+        action=orchestrator.start_new_project,
+        expected_message_part="input ended before an answer was given",
+    )
+    assert orchestrator.manifest is None
     assert mock_http.calls == []
-    print("✓ test_dry_run_reports_blocked_for_unfilled_definition passed")
+    print("✓ test_end_of_input_when_asked_fails_before_any_launch passed")
 
 
-def test_filled_definition_is_sent_in_stage1_launch_request():
-    """With a filled block, the Stage 1 launch request carries that block."""
-    with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
-        write_definition_doc(repo_root=repo_root, block=FILLED_DEFINITION_BLOCK)
+def test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request():
+    """The Stage 1 launch body holds the selected file's text, not its local path."""
+    for file_name, quote in (("model_setup.qmd", ""), ("model_setup.tex", ""), ("MODEL.TEX", '"')):
+        with tempfile.TemporaryDirectory() as tmp:
+            document_path = write_document(directory=Path(tmp), file_name=file_name)
+            bytes_before = document_path.read_bytes()
+            sha256 = hashlib.sha256(bytes_before).hexdigest()
+            mock_http = make_launch_mock()
+            orchestrator = load_real_orchestrator(
+                mock_http=mock_http,
+                dry_run=False,
+                ask=answer_with(f"{quote}{document_path}{quote}"),
+            )
+            orchestrator.start_new_project()
+            stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
+            
+            result = orchestrator._run_stage(stage=stage1)
+            
+            assert result.status == "FINISHED", file_name
+            launch_requests = get_launch_requests(mock_http=mock_http)
+            assert len(launch_requests) == 1
+            prompt_text = launch_requests[0]["prompt"]["text"]
+            positions = [
+                prompt_text.index("TASK: Derive the equilibrium"),
+                prompt_text.index(MODEL_SETUP_HEADING),
+                prompt_text.index(MODEL_SETUP_BEGIN_LINE),
+                prompt_text.index(SENTINEL_DOCUMENT_TEXT.rstrip()),
+                prompt_text.index(MODEL_SETUP_END_LINE),
+            ]
+            assert positions == sorted(positions), file_name
+            assert f"File name: {file_name}" in prompt_text
+            assert f"SHA-256: {sha256}" in prompt_text
+            assert tmp not in prompt_text, "The local path must not be sent"
+            assert "TODO(Yang)" not in prompt_text
+            assert document_path.read_bytes() == bytes_before, "The file must not change"
+            assert sorted(path.name for path in Path(tmp).iterdir()) == [file_name]
+    print("✓ test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request passed")
+
+
+def test_stage1_is_blocked_when_no_document_was_selected():
+    """Without a selected document, Stage 1 sends nothing, in a real run or a dry run."""
+    for dry_run in (False, True):
         mock_http = make_launch_mock()
-        orchestrator = load_real_orchestrator(
-            mock_http=mock_http, dry_run=False, repo_root=repo_root,
-        )
+        orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=dry_run)
         stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
         
         result = orchestrator._run_stage(stage=stage1)
-    
-    assert result.status == "FINISHED"
-    launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
-    assert len(launch_requests) == 1
-    prompt_text = launch_requests[0][3]["prompt"]["text"]
-    
-    task_position = prompt_text.index("TASK: Derive the equilibrium")
-    heading_position = prompt_text.index(DEFINITION_HEADING)
-    definition_position = prompt_text.index(SENTINEL_DEFINITION_TEXT)
-    assert task_position < heading_position < definition_position
-    assert DEFINITION_FILLED_STATUS_LINE in prompt_text
-    assert DEFINITION_PLACEHOLDER not in prompt_text
-    print("✓ test_filled_definition_is_sent_in_stage1_launch_request passed")
+        
+        assert result.status == "BLOCKED", f"dry_run={dry_run}"
+        assert "none has been selected" in result.error
+        assert result.agent_id is None
+        assert mock_http.calls == []
+        expect_document_error(
+            action=lambda: build_stage_prompt(stage=stage1),
+            expected_message_part="none has been selected",
+        )
+    print("✓ test_stage1_is_blocked_when_no_document_was_selected passed")
 
 
-def test_definition_rejected_unless_status_and_content_are_both_filled():
-    """Flipping the status, or removing placeholders, alone is not enough."""
+def test_document_that_pulls_in_other_files_is_rejected():
+    """Only the one file's text is sent, so a file that includes others is refused."""
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
+        directory = Path(tmp)
+        tex_with_input = write_document(
+            directory=directory,
+            file_name="main.tex",
+            text="Sentinel line.\n\\input{sections/setup}\n",
+        )
+        qmd_with_include = write_document(
+            directory=directory,
+            file_name="main.qmd",
+            text="Sentinel line.\n\n{{< include _setup.qmd >}}\n",
+        )
+        self_contained = write_document(
+            directory=directory,
+            file_name="alone.tex",
+            text=(
+                "\\usepackage[utf8]{inputenc}\n"
+                "% \\input{old_draft}\n"
+                "\\includegraphics{figure}\n"
+                "Sentinel line.\n"
+            ),
+        )
         
-        status_flipped_only = f"{DEFINITION_FILLED_STATUS_LINE}\n\n> {DEFINITION_PLACEHOLDER}\n"
-        path = write_definition_doc(repo_root=repo_root, block=status_flipped_only)
-        expect_definition_rejected(path=path, expected_message_part="placeholder")
+        for path in (tex_with_input, qmd_with_include):
+            try:
+                load_model_setup_document(location=str(path))
+            except ModelSetupDocumentError as error:
+                assert "pulls in other files" in str(error)
+                assert "line " in str(error)
+            else:
+                raise AssertionError(f"Expected {path.name} to be refused")
         
-        placeholders_removed_only = f"**Status:** UNFILLED\n\n> {SENTINEL_DEFINITION_TEXT}\n"
-        path = write_definition_doc(repo_root=repo_root, block=placeholders_removed_only)
-        expect_definition_rejected(path=path, expected_message_part="status line")
-        
-        path = write_definition_doc(repo_root=repo_root, block=DEFINITION_FILLED_STATUS_LINE)
-        expect_definition_rejected(path=path, expected_message_part="no content")
-        
-        path = write_definition_doc(repo_root=repo_root, block=FILLED_DEFINITION_BLOCK)
-        assert SENTINEL_DEFINITION_TEXT in read_equilibrium_definition(path=path)
-    print("✓ test_definition_rejected_unless_status_and_content_are_both_filled passed")
+        document = load_model_setup_document(location=str(self_contained))
+        assert document.format == "tex"
+    print("✓ test_document_that_pulls_in_other_files_is_rejected passed")
 
 
-def test_definition_rejected_for_missing_file_or_bad_markers():
-    """A missing file, or missing, duplicated or reversed markers, is rejected."""
+def start_project_and_reload_manifest(document_path: Path) -> PipelineManifest:
+    """Start a project with a document, and return its manifest as read back from JSON."""
+    starter = load_real_orchestrator(
+        mock_http=make_launch_mock(), dry_run=False, ask=answer_with(str(document_path)),
+    )
+    starter.start_new_project()
+    return PipelineManifest.from_dict(json.loads(json.dumps(starter.manifest.to_dict())))
+
+
+def test_resume_uses_the_recorded_document_without_asking():
+    """Resuming re-reads the project's own document and never asks."""
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
-        path = repo_root / DESIGN_DOC_RELATIVE_PATH
-        expect_definition_rejected(path=path, expected_message_part="not found")
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.tex")
+        manifest = start_project_and_reload_manifest(document_path=document_path)
         
-        path.parent.mkdir(parents=True)
-        path.write_text(FILLED_DEFINITION_BLOCK, encoding="utf-8")
-        expect_definition_rejected(path=path, expected_message_part="exactly once")
+        mock_http = make_launch_mock()
+        orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
+        orchestrator.resume_project(manifest=manifest)
+        assert mock_http.calls == []
         
-        path.write_text(
-            f"{DEFINITION_BEGIN_MARKER}\n{DEFINITION_BEGIN_MARKER}\n"
-            f"{FILLED_DEFINITION_BLOCK}\n{DEFINITION_END_MARKER}\n",
-            encoding="utf-8",
+        result = orchestrator._run_stage(
+            stage=get_stage(orchestrator=orchestrator, name=STAGE1_NAME),
         )
-        expect_definition_rejected(path=path, expected_message_part="exactly once")
         
-        path.write_text(
-            f"{DEFINITION_END_MARKER}\n{FILLED_DEFINITION_BLOCK}\n{DEFINITION_BEGIN_MARKER}\n",
-            encoding="utf-8",
-        )
-        expect_definition_rejected(path=path, expected_message_part="before the BEGIN")
-    print("✓ test_definition_rejected_for_missing_file_or_bad_markers passed")
+        assert result.status == "FINISHED"
+        prompt_text = get_launch_requests(mock_http=mock_http)[0]["prompt"]["text"]
+        assert SENTINEL_DOCUMENT_TEXT.rstrip() in prompt_text
+        assert orchestrator.manifest.model_setup_document == manifest.model_setup_document
+    print("✓ test_resume_uses_the_recorded_document_without_asking passed")
 
 
-def test_build_stage_prompt_refuses_definition_stage_without_text():
-    """A stage that needs a definition cannot get a prompt without definition text."""
-    stage = StageConfig(
-        name="needs_definition",
-        display_name="Needs definition",
-        description="",
-        prompt="Do the task.\n",
-        equilibrium_definition_file=str(DESIGN_DOC_RELATIVE_PATH),
-    )
-    for missing in (None, "", "   \n"):
-        try:
-            build_stage_prompt(stage=stage, equilibrium_definition=missing)
-        except DefinitionNotSuppliedError:
-            continue
-        raise AssertionError(f"Expected refusal for equilibrium_definition={missing!r}")
-    
-    prompt_text = build_stage_prompt(
-        stage=stage, equilibrium_definition=SENTINEL_DEFINITION_TEXT,
-    )
-    assert prompt_text == (
-        f"Do the task.\n\n{DEFINITION_HEADING}\n{SENTINEL_DEFINITION_TEXT}\n"
-    )
-    print("✓ test_build_stage_prompt_refuses_definition_stage_without_text passed")
-
-
-def test_run_validation_fails_only_while_definition_unfilled():
-    """Validation (used by --dry-run, --execute and --resume) follows the block's state."""
+def test_resume_fails_before_launch_when_the_recorded_document_is_unusable():
+    """A changed, deleted or unrecorded document stops a resume that still needs it."""
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
+        manifest = start_project_and_reload_manifest(document_path=document_path)
         
-        write_definition_doc(repo_root=repo_root, block=UNFILLED_DEFINITION_BLOCK)
-        unfilled = load_real_orchestrator(
-            mock_http=make_launch_mock(), dry_run=True, repo_root=repo_root,
-        )
-        definitions_ok, errors = unfilled.validate_equilibrium_definitions()
-        assert not definitions_ok
-        assert len(errors) == 1 and STAGE1_NAME in errors[0]
-        assert unfilled.run_validation() is False
+        def expect_resume_refused(resumed: PipelineManifest, expected_message_part: str) -> None:
+            mock_http = make_launch_mock()
+            orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
+            expect_document_error(
+                action=lambda: orchestrator.resume_project(manifest=resumed),
+                expected_message_part=expected_message_part,
+            )
+            assert orchestrator.manifest is None
+            assert mock_http.calls == []
         
-        write_definition_doc(repo_root=repo_root, block=FILLED_DEFINITION_BLOCK)
-        filled = load_real_orchestrator(
-            mock_http=make_launch_mock(), dry_run=True, repo_root=repo_root,
+        write_document(
+            directory=Path(tmp), file_name="model_setup.qmd", text=OTHER_SENTINEL_DOCUMENT_TEXT,
         )
-        assert filled.validate_equilibrium_definitions() == (True, [])
-        assert filled.run_validation() is True
-    print("✓ test_run_validation_fails_only_while_definition_unfilled passed")
+        expect_resume_refused(resumed=manifest, expected_message_part="has changed")
+        
+        document_path.unlink()
+        expect_resume_refused(resumed=manifest, expected_message_part="does not exist")
+        
+        unrecorded = PipelineManifest(
+            pipeline_name="test", repo_url="https://github.com/test/repo",
+            started_at="2026-11-24T00:00:00Z",
+        )
+        expect_resume_refused(
+            resumed=unrecorded, expected_message_part="records no model setup",
+        )
+        
+        unrecorded.model_setup_document = {"path": str(document_path)}
+        expect_resume_refused(resumed=unrecorded, expected_message_part="missing: sha256")
+    print("✓ test_resume_fails_before_launch_when_the_recorded_document_is_unusable passed")
 
 
-def test_validate_config_rejects_malformed_equilibrium_definition_file():
-    """equilibrium_definition_file must be a non-empty path string when present."""
-    for malformed in ("", "   ", 5, ["docs/pipeline-design.md"]):
-        config = {
-            "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
-            "stages": [
-                {"name": "s1", "prompt": "test", "equilibrium_definition_file": malformed},
-            ],
-        }
-        orchestrator = Orchestrator(config=config, dry_run=True)
-        is_valid, errors = orchestrator.validate_config()
-        assert not is_valid, f"Expected rejection for {malformed!r}"
-        assert any("equilibrium_definition_file" in error for error in errors)
-    print("✓ test_validate_config_rejects_malformed_equilibrium_definition_file passed")
-
-
-def test_committed_design_doc_gates_real_stage1_by_its_own_state():
-    """The committed config and design doc together gate the real Stage 1.
-
-    While the committed template is unfilled, Stage 1 must be blocked with no
-    request sent. Once Yang Lu fills it in, the launch request must carry the
-    committed block. Both branches are asserted, so this test stays valid
-    after the definition is supplied.
-    """
-    doc_text = DESIGN_DOC_PATH.read_text(encoding="utf-8")
-    assert doc_text.count(DEFINITION_BEGIN_MARKER) == 1
-    assert doc_text.count(DEFINITION_END_MARKER) == 1
-    block = doc_text.split(DEFINITION_BEGIN_MARKER)[1].split(DEFINITION_END_MARKER)[0].strip()
-    committed_block_is_unfilled = (
-        DEFINITION_PLACEHOLDER in block or DEFINITION_FILLED_STATUS_LINE not in block
-    )
+def test_resume_after_stage1_finished_does_not_need_the_document():
+    """Once the stage that receives the document is done, a resume neither asks nor reads it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
+        manifest = start_project_and_reload_manifest(document_path=document_path)
+        document_path.unlink()
     
+    manifest.stages[STAGE1_NAME] = StageResult(
+        name=STAGE1_NAME, status="FINISHED", output_branch="cursor/stage1-output",
+    )
     mock_http = make_launch_mock()
     orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
-    assert orchestrator.repo_root == REPO_ROOT
-    stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
-    assert stage1.equilibrium_definition_file == DESIGN_DOC_RELATIVE_PATH.as_posix()
+    orchestrator.resume_project(manifest=manifest)
     
-    result = orchestrator._run_stage(stage=stage1)
+    result = orchestrator.run_pipeline()
     
-    if committed_block_is_unfilled:
-        assert result.status == "BLOCKED"
-        assert mock_http.calls == []
-    else:
-        assert result.status == "FINISHED"
-        launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
-        assert len(launch_requests) == 1
-        assert block in launch_requests[0][3]["prompt"]["text"]
-    print("✓ test_committed_design_doc_gates_real_stage1_by_its_own_state passed")
+    launch_requests = get_launch_requests(mock_http=mock_http)
+    assert len(launch_requests) == 3
+    assert launch_requests[0]["repos"][0]["startingRef"] == "cursor/stage1-output"
+    assert all(MODEL_SETUP_HEADING not in body["prompt"]["text"] for body in launch_requests)
+    assert result.stages[STAGE2_NAME].status == "FINISHED"
+    print("✓ test_resume_after_stage1_finished_does_not_need_the_document passed")
 
 
-def test_documented_fill_steps_open_the_gate_for_the_committed_template():
-    """Following the design doc's fill steps on a copy of the committed doc opens the gate.
-
-    The copy gets sentinel text in place of every placeholder and its status
-    set to FILLED. If the committed doc is already filled, both edits are
-    no-ops and the gate must still open.
-    """
+def test_cli_execute_asks_records_the_document_and_resume_does_not_ask():
+    """--execute asks before anything is sent; --resume continues without asking."""
     with tempfile.TemporaryDirectory() as tmp:
-        repo_root = Path(tmp)
-        copy_path = repo_root / DESIGN_DOC_RELATIVE_PATH
-        copy_path.parent.mkdir(parents=True)
-        filled_text = (
-            DESIGN_DOC_PATH.read_text(encoding="utf-8")
-            .replace(DEFINITION_PLACEHOLDER, SENTINEL_DEFINITION_TEXT)
-            .replace("**Status:** UNFILLED", DEFINITION_FILLED_STATUS_LINE)
-        )
-        copy_path.write_text(filled_text, encoding="utf-8")
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.qmd")
+        manifest_path = Path(tmp) / "project_manifest.json"
+        mock_http = make_launch_mock()
+        client = CursorAPIClient(api_key="test-key", http_client=mock_http)
+        execute_arguments = [
+            "--execute", "--config", str(REAL_CONFIG_PATH), "--output", str(manifest_path),
+        ]
         
-        block = read_equilibrium_definition(path=copy_path)
-        assert DEFINITION_PLACEHOLDER not in block
+        exit_code = main(argv=execute_arguments, api_client=client, ask=end_of_input)
+        assert exit_code == 1
+        assert mock_http.calls == [], "No request may be sent when no document is given"
+        assert not manifest_path.exists()
+        
+        ask = answer_with(str(document_path))
+        exit_code = main(argv=execute_arguments, api_client=client, ask=ask)
+        assert exit_code == 0
+        assert ask.questions == [MODEL_SETUP_QUESTION]
+        launch_requests = get_launch_requests(mock_http=mock_http)
+        assert len(launch_requests) == 4
+        assert SENTINEL_DOCUMENT_TEXT.rstrip() in launch_requests[0]["prompt"]["text"]
+        assert all(
+            MODEL_SETUP_HEADING not in body["prompt"]["text"] for body in launch_requests[1:]
+        )
+        
+        saved_text = manifest_path.read_text(encoding="utf-8")
+        assert SENTINEL_DOCUMENT_TEXT.rstrip() not in saved_text, "The text is not stored"
+        saved = load_manifest(manifest_path=manifest_path)
+        assert saved.model_setup_document["path"] == str(document_path.resolve())
+        assert saved.model_setup_document["sha256"] == hashlib.sha256(
+            document_path.read_bytes()
+        ).hexdigest()
+        
+        exit_code = main(argv=execute_arguments, api_client=client, ask=must_not_ask)
+        assert exit_code == 1, "A new project must not overwrite an existing project's manifest"
+        assert manifest_path.read_text(encoding="utf-8") == saved_text
+        
+        exit_code = main(
+            argv=["--resume", str(manifest_path), "--config", str(REAL_CONFIG_PATH)],
+            api_client=client,
+            ask=must_not_ask,
+        )
+        assert exit_code == 0
+        assert len(get_launch_requests(mock_http=mock_http)) == 4, "Finished stages are not rerun"
+    print("✓ test_cli_execute_asks_records_the_document_and_resume_does_not_ask passed")
+
+
+def test_cli_dry_run_asks_and_launches_and_saves_nothing():
+    """--dry-run asks too, reports failure without a document, and never launches or saves."""
+    with tempfile.TemporaryDirectory() as tmp:
+        document_path = write_document(directory=Path(tmp), file_name="model_setup.tex")
+        manifest_path = Path(tmp) / "project_manifest.json"
+        dry_run_arguments = [
+            "--dry-run", "--config", str(REAL_CONFIG_PATH), "--output", str(manifest_path),
+        ]
         
         mock_http = make_launch_mock()
-        orchestrator = load_real_orchestrator(
-            mock_http=mock_http, dry_run=False, repo_root=repo_root,
-        )
-        stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
-        result = orchestrator._run_stage(stage=stage1)
+        client = CursorAPIClient(api_key="test-key", http_client=mock_http)
+        exit_code = main(argv=dry_run_arguments, api_client=client, ask=answer_with(""))
+        assert exit_code == 1
+        assert mock_http.calls == []
+        
+        ask = answer_with(str(document_path))
+        exit_code = main(argv=dry_run_arguments, api_client=client, ask=ask)
+        assert exit_code == 0
+        assert ask.questions == [MODEL_SETUP_QUESTION]
+        assert get_launch_requests(mock_http=mock_http) == []
+        assert not manifest_path.exists()
+    print("✓ test_cli_dry_run_asks_and_launches_and_saves_nothing passed")
+
+
+def test_validate_config_requires_the_first_stage_to_receive_the_document():
+    """The config cannot switch off sending the document to the first stage."""
+    def validate(first_stage_extra: dict) -> tuple[bool, list[str]]:
+        config = {
+            "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
+            "stages": [{"name": "s1", "prompt": "test", **first_stage_extra}],
+        }
+        return Orchestrator(config=config, dry_run=True).validate_config()
     
-    assert result.status == "FINISHED"
-    launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
-    assert len(launch_requests) == 1
-    assert block in launch_requests[0][3]["prompt"]["text"]
-    print("✓ test_documented_fill_steps_open_the_gate_for_the_committed_template passed")
+    assert validate({"receives_model_setup_document": True}) == (True, [])
+    for rejected in ({}, {"receives_model_setup_document": False},
+                     {"receives_model_setup_document": "yes"}):
+        is_valid, errors = validate(rejected)
+        assert not is_valid, rejected
+        assert any("receives_model_setup_document" in error for error in errors)
+    
+    real = load_real_orchestrator(mock_http=MockHttpClient(), dry_run=True)
+    assert [stage.receives_model_setup_document for stage in real.stages] == [
+        True, False, False, False,
+    ]
+    assert real.validate_config() == (True, [])
+    print("✓ test_validate_config_requires_the_first_stage_to_receive_the_document passed")
 
 
 def run_all_tests():
