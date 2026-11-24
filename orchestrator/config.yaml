@@ -65,8 +65,8 @@ api:
 #     and nothing is launched. Nothing is substituted or dropped.
 stages:
   # Stage 1: Equilibrium Derivation
-  # Input: The model setup / equilibrium definition document (.qmd or .tex)
-  #        that the orchestrator asks for when a project is started
+  # Input: The model setup / equilibrium definition document (.qmd, .tex
+  #        or .md) that the orchestrator asks for when a project is started
   # Output: LaTeX derivations committed to outputs/stage1_derivation/
   - name: "equilibrium_derivation"
     display_name: "Equilibrium Derivation"

@@ -39,6 +39,8 @@ from orchestrator import (
     MANIFEST_FORMAT_VERSION,
     MODEL_SETUP_BEGIN_LINE,
     MODEL_SETUP_END_LINE,
+    MODEL_SETUP_EXTENSIONS,
+    MODEL_SETUP_FORMATS,
     MODEL_SETUP_HEADING,
     MODEL_SETUP_QUESTION,
     STAGE_ARTIFACTS_FAILED,
@@ -1246,22 +1248,38 @@ def test_unusable_locations_are_rejected_before_any_launch():
         write_document(directory=directory, file_name="notes.txt")
         write_document(directory=directory, file_name="paper.pdf")
         write_document(directory=directory, file_name="no_extension")
+        write_document(directory=directory, file_name="notes.markdown")
+        write_document(directory=directory, file_name="notebook.Rmd")
         write_document(directory=directory, file_name="empty.tex", text="")
         write_document(directory=directory, file_name="blank.qmd", text="  \n\n")
+        write_document(directory=directory, file_name="empty.md", text="")
+        write_document(directory=directory, file_name="blank.md", text="\n \t\n")
+        (directory / "folder.md").mkdir()
         (directory / "latin1.tex").write_bytes("caf\xe9".encode("latin-1"))
+        (directory / "latin1.md").write_bytes("caf\xe9".encode("latin-1"))
+        (directory / "utf16.md").write_bytes("Sentinel line.\n".encode("utf-16"))
         
+        wrong_type = "must be a .qmd, .tex or .md file"
         cases = [
             ("", "No location was given"),
             ("   ", "No location was given"),
             ('""', "No location was given"),
             (str(directory / "missing.qmd"), "does not exist"),
+            (str(directory / "missing.md"), "does not exist"),
             (str(directory / "folder.tex"), "is not a file"),
-            (str(directory / "notes.txt"), "must be a .qmd or .tex file"),
-            (str(directory / "paper.pdf"), "must be a .qmd or .tex file"),
-            (str(directory / "no_extension"), "must be a .qmd or .tex file"),
+            (str(directory / "folder.md"), "is not a file"),
+            (str(directory / "notes.txt"), wrong_type),
+            (str(directory / "paper.pdf"), wrong_type),
+            (str(directory / "no_extension"), wrong_type),
+            (str(directory / "notes.markdown"), wrong_type),
+            (str(directory / "notebook.Rmd"), wrong_type),
             (str(directory / "empty.tex"), "is empty"),
             (str(directory / "blank.qmd"), "is empty"),
+            (str(directory / "empty.md"), "is empty"),
+            (str(directory / "blank.md"), "is empty"),
             (str(directory / "latin1.tex"), "is not UTF-8 text"),
+            (str(directory / "latin1.md"), "is not UTF-8 text"),
+            (str(directory / "utf16.md"), "is not UTF-8 text"),
         ]
         for answer, expected_message_part in cases:
             mock_http = make_launch_mock()
@@ -1298,9 +1316,32 @@ def test_end_of_input_when_asked_fails_before_any_launch():
     print("✓ test_end_of_input_when_asked_fails_before_any_launch passed")
 
 
-def test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request():
+def test_accepted_formats_are_qmd_tex_and_md():
+    """The question, the messages and the format names all come from one mapping."""
+    assert MODEL_SETUP_FORMATS == {
+        ".qmd": "Quarto Markdown (.qmd)",
+        ".tex": "LaTeX (.tex)",
+        ".md": "Markdown (.md)",
+    }
+    assert MODEL_SETUP_EXTENSIONS == ".qmd, .tex or .md"
+    assert MODEL_SETUP_QUESTION.endswith("for this project (.qmd, .tex or .md): ")
+    expect_document_error(
+        action=lambda: load_model_setup_document(location=""),
+        expected_message_part="Give the path of a .qmd, .tex or .md file.",
+    )
+    print("✓ test_accepted_formats_are_qmd_tex_and_md passed")
+
+
+def test_valid_qmd_tex_and_md_documents_reach_stage1_in_the_launch_request():
     """The Stage 1 launch body holds the selected file's text, not its local path."""
-    for file_name, quote in (("model_setup.qmd", ""), ("model_setup.tex", ""), ("MODEL.TEX", '"')):
+    cases = (
+        ("model_setup.qmd", "", "qmd", "Quarto Markdown (.qmd)"),
+        ("model_setup.tex", "", "tex", "LaTeX (.tex)"),
+        ("MODEL.TEX", '"', "tex", "LaTeX (.tex)"),
+        ("model_setup.md", "", "md", "Markdown (.md)"),
+        ("NOTES.MD", '"', "md", "Markdown (.md)"),
+    )
+    for file_name, quote, recorded_format, format_name in cases:
         with tempfile.TemporaryDirectory() as tmp:
             document_path = write_document(directory=Path(tmp), file_name=file_name)
             bytes_before = document_path.read_bytes()
@@ -1312,6 +1353,8 @@ def test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request():
                 ask=answer_with(f"{quote}{document_path}{quote}"),
             )
             orchestrator.start_new_project()
+            record = orchestrator.manifest.model_setup_document
+            assert record["format"] == recorded_format, file_name
             stage1 = get_stage(orchestrator=orchestrator, name=STAGE1_NAME)
             
             result = orchestrator._run_stage(stage=stage1)
@@ -1320,6 +1363,7 @@ def test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request():
             launch_requests = get_launch_requests(mock_http=mock_http)
             assert len(launch_requests) == 1
             prompt_text = launch_requests[0]["prompt"]["text"]
+            assert f"Format: {format_name}\n" in prompt_text, file_name
             positions = [
                 prompt_text.index("TASK: Derive the equilibrium"),
                 prompt_text.index(MODEL_SETUP_HEADING),
@@ -1334,7 +1378,7 @@ def test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request():
             assert "TODO(Yang)" not in prompt_text
             assert document_path.read_bytes() == bytes_before, "The file must not change"
             assert sorted(path.name for path in Path(tmp).iterdir()) == [file_name]
-    print("✓ test_valid_qmd_and_tex_documents_reach_stage1_in_the_launch_request passed")
+    print("✓ test_valid_qmd_tex_and_md_documents_reach_stage1_in_the_launch_request passed")
 
 
 def test_stage1_is_blocked_when_no_document_was_selected():
@@ -1382,18 +1426,56 @@ def test_document_that_pulls_in_other_files_is_rejected():
                 "Sentinel line.\n"
             ),
         )
+        md_with_includes = [
+            write_document(
+                directory=directory,
+                file_name=file_name,
+                text=f"# Sentinel heading\n\nSentinel line.\n\n{include_line}\n",
+            )
+            for file_name, include_line in (
+                ("quarto_shortcode.md", "{{< include _setup.md >}}"),
+                ("myst_backticks.md", "```{include} sections/setup.md\n```"),
+                ("myst_colons.MD", ":::{include} sections/setup.md\n:::"),
+                ("myst_indented.md", "  ~~~ {literalinclude} code/solver.py\n  ~~~"),
+            )
+        ]
         
-        for path in (tex_with_input, qmd_with_include):
+        for path in (tex_with_input, qmd_with_include, *md_with_includes):
             try:
                 load_model_setup_document(location=str(path))
             except ModelSetupDocumentError as error:
-                assert "pulls in other files" in str(error)
+                assert "pulls in other files" in str(error), path.name
                 assert "line " in str(error)
+                if path in md_with_includes:
+                    assert "line 5: " in str(error), path.name
             else:
                 raise AssertionError(f"Expected {path.name} to be refused")
         
         document = load_model_setup_document(location=str(self_contained))
         assert document.format == "tex"
+        
+        md_text = (
+            "# Sentinel heading\n\n"
+            "Sentinel line. Prose may include the word include, {include} and \\input{x}.\n\n"
+            "![Sentinel figure](figures/sentinel.png)\n\n"
+            "[Sentinel link](other_notes.md)\n\n"
+            "```python\nfrom sentinel import solve\n```\n\n"
+            "$$\nx = y\n$$\n"
+        )
+        md_self_contained = write_document(
+            directory=directory, file_name="alone.md", text=md_text,
+        )
+        document = load_model_setup_document(location=str(md_self_contained))
+        assert document.format == "md"
+        assert document.text == md_text
+        
+        # The Markdown-only directive check does not change what a .qmd file may hold.
+        qmd_with_myst_directive = write_document(
+            directory=directory,
+            file_name="unchanged.qmd",
+            text="Sentinel line.\n\n```{include} sections/setup.md\n```\n",
+        )
+        assert load_model_setup_document(location=str(qmd_with_myst_directive)).format == "qmd"
     print("✓ test_document_that_pulls_in_other_files_is_rejected passed")
 
 
@@ -1408,23 +1490,25 @@ def start_project_and_reload_manifest(document_path: Path) -> PipelineManifest:
 
 def test_resume_uses_the_recorded_document_without_asking():
     """Resuming re-reads the project's own document and never asks."""
-    with tempfile.TemporaryDirectory() as tmp:
-        document_path = write_document(directory=Path(tmp), file_name="model_setup.tex")
-        manifest = start_project_and_reload_manifest(document_path=document_path)
-        
-        mock_http = make_launch_mock()
-        orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
-        orchestrator.resume_project(manifest=manifest)
-        assert mock_http.calls == []
-        
-        result = orchestrator._run_stage(
-            stage=get_stage(orchestrator=orchestrator, name=STAGE1_NAME),
-        )
-        
-        assert result.status == STAGE_COMPLETE
-        prompt_text = get_launch_requests(mock_http=mock_http)[0]["prompt"]["text"]
-        assert SENTINEL_DOCUMENT_TEXT.rstrip() in prompt_text
-        assert orchestrator.manifest.model_setup_document == manifest.model_setup_document
+    for file_name, recorded_format in (("model_setup.tex", "tex"), ("model_setup.md", "md")):
+        with tempfile.TemporaryDirectory() as tmp:
+            document_path = write_document(directory=Path(tmp), file_name=file_name)
+            manifest = start_project_and_reload_manifest(document_path=document_path)
+            assert manifest.model_setup_document["format"] == recorded_format
+            
+            mock_http = make_launch_mock()
+            orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
+            orchestrator.resume_project(manifest=manifest)
+            assert mock_http.calls == []
+            
+            result = orchestrator._run_stage(
+                stage=get_stage(orchestrator=orchestrator, name=STAGE1_NAME),
+            )
+            
+            assert result.status == STAGE_COMPLETE, file_name
+            prompt_text = get_launch_requests(mock_http=mock_http)[0]["prompt"]["text"]
+            assert SENTINEL_DOCUMENT_TEXT.rstrip() in prompt_text
+            assert orchestrator.manifest.model_setup_document == manifest.model_setup_document
     print("✓ test_resume_uses_the_recorded_document_without_asking passed")
 
 
@@ -1565,28 +1649,31 @@ def test_cli_dry_run_is_offline_and_saves_nothing():
     """--dry-run asks for the document, needs no API key, sends nothing and saves nothing."""
     old_key = os.environ.pop("CURSOR_API_KEY", None)
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            document_path = write_document(directory=Path(tmp), file_name="model_setup.tex")
-            manifest_path = Path(tmp) / "project_manifest.json"
-            dry_run_arguments = [
-                "--dry-run", "--config", str(REAL_CONFIG_PATH), "--output", str(manifest_path),
-            ]
-            backend = make_launch_mock()
-            
-            exit_code = run_cli(
-                backend=backend, arguments=dry_run_arguments, ask=answer_with(""), api_key=None,
-            )
-            assert exit_code == 1
-            
-            ask = answer_with(str(document_path))
-            exit_code = run_cli(
-                backend=backend, arguments=dry_run_arguments, ask=ask, api_key=None,
-            )
-            assert exit_code == 0, "A dry run needs no API key"
-            assert ask.questions == [MODEL_SETUP_QUESTION]
-            assert backend.calls == [], "A dry run sends no request to any service"
-            assert backend.downloads == [] and backend.sleeps == []
-            assert sorted(path.name for path in Path(tmp).iterdir()) == ["model_setup.tex"]
+        for file_name in ("model_setup.tex", "model_setup.qmd", "model_setup.md"):
+            with tempfile.TemporaryDirectory() as tmp:
+                document_path = write_document(directory=Path(tmp), file_name=file_name)
+                manifest_path = Path(tmp) / "project_manifest.json"
+                dry_run_arguments = [
+                    "--dry-run", "--config", str(REAL_CONFIG_PATH),
+                    "--output", str(manifest_path),
+                ]
+                backend = make_launch_mock()
+                
+                exit_code = run_cli(
+                    backend=backend, arguments=dry_run_arguments, ask=answer_with(""),
+                    api_key=None,
+                )
+                assert exit_code == 1
+                
+                ask = answer_with(str(document_path))
+                exit_code = run_cli(
+                    backend=backend, arguments=dry_run_arguments, ask=ask, api_key=None,
+                )
+                assert exit_code == 0, f"A dry run needs no API key ({file_name})"
+                assert ask.questions == [MODEL_SETUP_QUESTION]
+                assert backend.calls == [], "A dry run sends no request to any service"
+                assert backend.downloads == [] and backend.sleeps == []
+                assert sorted(path.name for path in Path(tmp).iterdir()) == [file_name]
     finally:
         if old_key:
             os.environ["CURSOR_API_KEY"] = old_key

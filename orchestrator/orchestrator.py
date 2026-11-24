@@ -12,8 +12,8 @@ Usage:
     python orchestrator.py --resume manifest.json # Continue an existing project
 
 Starting a new project (--execute) always asks for the location of the
-model setup / equilibrium definition document (.qmd or .tex). Nothing is
-launched until a valid document has been given.
+model setup / equilibrium definition document (.qmd, .tex or .md). Nothing
+is launched until a valid document has been given.
 
 Official API docs: https://cursor.com/docs/cloud-agent/api/endpoints
 """
@@ -67,14 +67,19 @@ class StageConfig:
 
 GUARDRAILS_HEADING = "REPRODUCIBILITY GUARDRAILS (follow all of these):"
 
-MODEL_SETUP_QUESTION = (
-    "Location of the model setup / equilibrium definition document "
-    "for this project (.qmd or .tex): "
-)
 MODEL_SETUP_FORMATS = {
     ".qmd": "Quarto Markdown (.qmd)",
     ".tex": "LaTeX (.tex)",
+    ".md": "Markdown (.md)",
 }
+# The accepted extensions as written in the question and in error messages:
+# ".qmd, .tex or .md".
+*_FIRST_EXTENSIONS, _LAST_EXTENSION = MODEL_SETUP_FORMATS
+MODEL_SETUP_EXTENSIONS = f"{', '.join(_FIRST_EXTENSIONS)} or {_LAST_EXTENSION}"
+MODEL_SETUP_QUESTION = (
+    "Location of the model setup / equilibrium definition document "
+    f"for this project ({MODEL_SETUP_EXTENSIONS}): "
+)
 MODEL_SETUP_HEADING = (
     "MODEL SETUP AND EQUILIBRIUM DEFINITION DOCUMENT "
     "(supplied by the project owner for this project):"
@@ -86,9 +91,16 @@ MODEL_SETUP_END_LINE = "----- END DOCUMENT -----"
 # selected file's own text is sent to the cloud agent, so a document that
 # uses one of these would reach the agent incomplete.
 TEX_COMMENT_PATTERN = re.compile(r"(?<!\\)%.*$")
+QUARTO_INCLUDE = r"\{\{<\s*include\s"
+# Markdown has no include syntax of its own; tools that read .md files add
+# one. A .md file is checked for two of them: the Quarto shortcode, and the
+# MyST `{include}` / `{literalinclude}` directives at the start of a fence.
+# The include forms of other Markdown tools are not detected.
+MYST_INCLUDE = r"^\s*(?:`{3,}|~{3,}|:{3,})\s*\{(?:include|literalinclude)\}"
 INCLUDE_DIRECTIVE_PATTERNS = {
     ".tex": re.compile(r"\\(?:input|include|subfile|import|subimport)(?![A-Za-z])"),
-    ".qmd": re.compile(r"\{\{<\s*include\s"),
+    ".qmd": re.compile(QUARTO_INCLUDE),
+    ".md": re.compile(f"{QUARTO_INCLUDE}|{MYST_INCLUDE}"),
 }
 
 
@@ -136,8 +148,8 @@ def find_include_directives(text: str, suffix: str) -> list[str]:
 def load_model_setup_document(location: str) -> ModelSetupDocument:
     """Read the model setup document at a location given by the user.
 
-    The file is only read. It must exist, be a `.qmd` or `.tex` file, hold
-    UTF-8 text, be non-empty and be self-contained. Whether it states a
+    The file is only read. It must exist, be a `.qmd`, `.tex` or `.md` file,
+    hold UTF-8 text, be non-empty and be self-contained. Whether it states a
     correct or complete equilibrium definition cannot be checked here.
 
     Raises:
@@ -150,7 +162,7 @@ def load_model_setup_document(location: str) -> ModelSetupDocument:
     if not cleaned:
         raise ModelSetupDocumentError(
             "No location was given for the model setup / equilibrium "
-            "definition document. Give the path of a .qmd or .tex file."
+            f"definition document. Give the path of a {MODEL_SETUP_EXTENSIONS} file."
         )
     
     path = Path(cleaned).expanduser()
@@ -164,7 +176,7 @@ def load_model_setup_document(location: str) -> ModelSetupDocument:
     suffix = path.suffix.lower()
     if suffix not in MODEL_SETUP_FORMATS:
         raise ModelSetupDocumentError(
-            f"The model setup document must be a .qmd or .tex file, "
+            f"The model setup document must be a {MODEL_SETUP_EXTENSIONS} file, "
             f"but this file has the extension '{path.suffix}': {path}"
         )
     
@@ -1798,7 +1810,7 @@ Examples:
 
 Model setup / equilibrium definition document:
   --execute and --dry-run always ask for the location of this document
-  (.qmd or .tex). --resume uses the document recorded in the manifest.
+  (.qmd, .tex or .md). --resume uses the document recorded in the manifest.
 
 Environment:
   CURSOR_API_KEY    API key from Cursor Dashboard -> API Keys
