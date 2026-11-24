@@ -9,6 +9,7 @@ Or simply: python test_orchestrator.py
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock
@@ -17,12 +18,21 @@ import yaml
 
 from api_client import CursorAPIClient, CursorAPIError, Model, RunStatus
 from orchestrator import (
+    GUARDRAILS_HEADING,
     Orchestrator,
     PipelineManifest,
     StageConfig,
     StageResult,
+    build_stage_prompt,
     load_config,
 )
+
+ORCHESTRATOR_DIR = Path(__file__).resolve().parent
+REAL_CONFIG_PATH = ORCHESTRATOR_DIR / "config.yaml"
+DESIGN_DOC_PATH = ORCHESTRATOR_DIR.parent / "docs" / "pipeline-design.md"
+DESIGN_DOC_GUARDRAILS_HEADING = "#### Reproducibility Guardrails (Stage 3)"
+STAGE3_NAME = "pseudocode_to_implementation"
+EXPECTED_GUARDRAIL_COUNT = 12
 
 
 class MockHttpClient:
@@ -517,31 +527,117 @@ def test_stage_input_ref_from_dependency():
     print("✓ test_stage_input_ref_from_dependency passed")
 
 
+def read_design_doc_guardrails() -> list[str]:
+    """Return the numbered items under the Stage 3 guardrails heading in the design doc."""
+    lines = DESIGN_DOC_PATH.read_text(encoding="utf-8").splitlines()
+    section_start = lines.index(DESIGN_DOC_GUARDRAILS_HEADING) + 1
+    guardrails = []
+    for line in lines[section_start:]:
+        if line.startswith("#"):
+            break
+        numbered_item = re.match(r"^\d+\.\s+(.*\S)\s*$", line)
+        if numbered_item:
+            guardrails.append(numbered_item.group(1))
+    return guardrails
+
+
+def load_real_orchestrator(mock_http: MockHttpClient, dry_run: bool) -> Orchestrator:
+    """Build an orchestrator from the committed config.yaml with mocked HTTP."""
+    client = CursorAPIClient(api_key="test-key", http_client=mock_http)
+    return Orchestrator(
+        config=load_config(config_path=REAL_CONFIG_PATH),
+        api_client=client,
+        dry_run=dry_run,
+    )
+
+
+def get_stage(orchestrator: Orchestrator, name: str) -> StageConfig:
+    matches = [stage for stage in orchestrator.stages if stage.name == name]
+    assert len(matches) == 1, f"Expected exactly one stage named '{name}'"
+    return matches[0]
+
+
+def test_stage3_guardrails_in_config_match_design_doc():
+    """config.yaml lists the same twelve guardrails, in order, as the design doc."""
+    doc_guardrails = read_design_doc_guardrails()
+    assert len(doc_guardrails) == EXPECTED_GUARDRAIL_COUNT, doc_guardrails
+    
+    orchestrator = load_real_orchestrator(mock_http=MockHttpClient(), dry_run=True)
+    stage3 = get_stage(orchestrator=orchestrator, name=STAGE3_NAME)
+    
+    assert stage3.guardrails == doc_guardrails
+    
+    is_valid, errors = orchestrator.validate_config()
+    assert is_valid, errors
+    print("✓ test_stage3_guardrails_in_config_match_design_doc passed")
+
+
+def test_stage3_launch_request_carries_all_guardrails():
+    """The POST /v1/agents body for Stage 3 holds the task and all twelve guardrails."""
+    mock_http = MockHttpClient()
+    mock_http.add_response("POST", "/agents", 200, MOCK_CREATE_RESPONSE)
+    mock_http.add_response("GET", "/runs/", 200, MOCK_RUN_FINISHED)
+    
+    orchestrator = load_real_orchestrator(mock_http=mock_http, dry_run=False)
+    stage3 = get_stage(orchestrator=orchestrator, name=STAGE3_NAME)
+    
+    result = orchestrator._run_stage(stage=stage3)
+    assert result.status == "FINISHED"
+    
+    launch_requests = [call for call in mock_http.calls if call[0] == "POST"]
+    assert len(launch_requests) == 1
+    prompt_text = launch_requests[0][3]["prompt"]["text"]
+    
+    assert "TASK: Implement the pseudocode in Python" in prompt_text
+    assert GUARDRAILS_HEADING in prompt_text
+    doc_guardrails = read_design_doc_guardrails()
+    assert len(doc_guardrails) == EXPECTED_GUARDRAIL_COUNT
+    for number, guardrail in enumerate(doc_guardrails, start=1):
+        assert f"{number}. {guardrail}" in prompt_text, f"Missing guardrail {number}"
+    print("✓ test_stage3_launch_request_carries_all_guardrails passed")
+
+
+def test_stage_without_guardrails_sends_prompt_unchanged():
+    """A stage with no guardrails sends exactly its configured prompt."""
+    stage = StageConfig(
+        name="plain",
+        display_name="Plain",
+        description="",
+        prompt="Do the task.\n",
+    )
+    assert build_stage_prompt(stage=stage) == "Do the task.\n"
+    print("✓ test_stage_without_guardrails_sends_prompt_unchanged passed")
+
+
+def test_validate_config_rejects_malformed_guardrails():
+    """Guardrails must be a list of non-empty strings."""
+    for malformed in (None, "one string", ["ok", ""], ["ok", 3]):
+        config = {
+            "pipeline": {"repository": {"url": "https://github.com/test/repo"}},
+            "stages": [{"name": "s1", "prompt": "test", "guardrails": malformed}],
+        }
+        orchestrator = Orchestrator(config=config, dry_run=True)
+        is_valid, errors = orchestrator.validate_config()
+        assert not is_valid, f"Expected rejection for guardrails={malformed!r}"
+        assert any("guardrails" in error for error in errors)
+    print("✓ test_validate_config_rejects_malformed_guardrails passed")
+
+
 def run_all_tests():
-    """Run all tests."""
+    """Run every test_* function in this module."""
     print("Running orchestrator tests (mocked HTTP, no network)...")
     print("-" * 50)
     
-    test_run_status_helpers()
-    test_api_client_list_models()
-    test_api_client_validate_model_valid()
-    test_api_client_validate_model_invalid()
-    test_api_client_validate_params_valid()
-    test_api_client_validate_params_invalid()
-    test_api_client_create_agent()
-    test_api_client_get_run()
-    test_api_client_auth_error()
-    test_orchestrator_validate_config_valid()
-    test_orchestrator_validate_config_missing_repo()
-    test_orchestrator_validate_config_bad_dependency()
-    test_orchestrator_validate_models()
-    test_orchestrator_validate_models_invalid()
-    test_orchestrator_dry_run()
-    test_pipeline_manifest_serialization()
-    test_stage_input_ref_from_dependency()
+    tests = [
+        function
+        for name, function in globals().items()
+        if name.startswith("test_") and callable(function)
+    ]
+    for test in tests:
+        test()
     
     print("-" * 50)
-    print("All 17 tests passed!")
+    print(f"All {len(tests)} tests passed!")
 
 
 if __name__ == "__main__":

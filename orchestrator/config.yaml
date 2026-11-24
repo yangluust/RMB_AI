@@ -146,6 +146,24 @@ stages:
       
       Commit your outputs before finishing.
     
+    # Reproducibility guardrails supplied by Yang Lu. When the orchestrator
+    # launches this stage it appends this list, numbered, to the prompt above.
+    # Keep it identical to "Reproducibility Guardrails (Stage 3)" in
+    # docs/pipeline-design.md; test_orchestrator.py fails if the two differ.
+    guardrails:
+      - "Reusable code without duplication."
+      - "Configuration-driven parameters, saved with the results."
+      - "Stable semantic paths, without timestamps or version suffixes."
+      - "Named function arguments."
+      - "Version-controlled code, configs, and documentation."
+      - "Declared dependency versions."
+      - "Explicit random seeds."
+      - "External specification kept in sync with clear code."
+      - "Property-based, unit, and integration tests."
+      - "Programmatically generated outputs, never manually edited."
+      - "Raw inputs left unchanged."
+      - "Secrets and large generated files kept outside Git."
+    
     output_manifest:
       required_files:
         - "outputs/stage3_implementation/README.md"

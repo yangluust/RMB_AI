@@ -88,7 +88,7 @@ Principles supplied by Yang Lu for the Stage 3 Python implementation:
 11. Raw inputs left unchanged.
 12. Secrets and large generated files kept outside Git.
 
-**Status:** These principles are recorded in this design document only. The Stage 3 prompt in `orchestrator/config.yaml` does not yet state them, so a pipeline run would not pass them to the Stage 3 agent until that prompt is updated.
+**Runtime:** The same twelve principles are listed under `guardrails` for this stage in `orchestrator/config.yaml`. When the orchestrator launches Stage 3 it appends them, numbered, to the stage prompt, so the agent receives them in the launch request. `orchestrator/test_orchestrator.py` fails if the list in the config differs from the list above, so edit both together. This has been checked with mocked HTTP only; no Stage 3 agent has been launched.
 
 ### Stage 4: Academic Writing
 
@@ -494,6 +494,7 @@ This would require:
 | 2026-11-24 | Cloud Agent | Initial draft |
 | 2026-11-24 | Cloud Agent | Updated with specific model requests: Claude Fable 5.2 (Stages 1-2), Grok (Stage 3), GPT-5.6 (Stage 4). Added Stage 1 input format (QMD/LaTeX). Added pending sections for equilibrium definition and reproducibility guardrails. |
 | 2026-11-24 | Cloud Agent | Replaced the Stage 3 reproducibility guardrails placeholder with the twelve principles supplied by Yang Lu. Equilibrium definition remains pending. |
+| 2026-11-24 | Cloud Agent | The twelve Stage 3 guardrails are now in `orchestrator/config.yaml` and appended to the Stage 3 prompt at launch. |
 
 ---
 

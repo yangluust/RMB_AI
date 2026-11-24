@@ -51,10 +51,18 @@ stages:
         value: "true"
     prompt: |
       Your task prompt here...
+    guardrails:                 # Optional, appended to the prompt at launch
+      - "A rule the agent must follow."
     output_manifest:
       required_files:
         - "outputs/my_stage/result.txt"
 ```
+
+### Guardrails
+
+A stage may list `guardrails`. When the orchestrator launches that stage it appends the list, numbered, to the stage prompt, so the agent receives the guardrails in the launch request.
+
+Stage 3 (`pseudocode_to_implementation`) carries the twelve reproducibility guardrails from [`docs/pipeline-design.md`](../docs/pipeline-design.md#reproducibility-guardrails-stage-3). The tests fail if the list in `config.yaml` differs from the list in the design document, so edit both together.
 
 ### Model Selection
 

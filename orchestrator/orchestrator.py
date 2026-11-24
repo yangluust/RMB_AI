@@ -42,6 +42,25 @@ class StageConfig:
     model_params: list[dict] = field(default_factory=list)
     depends_on: Optional[str] = None
     output_manifest: dict = field(default_factory=dict)
+    guardrails: list[str] = field(default_factory=list)
+
+
+GUARDRAILS_HEADING = "REPRODUCIBILITY GUARDRAILS (follow all of these):"
+
+
+def build_stage_prompt(stage: StageConfig) -> str:
+    """Return the prompt text sent to the cloud agent for a stage.
+
+    A stage's guardrails are appended to its prompt as a numbered list, so
+    the agent receives them in the same launch request as the task.
+    """
+    if not stage.guardrails:
+        return stage.prompt
+    numbered = "\n".join(
+        f"{number}. {guardrail}"
+        for number, guardrail in enumerate(stage.guardrails, start=1)
+    )
+    return f"{stage.prompt.rstrip()}\n\n{GUARDRAILS_HEADING}\n{numbered}\n"
 
 
 @dataclass
@@ -160,6 +179,7 @@ class Orchestrator:
                 model_params=stage_data.get("model_params", []),
                 depends_on=stage_data.get("depends_on"),
                 output_manifest=stage_data.get("output_manifest", {}),
+                guardrails=stage_data.get("guardrails", []),
             ))
         return stages
     
@@ -185,6 +205,15 @@ class Orchestrator:
             
             if not stage.prompt.strip():
                 errors.append(f"Stage '{stage.name}' has empty prompt")
+            
+            guardrails_ok = isinstance(stage.guardrails, list) and all(
+                isinstance(guardrail, str) and guardrail.strip()
+                for guardrail in stage.guardrails
+            )
+            if not guardrails_ok:
+                errors.append(
+                    f"Stage '{stage.name}': guardrails must be a list of non-empty strings"
+                )
         
         return len(errors) == 0, errors
     
@@ -301,6 +330,7 @@ class Orchestrator:
         print(f"\n--- Stage: {stage.display_name} ---")
         print(f"  Input ref: {input_ref}")
         print(f"  Model: {stage.model_id or '(default)'}")
+        print(f"  Guardrails appended to prompt: {len(stage.guardrails)}")
         
         if self.dry_run:
             print("  [DRY RUN] Would launch cloud agent")
@@ -314,7 +344,7 @@ class Orchestrator:
             
             print("  Launching cloud agent...")
             run = self.api.create_agent(
-                prompt_text=stage.prompt,
+                prompt_text=build_stage_prompt(stage=stage),
                 repo_url=self.repo_config["url"],
                 starting_ref=input_ref,
                 model_id=stage.model_id,
