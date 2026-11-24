@@ -525,7 +525,9 @@ class Orchestrator:
     ):
         self.config = config
         self.dry_run = dry_run
-        self.api = api_client or CursorAPIClient()
+        self.api = api_client or CursorAPIClient(
+            base_url=config.get("api", {}).get("base_url"),
+        )
         # Called with the question text; returns the user's answer.
         self.ask = ask
         self._github = github

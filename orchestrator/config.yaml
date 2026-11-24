@@ -37,7 +37,9 @@ api:
   # Polling configuration for run status
   polling:
     interval_seconds: 30
-    max_attempts: 120  # 1 hour maximum wait per stage
+    # 1 hour of waiting per command. A run that is still going after that
+    # stays recorded as RUNNING; --resume waits for the same run again.
+    max_attempts: 120
     
   # Retries for transient failures (no response, HTTP 429, HTTP 5xx).
   # max_attempts counts every try, the first included. backoff_seconds are
